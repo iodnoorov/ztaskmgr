@@ -5,6 +5,8 @@ use std::fs;
 use std::hash::{BuildHasher, RandomState};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::os::unix::fs::MetadataExt;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 
@@ -13,8 +15,21 @@ use crate::model::{Board, Category, State, Task};
 use crate::notes::{Notes, Summary};
 use crate::storage;
 
-/// Куда уходят записи удалённых задач, чтобы не терять их.
+/// Куда уходят удалённые записи, чтобы не терять их.
 pub const DELETED_NOTES: &str = "DELETED_NOTES.md";
+/// Какие списки скрыты от ИИ: `- Личное` по строке на список.
+pub const AI_HIDDEN: &str = "AI_HIDDEN.md";
+
+/// Отпечаток файла: время изменения, размер и inode. По нему видно правки снаружи (агент,
+/// синхронизация, редактор). Время в Linux грубое (миллисекунды), две записи подряд могут
+/// его не сдвинуть, поэтому ещё размер и inode: запись через rename всегда даёт новый inode.
+pub type Stamp = (SystemTime, u64, u64);
+
+/// Нет файла — `None`.
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len(), meta.ino()))
+}
 
 pub struct Book {
     dir: PathBuf,
@@ -139,21 +154,63 @@ impl Book {
         if notes.is_empty() || self.is_referenced(id)? {
             return Ok(false);
         }
+        self.append_deleted(&format!("{stamp} — {}", task.text), id, page, &notes.serialize())?;
+        self.save_notes(id, &Notes::default())?;
+        Ok(true)
+    }
+
+    /// Удалён один пункт записей (заметка, подзадача) — он дописывается в `DELETED_NOTES.md`.
+    pub fn archive_entry(&self, task: &str, id: &str, page: Date, stamp: &str, raw: &str) -> Result<()> {
+        self.append_deleted(&format!("{stamp} — {task} · удалённый пункт записей"), id, page, raw)
+    }
+
+    fn append_deleted(&self, title: &str, id: &str, page: Date, body: &str) -> Result<()> {
         let path = self.dir.join(DELETED_NOTES);
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("запись {}", path.display()))?;
-        write!(
-            file,
-            "## {stamp} — {}\n<!-- id:{id}, страница {page} -->\n\n{}\n",
-            task.text,
-            notes.serialize()
-        )?;
+        write!(file, "## {title}\n<!-- id:{id}, страница {page} -->\n\n{body}\n")?;
         file.sync_all()?;
-        self.save_notes(id, &Notes::default())?;
-        Ok(true)
+        Ok(())
+    }
+
+    /// Списки, скрытые от ИИ; нет файла — скрытых нет.
+    pub fn hidden(&self) -> Result<[bool; 4]> {
+        let path = self.dir.join(AI_HIDDEN);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok([false; 4]),
+            Err(e) => return Err(e).with_context(|| format!("чтение {}", path.display())),
+        };
+        let mut hidden = [false; 4];
+        for line in text.lines().filter_map(|l| l.trim().strip_prefix("- ")) {
+            let category = Category::from_title(line.trim())
+                .with_context(|| format!("{}: неизвестный список «{line}»", path.display()))?;
+            hidden[category.index()] = true;
+        }
+        Ok(hidden)
+    }
+
+    pub fn set_hidden(&self, hidden: [bool; 4]) -> Result<()> {
+        let mut text = String::from("# Списки, скрытые от ИИ\n\n");
+        for category in Category::ALL.into_iter().filter(|c| hidden[c.index()]) {
+            text.push_str(&format!("- {}\n", category.title()));
+        }
+        storage::write_atomic(&self.dir.join(AI_HIDDEN), &text)
+    }
+
+    pub fn hidden_stamp(&self) -> Option<Stamp> {
+        stamp(&self.dir.join(AI_HIDDEN))
+    }
+
+    pub fn page_stamp(&self, date: Date) -> Option<Stamp> {
+        stamp(&self.page_path(date))
+    }
+
+    pub fn notes_stamp(&self, id: &str) -> Option<Stamp> {
+        stamp(&self.notes_path(id))
     }
 
     /// Даты всех страниц книжки, по возрастанию. Посторонние файлы не учитываются.
@@ -343,6 +400,30 @@ mod tests {
         // Пустые записи — без файла.
         book.save_notes(&id, &Notes::default()).unwrap();
         assert!(!book.notes_path(&id).exists());
+        fs::remove_dir_all(book.dir()).unwrap();
+    }
+
+    #[test]
+    fn hidden_lists_and_entry_archive() {
+        let book = temp_book("hidden");
+        assert_eq!(book.hidden().unwrap(), [false; 4]);
+        book.set_hidden([false, false, true, false]).unwrap();
+        assert_eq!(book.hidden().unwrap(), [false, false, true, false]);
+        let text = fs::read_to_string(book.dir().join(AI_HIDDEN)).unwrap();
+        assert!(text.contains("- Личное\n"), "{text}");
+        fs::write(book.dir().join(AI_HIDDEN), "- Отпуск\n").unwrap();
+        assert!(book.hidden().is_err());
+
+        book.archive_entry("кран", "abc", d(26), "2026-10-26 21:00", "- [ ] купить\n").unwrap();
+        let deleted = fs::read_to_string(book.dir().join(DELETED_NOTES)).unwrap();
+        assert!(deleted.starts_with("## 2026-10-26 21:00 — кран · удалённый пункт записей\n"));
+        assert!(deleted.ends_with("\n\n- [ ] купить\n\n"), "{deleted:?}");
+
+        assert_eq!(book.page_stamp(d(26)), None);
+        let mut board = Board::default();
+        board.push(Category::Work, Task::new("a"));
+        book.save(d(26), &board).unwrap();
+        assert!(book.page_stamp(d(26)).is_some());
         fs::remove_dir_all(book.dir()).unwrap();
     }
 

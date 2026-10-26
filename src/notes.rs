@@ -239,6 +239,11 @@ impl Notes {
         true
     }
 
+    /// Пункт как в файле — для архива удалённого.
+    pub fn raw(&self, i: usize) -> String {
+        self.entries[i].lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
     pub fn remove(&mut self, i: usize) {
         self.entries.remove(i);
     }

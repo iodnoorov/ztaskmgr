@@ -38,6 +38,10 @@ pub enum Action {
     OpenEditor,
     /// Закрыть окно записей.
     Close,
+    /// Задача скрыта от ИИ / открыта.
+    TogglePrivate,
+    /// Список скрыт от ИИ / открыт.
+    ToggleHidden,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -156,6 +160,8 @@ pub const ROWS: &[Row] = &[
         &[(c('d'), A::Delete), (k(KeyCode::Delete), A::Delete)],
     ),
     row(Section::Tasks, "записи задачи", &[(c('n'), A::Notes)]),
+    row(Section::Tasks, "скрыть задачу от ИИ / открыть", &[(c('p'), A::TogglePrivate)]),
+    row(Section::Tasks, "скрыть список от ИИ / открыть", &[(c('P'), A::ToggleHidden)]),
     labeled(
         Section::Pages,
         "[ ]  PgUp PgDn",

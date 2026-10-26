@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::widgets::ListState;
 
-use crate::book::{Book, DELETED_NOTES};
+use crate::book::{Book, Stamp, DELETED_NOTES};
 use crate::clock::{self, Date};
 use crate::field::{LineInput, TextArea};
 use crate::input::Press;
@@ -43,12 +43,19 @@ pub struct NotesView {
     /// Выделение — среди пунктов, `Notes::visible`.
     pub list: ListState,
     pub mode: NotesMode,
+    /// Время изменения файла записей, когда мы его читали или писали, — для правок снаружи.
+    stamp: Option<Stamp>,
 }
 
 pub enum NotesMode {
     List,
-    /// Однострочное поле — подзадача.
-    Edit { input: LineInput, target: NoteTarget },
+    /// Однострочное поле — подзадача. `original` — текст до правки: по нему пункт находится
+    /// снова, если записи поменялись снаружи.
+    Edit {
+        input: LineInput,
+        target: NoteTarget,
+        original: String,
+    },
     /// Многострочное поле — заметка или прочий текст: Enter — новая строка, Ctrl+S — сохранить.
     Text(Draft),
     ConfirmDelete,
@@ -195,6 +202,11 @@ pub struct App {
     /// Файл, который надо открыть во внешнем редакторе: это делает главный цикл,
     /// ему принадлежит терминал. Потом — `after_editor`.
     pub editor_request: Option<PathBuf>,
+    /// Списки, скрытые от ИИ (`AI_HIDDEN.md`).
+    pub hidden: [bool; 4],
+    /// Время изменения файлов страницы и скрытых списков, когда мы их читали или писали.
+    page_stamp: Option<Stamp>,
+    hidden_stamp: Option<Stamp>,
     pub quit: bool,
 }
 
@@ -246,8 +258,12 @@ impl App {
             notes: None,
             summaries: HashMap::new(),
             editor_request: None,
+            hidden: [false; 4],
+            page_stamp: None,
+            hidden_stamp: None,
             quit: false,
         };
+        app.load_hidden();
         app.open_page(today);
         app
     }
@@ -300,6 +316,7 @@ impl App {
         for category in Category::ALL {
             self.clamp_selection(category);
         }
+        self.page_stamp = self.book.page_stamp(date);
         // Окно записей привязано к задаче прежней страницы.
         self.notes = None;
         self.summaries = self.book.summaries(&self.board);
@@ -333,6 +350,202 @@ impl App {
             }
             Err(e) => self.status = Some(Status::Error(format!("Ошибка сохранения: {e:#}"))),
         }
+        self.page_stamp = self.book.page_stamp(self.date);
+    }
+
+    fn load_hidden(&mut self) {
+        match self.book.hidden() {
+            Ok(hidden) => self.hidden = hidden,
+            Err(e) => self.status = Some(Status::Error(format!("Скрытые от ИИ списки: {e:#}"))),
+        }
+        self.hidden_stamp = self.book.hidden_stamp();
+    }
+
+    /// Скрыт ли список от ИИ.
+    pub fn is_hidden(&self, category: Category) -> bool {
+        self.hidden[category.index()]
+    }
+
+    fn toggle_hidden(&mut self) {
+        let mut hidden = self.hidden;
+        hidden[self.active.index()] ^= true;
+        match self.book.set_hidden(hidden) {
+            Ok(()) => {
+                self.hidden = hidden;
+                let what = if hidden[self.active.index()] { "скрыт от ИИ" } else { "открыт для ИИ" };
+                self.status = Some(Status::Info(format!("Список «{}» {what}", self.active.title())));
+            }
+            Err(e) => self.status = Some(Status::Error(format!("Скрытые от ИИ списки: {e:#}"))),
+        }
+        self.hidden_stamp = self.book.hidden_stamp();
+    }
+
+    fn toggle_private(&mut self) {
+        let Some(index) = self.selected() else {
+            return;
+        };
+        let Some(task) = self.board.get_mut(self.active, index) else {
+            return;
+        };
+        task.private ^= true;
+        let what = if task.private { "скрыта от ИИ" } else { "открыта для ИИ" };
+        self.status = Some(Status::Info(format!("Задача {what}")));
+        self.save();
+    }
+
+    /// Задача, как её найти снова после перечитывания страницы: по id, иначе по тексту —
+    /// сначала среди задач без id, потом среди всех (снаружи ей могли дать id).
+    fn find_task(&self, category: Category, task: &Task) -> Option<usize> {
+        let list = self.board.list(category);
+        match &task.id {
+            Some(id) => list.iter().position(|t| t.id.as_ref() == Some(id)),
+            None => list
+                .iter()
+                .position(|t| t.id.is_none() && t.text == task.text)
+                .or_else(|| list.iter().position(|t| t.text == task.text)),
+        }
+    }
+
+    /// Файлы страницы, открытых записей или скрытых списков поменялись снаружи (агент,
+    /// синхронизация, правка руками) — перечитать, сохранив выделение и начатую правку.
+    /// Возвращает, было ли что перечитывать.
+    pub fn check_external(&mut self) -> bool {
+        let mut changed = false;
+        if self.book.hidden_stamp() != self.hidden_stamp {
+            self.load_hidden();
+            changed = true;
+        }
+        if self.book.page_stamp(self.date) != self.page_stamp {
+            self.reload_page();
+            changed = true;
+        }
+        if let Some(view) = &self.notes
+            && self.book.notes_stamp(&view.id) != view.stamp
+        {
+            self.reload_notes();
+            changed = true;
+        }
+        if changed && self.status.is_none() {
+            self.status = Some(Status::Info("Обновлено снаружи".into()));
+        }
+        changed
+    }
+
+    fn reload_page(&mut self) {
+        // Что было выделено и что правится — чтобы найти те же задачи на перечитанной странице.
+        let selected: Vec<Option<Task>> = Category::ALL
+            .iter()
+            .map(|&c| self.lists[c.index()].selected().and_then(|i| self.board.list(c).get(i).cloned()))
+            .collect();
+        let editing = match &self.mode {
+            Mode::Edit { index: Some(i), .. } | Mode::Date { purpose: DatePurpose::Postpone(i), .. } => {
+                self.board.list(self.active).get(*i).cloned()
+            }
+            _ => None,
+        };
+        let notes_task = self.notes_task().cloned();
+
+        match self.book.load(self.date) {
+            Ok(board) => {
+                self.board = board;
+                self.page_error = None;
+            }
+            Err(e) => {
+                let e = format!("{e:#}");
+                self.board = Board::default();
+                self.status = Some(Status::Error(format!("Страница не прочитана: {e}")));
+                self.page_error = Some(e);
+            }
+        }
+        self.page_stamp = self.book.page_stamp(self.date);
+
+        for category in Category::ALL {
+            let index = selected[category.index()].as_ref().and_then(|t| self.find_task(category, t));
+            self.lists[category.index()].select(index);
+            self.clamp_selection(category);
+        }
+        let editing = editing.map(|t| self.find_task(self.active, &t));
+        let selected_gone = selected[self.active.index()]
+            .as_ref()
+            .is_some_and(|t| self.find_task(self.active, t).is_none());
+        match &mut self.mode {
+            Mode::Edit { index: Some(i), .. } | Mode::Date { purpose: DatePurpose::Postpone(i), .. } => {
+                match editing.flatten() {
+                    Some(j) => *i = j,
+                    None => {
+                        self.mode = Mode::Normal;
+                        self.status = Some(Status::Info("Задача изменена снаружи — правка закрыта".into()));
+                    }
+                }
+            }
+            Mode::ConfirmDelete | Mode::MoveTo if selected_gone => self.mode = Mode::Normal,
+            _ => {}
+        }
+        if let (Some(task), Some(view)) = (notes_task, &self.notes) {
+            match self.find_task(view.category, &task) {
+                Some(j) => {
+                    let new_id = self.board.list(view.category)[j].id.clone();
+                    let view = self.notes.as_mut().unwrap();
+                    view.index = j;
+                    // Задаче без записей дали id снаружи (агент добавил запись): у окна был
+                    // лишь заготовленный id без файла — берём настоящий и читаем записи.
+                    if let Some(id) = new_id
+                        && id != view.id
+                    {
+                        view.id = id;
+                        view.stamp = None;
+                        self.reload_notes();
+                    }
+                }
+                None => {
+                    // Записи живут по id — начатое сохраняем, окно закрываем.
+                    self.save_draft(false);
+                    self.notes = None;
+                    self.status = Some(Status::Info("Задача изменена снаружи — записи закрыты".into()));
+                }
+            }
+        }
+        self.summaries = self.book.summaries(&self.board);
+    }
+
+    fn reload_notes(&mut self) {
+        let Some(view) = &mut self.notes else {
+            return;
+        };
+        let notes = match self.book.load_notes(&view.id) {
+            Ok(notes) => notes,
+            Err(e) => {
+                self.status = Some(Status::Error(format!("Записи задачи: {e:#}")));
+                return;
+            }
+        };
+        view.stamp = self.book.notes_stamp(&view.id);
+        // Пункт, который правится, — по его тексту до правки (или последнему сохранённому).
+        let find = |text: &str| notes.visible().into_iter().find(|&i| notes.editable_text(i) == text);
+        match &mut view.mode {
+            NotesMode::Text(draft) => {
+                if let NoteTarget::Entry(_) = draft.target {
+                    // Пропал — при сохранении добавится заново, ничего не потеряется.
+                    draft.target = find(&draft.saved).map_or(NoteTarget::Note, NoteTarget::Entry);
+                }
+            }
+            NotesMode::Edit { target: target @ NoteTarget::Entry(_), original, .. } => {
+                match find(original) {
+                    Some(i) => *target = NoteTarget::Entry(i),
+                    None => view.mode = NotesMode::List,
+                }
+            }
+            NotesMode::ConfirmDelete => view.mode = NotesMode::List,
+            _ => {}
+        }
+        view.notes = notes;
+        view.clamp();
+        let summary = view.notes.summary();
+        if summary.any {
+            self.summaries.insert(view.id.clone(), summary);
+        } else {
+            self.summaries.remove(&view.id);
+        }
     }
 
     /// Можно ли править открытую страницу; если нет — говорит почему.
@@ -354,6 +567,11 @@ impl App {
             self.quit = true;
             return;
         }
+        if matches!(self.status, Some(Status::Info(_))) {
+            self.status = None;
+        }
+        // Действие — над тем, что сейчас на диске, а не над устаревшей копией.
+        self.check_external();
         if matches!(self.status, Some(Status::Info(_))) {
             self.status = None;
         }
@@ -418,6 +636,7 @@ impl App {
                 | Action::Postpone
                 | Action::Delete
                 | Action::Notes
+                | Action::TogglePrivate
         );
         if edits && !self.editable() {
             return;
@@ -471,6 +690,8 @@ impl App {
             Action::MoveTo if self.selected_task().is_some() => self.mode = Mode::MoveTo,
             Action::Delete if self.selected_task().is_some() => self.mode = Mode::ConfirmDelete,
             Action::Notes => self.open_notes(),
+            Action::TogglePrivate => self.toggle_private(),
+            Action::ToggleHidden => self.toggle_hidden(),
             Action::MoveTo | Action::Delete => {}
             // Только в окне записей.
             Action::AddSubtask | Action::OpenEditor | Action::Close => {}
@@ -561,8 +782,15 @@ impl App {
         let Some(index) = self.selected() else {
             return;
         };
-        if let Some(new_index) = self.board.move_to(self.active, index, to) {
-            self.clamp_selection(self.active);
+        let from = self.active;
+        if let Some(new_index) = self.board.move_to(from, index, to) {
+            // Из скрытого списка в открытый задача уходит скрытой: открыть её может только
+            // пользователь. В скрытый — скрыта и так.
+            if self.is_hidden(from) && !self.is_hidden(to) {
+                self.board.get_mut(to, new_index).unwrap().private = true;
+                self.status = Some(Status::Info("Задача осталась скрытой от ИИ (p — открыть)".into()));
+            }
+            self.clamp_selection(from);
             self.select(to, Some(new_index));
             self.save();
         }
@@ -595,6 +823,7 @@ impl App {
             .postpone(&mut self.board, self.date, self.active, index, to)
         {
             Ok(true) => {
+                self.page_stamp = self.book.page_stamp(self.date);
                 let when = to.format(c"%-d %B %Y");
                 self.status = Some(Status::Info(format!("Перенесено на {when}")));
             }
@@ -662,6 +891,7 @@ impl App {
         };
         let task = &self.board.list(self.active)[index];
         let id = task.id.clone().unwrap_or_else(|| self.book.new_id());
+        let stamp = self.book.notes_stamp(&id);
         match self.book.load_notes(&id) {
             Ok(notes) => {
                 let mut view = NotesView {
@@ -671,6 +901,7 @@ impl App {
                     notes,
                     list: ListState::default(),
                     mode: NotesMode::List,
+                    stamp,
                 };
                 view.clamp();
                 self.notes = Some(view);
@@ -696,7 +927,7 @@ impl App {
                     self.act_notes(action);
                 }
             }
-            NotesMode::Edit { input, target } => match edit_line(input, &press) {
+            NotesMode::Edit { input, target, .. } => match edit_line(input, &press) {
                 Some(KeyCode::Enter) => {
                     let (text, target) = (input.text().trim().to_string(), *target);
                     self.commit_note(target, &text);
@@ -728,9 +959,7 @@ impl App {
                 if matches!(press.hotkey.code, KeyCode::Char('y') | KeyCode::Enter)
                     && let Some(entry) = view.selected_entry()
                 {
-                    view.notes.remove(entry);
-                    view.clamp();
-                    self.save_notes();
+                    self.remove_entry(entry);
                 }
             }
         }
@@ -754,9 +983,7 @@ impl App {
             if explicit && let NoteTarget::Entry(entry) = draft.target {
                 draft.target = NoteTarget::Note;
                 draft.saved = String::new();
-                view.notes.remove(entry);
-                view.clamp();
-                self.save_notes();
+                self.remove_entry(entry);
             }
             return;
         }
@@ -777,6 +1004,22 @@ impl App {
         if added {
             view.list.select(Some(usize::MAX));
             view.clamp();
+        }
+        self.save_notes();
+    }
+
+    /// Удаляет пункт записей; как и всё удалённое из записей, он уходит в `DELETED_NOTES.md`.
+    fn remove_entry(&mut self, entry: usize) {
+        let task = self.notes_task().map(|t| t.text.clone()).unwrap_or_default();
+        let Some(view) = &mut self.notes else {
+            return;
+        };
+        let (raw, id) = (view.notes.raw(entry), view.id.clone());
+        view.notes.remove(entry);
+        view.clamp();
+        if let Err(e) = self.book.archive_entry(&task, &id, self.date, &clock::stamp(), &raw) {
+            self.status = Some(Status::Error(format!("Архив записей: {e:#}")));
+            return;
         }
         self.save_notes();
     }
@@ -813,9 +1056,7 @@ impl App {
         view.mode = NotesMode::List;
         if text.trim().is_empty() {
             if let NoteTarget::Entry(entry) = target {
-                view.notes.remove(entry);
-                view.clamp();
-                self.save_notes();
+                self.remove_entry(entry);
             }
             return;
         }
@@ -863,6 +1104,7 @@ impl App {
                 view.mode = NotesMode::Edit {
                     input: LineInput::default(),
                     target: NoteTarget::Subtask,
+                    original: String::new(),
                 };
             }
             Action::Edit => {
@@ -873,8 +1115,9 @@ impl App {
                         NotesMode::Text(Draft::new(text, target))
                     } else {
                         NotesMode::Edit {
-                            input: LineInput::new(text),
+                            input: LineInput::new(text.clone()),
                             target,
+                            original: text,
                         }
                     };
                 }
@@ -926,6 +1169,10 @@ impl App {
         if let Err(e) = self.book.save_notes(&id, &view.notes) {
             self.status = Some(Status::Error(format!("Записи задачи: {e:#}")));
             return;
+        }
+        let stamp = self.book.notes_stamp(&id);
+        if let Some(view) = &mut self.notes {
+            view.stamp = stamp;
         }
         if summary.any {
             self.summaries.insert(id.clone(), summary);
@@ -1429,6 +1676,134 @@ mod tests {
         press_with(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.quit);
         assert_eq!(saved_note(&app).as_deref(), Some("черновик!?"));
+        cleanup(app);
+    }
+
+    #[test]
+    fn privacy() {
+        let mut app = test_app("privacy");
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "личное дело");
+        press(&mut app, KeyCode::Enter);
+        // P — список скрыт, настройка в AI_HIDDEN.md.
+        press(&mut app, KeyCode::Char('P'));
+        assert!(app.is_hidden(Category::Personal));
+        assert_eq!(app.book.hidden().unwrap(), [false, false, true, false]);
+
+        // Из скрытого в открытый — задача уходит скрытой.
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('1'));
+        let task = &app.board.list(Category::Work)[0];
+        assert!(task.private);
+        // p — открыть; из открытого в скрытый — пометка не нужна, скрыт сам список.
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('p'));
+        assert!(!app.board.list(Category::Work)[0].private);
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('3'));
+        assert!(!app.board.list(Category::Personal)[0].private);
+        // Пометка сохраняется в файле и едет при переносе на дату.
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Char('2'));
+        assert!(app.board.list(Category::Home)[0].private);
+        press(&mut app, KeyCode::Char('>'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.book.load(d(27)).unwrap().list(Category::Home)[0].private);
+        cleanup(app);
+    }
+
+    #[test]
+    fn deleted_entries_are_archived() {
+        let mut app = test_app("entries");
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "кран");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('s'));
+        type_text(&mut app, "прокладка");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        let deleted = std::fs::read_to_string(app.book.dir().join(DELETED_NOTES)).unwrap();
+        assert!(deleted.contains("— кран · удалённый пункт записей\n"), "{deleted}");
+        assert!(deleted.contains("- [ ] прокладка\n"), "{deleted}");
+        cleanup(app);
+    }
+
+    #[test]
+    fn external_changes_are_picked_up() {
+        let mut app = test_app("external");
+        for text in ["первая", "вторая"] {
+            press(&mut app, KeyCode::Char('a'));
+            type_text(&mut app, text);
+            press(&mut app, KeyCode::Enter);
+        }
+        assert_eq!(app.selected(), Some(1));
+        assert!(!app.check_external());
+
+        // Агент дописал задачу в начало — выделение остаётся на «вторая».
+        let mut board = app.book.load(d(26)).unwrap();
+        board.push(Category::Work, Task::new("от агента"));
+        board.move_up(Category::Work, 2);
+        board.move_up(Category::Work, 1);
+        app.book.save(d(26), &board).unwrap();
+        assert!(app.check_external());
+        assert_eq!(texts(&app, Category::Work), ["от агента", "первая", "вторая"]);
+        assert_eq!(app.selected(), Some(2));
+        assert!(matches!(app.status, Some(Status::Info(_))));
+
+        // Правка задачи, пока агент переставил задачи: правится та же задача.
+        press(&mut app, KeyCode::Char('e'));
+        let mut board = app.book.load(d(26)).unwrap();
+        board.move_up(Category::Work, 2);
+        app.book.save(d(26), &board).unwrap();
+        type_text(&mut app, "!");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(texts(&app, Category::Work), ["от агента", "вторая!", "первая"]);
+
+        // Записи: агент добавил заметку, пока пишем свою, — обе на месте.
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "моя");
+        assert!(app.tick(Instant::now() + AUTOSAVE));
+        let id = app.board.list(Category::Work)[1].id.clone().unwrap();
+        let mut notes = app.book.load_notes(&id).unwrap();
+        notes.add_note("2026-10-26 09:00", "заметка агента");
+        app.book.save_notes(&id, &notes).unwrap();
+        type_text(&mut app, " длиннее");
+        save_note(&mut app);
+        let file = app.book.load_notes(&id).unwrap().serialize();
+        assert!(file.contains(" моя длиннее\n") && file.contains(" заметка агента\n"), "{file}");
+        assert!(!file.contains(" моя\n"), "{file}");
+
+        // Окно записей у задачи без id, агент дал ей id и запись — окно на месте, запись видна.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('n'));
+        let mut board = app.book.load(d(26)).unwrap();
+        board.get_mut(Category::Work, 0).unwrap().id = Some("agent1".into());
+        app.book.save(d(26), &board).unwrap();
+        let mut notes = crate::notes::Notes::default();
+        notes.add_subtask("от агента");
+        app.book.save_notes("agent1", &notes).unwrap();
+        assert!(app.check_external());
+        let view = app.notes.as_ref().expect("окно записей осталось");
+        assert_eq!(view.id, "agent1");
+        assert_eq!(view.notes.visible().len(), 1);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('n'));
+
+        // Задачу удалили снаружи — окно записей закрылось.
+        let mut board = app.book.load(d(26)).unwrap();
+        board.remove(Category::Work, 1);
+        app.book.save(d(26), &board).unwrap();
+        press(&mut app, KeyCode::Char('j'));
+        assert!(app.notes.is_none());
+        assert_eq!(texts(&app, Category::Work), ["от агента", "первая"]);
         cleanup(app);
     }
 

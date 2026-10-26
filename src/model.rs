@@ -61,6 +61,8 @@ pub struct Task {
     /// Ключ доп. записей (`notes/<id>.md`); появляется с первой записью и переезжает
     /// вместе с задачей при переносе.
     pub id: Option<String>,
+    /// Скрыта от ИИ сама по себе (вдобавок к скрытым спискам); едет с задачей при переносе.
+    pub private: bool,
 }
 
 impl Task {
@@ -69,6 +71,7 @@ impl Task {
             text: text.into(),
             state: State::Open,
             id: None,
+            private: false,
         }
     }
 
@@ -78,6 +81,7 @@ impl Task {
             text: self.text.clone(),
             state: State::Open,
             id: self.id.clone(),
+            private: self.private,
         }
     }
 

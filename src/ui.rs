@@ -195,7 +195,12 @@ fn draw_list(frame: &mut Frame, app: &mut App, category: Category, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(border_style)
-        .title(format!(" {} {} ", category.index() + 1, category.title()))
+        .title(format!(
+            " {} {}{} ",
+            category.index() + 1,
+            category.title(),
+            if app.is_hidden(category) { " 🔒" } else { "" }
+        ))
         .title(Line::from(format!(" {done}/{total} ")).right_aligned());
 
     if tasks.is_empty() {
@@ -221,6 +226,10 @@ fn draw_list(frame: &mut Frame, app: &mut App, category: Category, area: Rect) {
             };
             if let Some(mark) = notes_mark(app, task) {
                 line.push_span(Span::raw(mark).fg(SUB));
+            }
+            // В скрытом списке скрыто всё, замок у каждой задачи не нужен.
+            if task.private && !app.is_hidden(category) {
+                line.push_span(Span::raw(" 🔒").fg(SUB));
             }
             line.into()
         })
@@ -422,7 +431,7 @@ fn draw_notes(frame: &mut Frame, app: &mut App) {
 
     match &mut view.mode {
         NotesMode::List => {}
-        NotesMode::Edit { input, target } => {
+        NotesMode::Edit { input, target, .. } => {
             let title = match target {
                 NoteTarget::Entry(_) => "Правка подзадачи",
                 _ => "Новая подзадача",

@@ -41,15 +41,33 @@ pub fn parse(text: &str) -> Result<Board> {
     Ok(board)
 }
 
-/// `<!-- id:k3x9ab -->` в конце строки задачи — ключ её доп. записей.
-fn split_id(line: &str) -> Option<(&str, Option<String>)> {
+/// Служебное в конце строки задачи: `<!-- id:k3x9ab private -->` — ключ доп. записей и
+/// пометка «скрыта от ИИ», в любом наборе. Комментарий из других слов — часть текста.
+#[derive(Default)]
+struct Meta {
+    id: Option<String>,
+    private: bool,
+}
+
+fn split_meta(line: &str) -> Option<(&str, Meta)> {
+    let plain = Some((line, Meta::default()));
     let Some(rest) = line.strip_suffix(" -->") else {
-        return Some((line, None));
+        return plain;
     };
-    let Some((line, id)) = rest.rsplit_once(" <!-- id:") else {
-        return Some((line, None));
+    let Some((text, comment)) = rest.rsplit_once(" <!-- ") else {
+        return plain;
     };
-    is_valid_id(id).then(|| (line, Some(id.to_string())))
+    let mut meta = Meta::default();
+    for word in comment.split_whitespace() {
+        match word.strip_prefix("id:") {
+            // Испорченный id — ошибка, а не текст: иначе записи потеряют задачу.
+            Some(id) if !is_valid_id(id) => return None,
+            Some(id) => meta.id = Some(id.to_string()),
+            None if word == "private" => meta.private = true,
+            None => return plain,
+        }
+    }
+    Some((text, meta))
 }
 
 /// id записей: латинские строчные буквы и цифры (он же имя файла).
@@ -58,7 +76,7 @@ pub fn is_valid_id(id: &str) -> bool {
 }
 
 fn parse_task(line: &str) -> Option<Task> {
-    let (line, id) = split_id(line)?;
+    let (line, Meta { id, private }) = split_meta(line)?;
     let rest = line.strip_prefix("- [")?;
     let (mark, text) = rest.split_once("] ").or_else(|| {
         // Пустой текст: «- [ ]» без пробела в конце после trim_end.
@@ -77,6 +95,7 @@ fn parse_task(line: &str) -> Option<Task> {
         text: text.to_string(),
         state,
         id,
+        private,
     })
 }
 
@@ -103,10 +122,12 @@ pub fn serialize(board: &Board) -> String {
                 out.push_str(MIGRATED_SEP);
                 out.push_str(&date.to_string());
             }
-            if let Some(id) = &task.id {
-                out.push_str(" <!-- id:");
-                out.push_str(id);
-                out.push_str(" -->");
+            let mut meta: Vec<String> = task.id.iter().map(|id| format!("id:{id}")).collect();
+            if task.private {
+                meta.push("private".into());
+            }
+            if !meta.is_empty() {
+                out.push_str(&format!(" <!-- {} -->", meta.join(" ")));
             }
             out.push('\n');
         }
@@ -158,6 +179,8 @@ mod tests {
 - [ ] Починить кран
 - [>] Позвонить мастеру → 2026-10-27 <!-- id:k3x9ab -->
 - [ ] С записями <!-- id:q1 -->
+- [ ] Секрет <!-- id:s2 private -->
+- [ ] Просто скрытая <!-- private -->
 
 ## Личное
 
@@ -173,7 +196,10 @@ mod tests {
         assert_eq!(work[0], Task::new("Написать отчёт"));
         assert_eq!(work[1].state, State::Done);
         let home = board.list(Category::Home);
-        assert_eq!(home.len(), 3);
+        assert_eq!(home.len(), 5);
+        assert!(home[3].private && home[3].id.as_deref() == Some("s2"));
+        assert!(home[4].private && home[4].id.is_none() && home[4].text == "Просто скрытая");
+        assert!(!home[2].private);
         assert_eq!(home[1].text, "Позвонить мастеру");
         assert_eq!(home[1].id.as_deref(), Some("k3x9ab"));
         assert_eq!(home[2].text, "С записями");

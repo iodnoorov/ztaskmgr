@@ -1,9 +1,11 @@
+mod agent;
 mod app;
 mod book;
 mod clock;
 mod field;
 mod input;
 mod keymap;
+mod mcp;
 mod model;
 mod notes;
 mod storage;
@@ -27,24 +29,32 @@ use crate::input::Input;
 
 const USAGE: &str = "\
 Использование: ztaskmgr [КАТАЛОГ]
+              ztaskmgr mcp [КАТАЛОГ]
 
 Записная книжка дел: страница на каждую дату, на странице четыре списка —
 Работа, Дом, Личное, Прочее.
-КАТАЛОГ — где лежат страницы (ГГГГ-ММ-ДД.md), по умолчанию ~/.local/share/ztaskmgr.";
+КАТАЛОГ — где лежат страницы (ГГГГ-ММ-ДД.md), по умолчанию ~/.local/share/ztaskmgr.
+
+mcp — MCP-сервер для ИИ-агентов (stdio): книжка как инструменты, без скрытого от ИИ.
+  claude mcp add ztaskmgr -- ztaskmgr mcp";
 
 /// Как часто проверять размер терминала, часы и смену дня, пока ввода нет.
 const RESIZE_POLL: Duration = Duration::from_millis(100);
 
 fn main() -> Result<()> {
     clock::init();
-    let Some(dir) = parse_args()? else {
+    let Some(run_as) = parse_args()? else {
         println!("{USAGE}");
         return Ok(());
     };
+    let (Run::Tui(dir) | Run::Mcp(dir)) = &run_as;
     if dir.is_file() {
         bail!("{} — файл, а нужен каталог книжки\n\n{USAGE}", dir.display());
     }
-    let book = Book::new(dir);
+    let book = Book::new(dir.clone());
+    if let Run::Mcp(_) = run_as {
+        return mcp::serve(&agent::Agent::new(book));
+    }
     let today = Date::today();
     // Автоперенос и страницу на сегодня — до перехода в TUI, чтобы ошибка разбора
     // вывелась в обычный терминал.
@@ -94,6 +104,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool) -> Resul
             dirty = true;
         }
         if app.tick(Instant::now()) {
+            dirty = true;
+        }
+        // Правки снаружи: агент через MCP, синхронизация, редактор.
+        if app.check_external() {
             dirty = true;
         }
         if let Some(path) = app.editor_request.take() {
@@ -152,14 +166,28 @@ fn run_editor(terminal: &mut DefaultTerminal, path: &Path, kitty: bool) -> Resul
 }
 
 /// `None` — запрошена справка.
-fn parse_args() -> Result<Option<PathBuf>> {
-    let mut args = std::env::args_os().skip(1);
-    match (args.next(), args.next()) {
-        (None, _) => default_path().map(Some),
-        (Some(arg), None) if arg == "-h" || arg == "--help" => Ok(None),
-        (Some(arg), None) => Ok(Some(PathBuf::from(arg))),
-        _ => bail!("слишком много аргументов\n\n{USAGE}"),
+/// Как запущена программа.
+enum Run {
+    Tui(PathBuf),
+    /// MCP-сервер для ИИ-агентов.
+    Mcp(PathBuf),
+}
+
+fn parse_args() -> Result<Option<Run>> {
+    let mut args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        return Ok(None);
     }
+    let mcp = args.first().is_some_and(|a| a == "mcp");
+    if mcp {
+        args.remove(0);
+    }
+    let dir = match &args[..] {
+        [] => default_path()?,
+        [dir] => PathBuf::from(dir),
+        _ => bail!("слишком много аргументов\n\n{USAGE}"),
+    };
+    Ok(Some(if mcp { Run::Mcp(dir) } else { Run::Tui(dir) }))
 }
 
 fn default_path() -> Result<PathBuf> {
