@@ -1,3 +1,5 @@
+use crate::clock::Date;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Category {
     Work,
@@ -44,18 +46,30 @@ impl Category {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Open,
+    Done,
+    /// Перенесена на другую страницу; здесь остаётся как запись истории.
+    Migrated(Date),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Task {
     pub text: String,
-    pub done: bool,
+    pub state: State,
 }
 
 impl Task {
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
-            done: false,
+            state: State::Open,
         }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.state == State::Open
     }
 }
 
@@ -107,6 +121,23 @@ impl Board {
         }
         list.swap(index, index + 1);
         Some(index + 1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lists.iter().all(Vec::is_empty)
+    }
+
+    /// Помечает все невыполненные задачи перенесёнными на `to` и возвращает их копии
+    /// (открытые, с категориями) для страницы `to`.
+    pub fn migrate_open(&mut self, to: Date) -> Vec<(Category, Task)> {
+        let mut moved = Vec::new();
+        for category in Category::ALL {
+            for task in self.list_mut(category).iter_mut().filter(|t| t.is_open()) {
+                moved.push((category, Task::new(task.text.clone())));
+                task.state = State::Migrated(to);
+            }
+        }
+        moved
     }
 
     /// Переносит задачу в конец другого списка. Возвращает её индекс там.
@@ -163,6 +194,24 @@ mod tests {
         assert_eq!(texts(&board, Category::Home), ["x", "a"]);
         assert_eq!(board.move_to(Category::Work, 0, Category::Work), None);
         assert_eq!(board.move_to(Category::Work, 5, Category::Home), None);
+    }
+
+    #[test]
+    fn migrate_open_only() {
+        let mut board = board_with(Category::Work, &["a", "b"]);
+        board.push(Category::Home, Task::new("c"));
+        board.get_mut(Category::Work, 1).unwrap().state = State::Done;
+        let to = Date::new(2026, 10, 27).unwrap();
+        let moved = board.migrate_open(to);
+        assert_eq!(
+            moved,
+            [(Category::Work, Task::new("a")), (Category::Home, Task::new("c"))]
+        );
+        assert_eq!(board.list(Category::Work)[0].state, State::Migrated(to));
+        assert_eq!(board.list(Category::Work)[1].state, State::Done);
+        assert!(board.migrate_open(to).is_empty());
+        assert!(!board.is_empty());
+        assert!(Board::default().is_empty());
     }
 
     #[test]

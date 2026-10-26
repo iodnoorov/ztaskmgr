@@ -23,22 +23,35 @@ pub enum Action {
     MoveDown,
     /// Перенос в другой список: дальше ждём цифру.
     MoveTo,
+    /// Перенос на другую дату: спрашиваем дату.
+    Postpone,
     Delete,
+    PrevDay,
+    NextDay,
+    Today,
+    GoToDate,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Section {
     Tasks,
+    Pages,
     Navigation,
     Field,
 }
 
 impl Section {
-    pub const ALL: [Section; 3] = [Section::Tasks, Section::Navigation, Section::Field];
+    pub const ALL: [Section; 4] = [
+        Section::Tasks,
+        Section::Pages,
+        Section::Navigation,
+        Section::Field,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Section::Tasks => "Задачи",
+            Section::Pages => "Страницы",
             Section::Navigation => "Навигация",
             Section::Field => "Поле ввода",
         }
@@ -124,9 +137,27 @@ pub const ROWS: &[Row] = &[
     ),
     row(
         Section::Tasks,
+        "перенести на другую дату",
+        &[(c('>'), A::Postpone)],
+    ),
+    row(
+        Section::Tasks,
         "удалить",
         &[(c('d'), A::Delete), (k(KeyCode::Delete), A::Delete)],
     ),
+    labeled(
+        Section::Pages,
+        "[ ]  PgUp PgDn",
+        "предыдущий / следующий день",
+        &[
+            (c('['), A::PrevDay),
+            (c(']'), A::NextDay),
+            (k(KeyCode::PageUp), A::PrevDay),
+            (k(KeyCode::PageDown), A::NextDay),
+        ],
+    ),
+    row(Section::Pages, "сегодня", &[(c('t'), A::Today)]),
+    row(Section::Pages, "перейти к дате", &[(c('D'), A::GoToDate)]),
     labeled(
         Section::Navigation,
         "1-4  Tab",
@@ -175,6 +206,7 @@ pub const ROWS: &[Row] = &[
     labeled(Section::Field, "Enter  Esc", "сохранить / отмена", &[]),
     labeled(Section::Field, "Ctrl+W", "удалить слово", &[]),
     labeled(Section::Field, "Ctrl+A  Ctrl+E", "в начало / в конец строки", &[]),
+    labeled(Section::Field, "дата", "2026-10-27  27.10  +1  -3", &[]),
 ];
 
 /// Что делает клавиша на главном экране.
@@ -259,6 +291,7 @@ mod tests {
         assert_eq!(hint_keys(&[A::Toggle]), "␣");
         assert_eq!(hint_keys(&[A::MoveUp, A::MoveDown]), "⇧↑↓");
         assert_eq!(hint_keys(&[A::Top, A::Bottom]), "g/G");
+        assert_eq!(hint_keys(&[A::PrevDay, A::NextDay]), "[]");
         // У каждой строки справки есть клавиши (или подпись к клавишам, назначенным в другом месте).
         for r in ROWS {
             assert!(!r.keys.is_empty() || r.label.is_some(), "{:?}", r.help);

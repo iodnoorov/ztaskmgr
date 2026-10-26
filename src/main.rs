@@ -1,4 +1,5 @@
 mod app;
+mod book;
 mod clock;
 mod field;
 mod input;
@@ -16,27 +17,40 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use ratatui::crossterm::{execute, terminal};
 
-use crate::app::App;
+use crate::app::{App, Status};
+use crate::book::Book;
+use crate::clock::Date;
 use crate::input::Input;
 
 const USAGE: &str = "\
-Использование: ztaskmgr [ФАЙЛ]
+Использование: ztaskmgr [КАТАЛОГ]
 
-Менеджер задач: четыре списка — Работа, Дом, Личное, Прочее.
-ФАЙЛ — Markdown-файл задач, по умолчанию ~/.local/share/ztaskmgr/tasks.md.";
+Записная книжка дел: страница на каждую дату, на странице четыре списка —
+Работа, Дом, Личное, Прочее.
+КАТАЛОГ — где лежат страницы (ГГГГ-ММ-ДД.md), по умолчанию ~/.local/share/ztaskmgr.";
 
-/// Как часто проверять размер терминала и часы, пока ввода нет.
+/// Как часто проверять размер терминала, часы и смену дня, пока ввода нет.
 const RESIZE_POLL: Duration = Duration::from_millis(100);
 
 fn main() -> Result<()> {
     clock::init();
-    let Some(path) = parse_args()? else {
+    let Some(dir) = parse_args()? else {
         println!("{USAGE}");
         return Ok(());
     };
-    // Файл читаем до перехода в TUI, чтобы ошибка разбора вывелась в обычный терминал.
-    let board = storage::load(&path)?;
-    let mut app = App::new(board, path);
+    if dir.is_file() {
+        bail!("{} — файл, а нужен каталог книжки\n\n{USAGE}", dir.display());
+    }
+    let book = Book::new(dir);
+    let today = Date::today();
+    // Автоперенос и страницу на сегодня — до перехода в TUI, чтобы ошибка разбора
+    // вывелась в обычный терминал.
+    let carried = book.carry_over(today)?;
+    book.load(today)?;
+    let mut app = App::new(book, today);
+    if let Some((from, count)) = carried {
+        app.status = Some(Status::Info(app::carried_message(from, count)));
+    }
 
     let mut terminal = ratatui::init();
     // Вставленный текст приходит одним событием, а не потоком горячих клавиш.
@@ -85,6 +99,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool) -> Resul
         if now != time {
             time = now;
             dirty = true;
+            let today = Date::today();
+            if today != app.today {
+                app.on_new_day(today);
+            }
         }
     }
     Ok(())
@@ -103,6 +121,6 @@ fn parse_args() -> Result<Option<PathBuf>> {
 
 fn default_path() -> Result<PathBuf> {
     ProjectDirs::from("", "", "ztaskmgr")
-        .map(|dirs| dirs.data_dir().join("tasks.md"))
+        .map(|dirs| dirs.data_dir().to_path_buf())
         .context("не удалось определить домашний каталог")
 }

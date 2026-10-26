@@ -4,7 +4,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::model::{Board, Category, Task};
+use crate::clock::Date;
+use crate::model::{Board, Category, State, Task};
 
 /// Разбирает Markdown-файл задач.
 ///
@@ -29,7 +30,7 @@ pub fn parse(text: &str) -> Result<Board> {
         }
 
         let Some(task) = parse_task(line) else {
-            bail!("строка {n}: ожидалась задача «- [ ] …» или заголовок «## …»: {line}");
+            bail!("строка {n}: ожидалась задача «- [ ] …», «- [x] …», «- [>] … → ГГГГ-ММ-ДД» или заголовок «## …»: {line}");
         };
         let Some(category) = current else {
             bail!("строка {n}: задача до первого заголовка категории");
@@ -46,16 +47,23 @@ fn parse_task(line: &str) -> Option<Task> {
         // Пустой текст: «- [ ]» без пробела в конце после trim_end.
         rest.strip_suffix(']').map(|mark| (mark, ""))
     })?;
-    let done = match mark {
-        " " => false,
-        "x" | "X" => true,
+    let (state, text) = match mark {
+        " " => (State::Open, text),
+        "x" | "X" => (State::Done, text),
+        ">" => {
+            let (text, date) = text.rsplit_once(MIGRATED_SEP)?;
+            (State::Migrated(Date::parse_iso(date)?), text)
+        }
         _ => return None,
     };
     Some(Task {
         text: text.to_string(),
-        done,
+        state,
     })
 }
+
+/// Между текстом перенесённой задачи и датой, на которую её перенесли.
+const MIGRATED_SEP: &str = " → ";
 
 pub fn serialize(board: &Board) -> String {
     let mut out = String::new();
@@ -67,8 +75,16 @@ pub fn serialize(board: &Board) -> String {
         out.push_str(category.title());
         out.push('\n');
         for task in board.list(category) {
-            out.push_str(if task.done { "- [x] " } else { "- [ ] " });
+            out.push_str(match task.state {
+                State::Open => "- [ ] ",
+                State::Done => "- [x] ",
+                State::Migrated(_) => "- [>] ",
+            });
             out.push_str(&task.text);
+            if let State::Migrated(date) = task.state {
+                out.push_str(MIGRATED_SEP);
+                out.push_str(&date.to_string());
+            }
             out.push('\n');
         }
     }
@@ -113,6 +129,7 @@ mod tests {
 
 ## Дом
 - [ ] Починить кран
+- [>] Позвонить мастеру → 2026-10-27
 
 ## Личное
 
@@ -126,10 +143,13 @@ mod tests {
         let work = board.list(Category::Work);
         assert_eq!(work.len(), 2);
         assert_eq!(work[0], Task::new("Написать отчёт"));
-        assert!(work[1].done);
-        assert_eq!(board.list(Category::Home).len(), 1);
+        assert_eq!(work[1].state, State::Done);
+        let home = board.list(Category::Home);
+        assert_eq!(home.len(), 2);
+        assert_eq!(home[1].text, "Позвонить мастеру");
+        assert_eq!(home[1].state, State::Migrated(Date::new(2026, 10, 27).unwrap()));
         assert!(board.list(Category::Personal).is_empty());
-        assert!(board.list(Category::Other)[0].done);
+        assert_eq!(board.list(Category::Other)[0].state, State::Done);
     }
 
     #[test]
@@ -167,6 +187,11 @@ mod tests {
         assert!(err.to_string().contains("строка 1"), "{err}");
 
         assert!(parse("## Работа\n- [?] странная\n").is_err());
+        // Перенесённая — только с датой.
+        assert!(parse("## Работа\n- [>] без даты\n").is_err());
+        assert!(parse("## Работа\n- [>] плохая → 2026-13-01\n").is_err());
+        let board = parse("## Работа\n- [>] a → b → 2026-10-27\n").unwrap();
+        assert_eq!(board.list(Category::Work)[0].text, "a → b");
     }
 
     #[test]

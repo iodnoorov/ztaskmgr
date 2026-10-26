@@ -1,35 +1,56 @@
-use std::path::PathBuf;
-
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::widgets::ListState;
 
+use crate::book::Book;
+use crate::clock::Date;
 use crate::field::LineInput;
 use crate::input::Press;
 use crate::keymap::{self, Action};
-use crate::model::{Board, Category, Task};
-use crate::storage;
+use crate::model::{Board, Category, State, Task};
 
 #[derive(Debug)]
 pub enum Mode {
     Normal,
     /// Ввод текста: новая задача (`index == None`) или правка существующей.
     Edit { input: LineInput, index: Option<usize> },
+    /// Ввод даты: перейти к странице или перенести задачу.
+    Date { input: LineInput, purpose: DatePurpose },
     ConfirmDelete,
     /// Ожидание цифры категории после `m`.
     MoveTo,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatePurpose {
+    Go,
+    /// Перенос задачи с этим индексом в активном списке.
+    Postpone(usize),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Status {
+    /// Сообщение; пропадает при следующем нажатии.
+    Info(String),
+    /// Ошибка; держится, пока не пройдёт следующее сохранение или не сменится страница.
+    Error(String),
+}
+
 pub struct App {
+    pub book: Book,
+    /// Дата открытой страницы.
+    pub date: Date,
+    pub today: Date,
     pub board: Board,
-    pub path: PathBuf,
+    /// Страница не прочиталась: показываем пустой лист, но не даём его править и сохранять,
+    /// иначе файл с ошибкой перезапишется.
+    pub page_error: Option<String>,
     pub active: Category,
     /// Выделение и прокрутка — свои у каждого списка.
     pub lists: [ListState; 4],
     pub mode: Mode,
     pub show_help: bool,
     pub show_about: bool,
-    /// Сообщение в строке состояния (ошибка сохранения и т. п.).
-    pub status: Option<String>,
+    pub status: Option<Status>,
     pub quit: bool,
 }
 
@@ -37,11 +58,41 @@ fn ctrl(press: &Press, c: char) -> bool {
     press.hotkey.code == KeyCode::Char(c) && press.hotkey.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+/// Правка однострочного поля. Возвращает `Enter` или `Esc`, если поле пора закрыть.
+fn edit_line(input: &mut LineInput, press: &Press) -> Option<KeyCode> {
+    let typed = press.typed;
+    match press.hotkey.code {
+        code @ (KeyCode::Esc | KeyCode::Enter) => return Some(code),
+        _ if ctrl(press, 'w') => input.delete_word(),
+        _ if ctrl(press, 'a') => input.home(),
+        _ if ctrl(press, 'e') => input.end(),
+        KeyCode::Backspace => input.backspace(),
+        KeyCode::Delete => input.delete(),
+        KeyCode::Left => input.left(),
+        KeyCode::Right => input.right(),
+        KeyCode::Home => input.home(),
+        KeyCode::End => input.end(),
+        _ => {
+            if let KeyCode::Char(c) = typed.code
+                && !typed
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                input.insert(c);
+            }
+        }
+    }
+    None
+}
+
 impl App {
-    pub fn new(board: Board, path: PathBuf) -> Self {
+    pub fn new(book: Book, today: Date) -> Self {
         let mut app = Self {
-            board,
-            path,
+            book,
+            date: today,
+            today,
+            board: Board::default(),
+            page_error: None,
             active: Category::Work,
             lists: Default::default(),
             mode: Mode::Normal,
@@ -50,9 +101,7 @@ impl App {
             status: None,
             quit: false,
         };
-        for category in Category::ALL {
-            app.clamp_selection(category);
-        }
+        app.open_page(today);
         app
     }
 
@@ -80,10 +129,68 @@ impl App {
         });
     }
 
+    /// Открывает страницу на дату; активный список остаётся тем же.
+    pub fn open_page(&mut self, date: Date) {
+        self.date = date;
+        match self.book.load(date) {
+            Ok(board) => {
+                self.board = board;
+                self.page_error = None;
+                if matches!(self.status, Some(Status::Error(_))) {
+                    self.status = None;
+                }
+            }
+            Err(e) => {
+                let e = format!("{e:#}");
+                self.board = Board::default();
+                self.status = Some(Status::Error(format!("Страница не прочитана: {e}")));
+                self.page_error = Some(e);
+            }
+        }
+        self.lists = Default::default();
+        for category in Category::ALL {
+            self.clamp_selection(category);
+        }
+    }
+
+    /// Наступил новый день (программа открыта через полночь): автоперенос, и если была
+    /// открыта страница «сегодня» — переход на новую.
+    pub fn on_new_day(&mut self, today: Date) {
+        let was_today = self.date == self.today;
+        self.today = today;
+        match self.book.carry_over(today) {
+            Ok(carried) => {
+                if let Some((from, count)) = carried {
+                    self.status = Some(Status::Info(carried_message(from, count)));
+                }
+                // Страницы, которых коснулся перенос, перечитываются.
+                if was_today || self.date == today || carried.is_some_and(|(f, _)| f == self.date) {
+                    self.open_page(if was_today { today } else { self.date });
+                }
+            }
+            Err(e) => self.status = Some(Status::Error(format!("Автоперенос: {e:#}"))),
+        }
+    }
+
     fn save(&mut self) {
-        self.status = storage::save(&self.path, &self.board)
-            .err()
-            .map(|e| format!("Ошибка сохранения: {e:#}"));
+        match self.book.save(self.date, &self.board) {
+            Ok(()) => {
+                if matches!(self.status, Some(Status::Error(_))) {
+                    self.status = None;
+                }
+            }
+            Err(e) => self.status = Some(Status::Error(format!("Ошибка сохранения: {e:#}"))),
+        }
+    }
+
+    /// Можно ли править открытую страницу; если нет — говорит почему.
+    fn editable(&mut self) -> bool {
+        if self.page_error.is_some() {
+            self.status = Some(Status::Error(
+                "Страница не прочитана — правка отключена, исправьте файл".into(),
+            ));
+        }
+        self.page_error.is_none()
     }
 
     /// Нажатие: горячие клавиши — по физической клавише, поле ввода получает набранное.
@@ -92,6 +199,9 @@ impl App {
         if ctrl(&press, 'c') {
             self.quit = true;
             return;
+        }
+        if matches!(self.status, Some(Status::Info(_))) {
+            self.status = None;
         }
         if self.show_help || self.show_about {
             self.show_help = false;
@@ -106,6 +216,7 @@ impl App {
                 }
             }
             Mode::Edit { .. } => self.on_key_edit(press),
+            Mode::Date { .. } => self.on_key_date(press),
             Mode::ConfirmDelete => self.on_key_confirm(press),
             Mode::MoveTo => self.on_key_move_to(press),
         }
@@ -114,7 +225,7 @@ impl App {
     /// Вставленный текст идёт в открытое поле ввода как есть, иначе игнорируется:
     /// на главном экране он сработал бы как горячие клавиши.
     pub fn on_paste(&mut self, text: &str) {
-        if let Mode::Edit { input, .. } = &mut self.mode {
+        if let Mode::Edit { input, .. } | Mode::Date { input, .. } = &mut self.mode {
             text.chars()
                 .filter(|c| !c.is_control())
                 .for_each(|c| input.insert(c));
@@ -122,6 +233,20 @@ impl App {
     }
 
     fn act(&mut self, action: Action) {
+        let edits = matches!(
+            action,
+            Action::Add
+                | Action::Edit
+                | Action::Toggle
+                | Action::MoveUp
+                | Action::MoveDown
+                | Action::MoveTo
+                | Action::Postpone
+                | Action::Delete
+        );
+        if edits && !self.editable() {
+            return;
+        }
         let list = &mut self.lists[self.active.index()];
         match action {
             Action::Quit => self.quit = true,
@@ -141,6 +266,15 @@ impl App {
             }
             Action::Top => self.select(self.active, Some(0)),
             Action::Bottom => self.select(self.active, Some(usize::MAX)),
+            Action::PrevDay => self.open_page(self.date.add_days(-1)),
+            Action::NextDay => self.open_page(self.date.add_days(1)),
+            Action::Today => self.open_page(self.today),
+            Action::GoToDate => {
+                self.mode = Mode::Date {
+                    input: LineInput::default(),
+                    purpose: DatePurpose::Go,
+                }
+            }
             Action::Add => {
                 self.mode = Mode::Edit {
                     input: LineInput::default(),
@@ -158,6 +292,7 @@ impl App {
             Action::Toggle => self.toggle_done(),
             Action::MoveUp => self.move_task(Board::move_up),
             Action::MoveDown => self.move_task(Board::move_down),
+            Action::Postpone => self.start_postpone(),
             Action::MoveTo if self.selected_task().is_some() => self.mode = Mode::MoveTo,
             Action::Delete if self.selected_task().is_some() => self.mode = Mode::ConfirmDelete,
             Action::MoveTo | Action::Delete => {}
@@ -168,33 +303,46 @@ impl App {
         let Mode::Edit { input, index } = &mut self.mode else {
             return;
         };
-        let typed = press.typed;
-        match press.hotkey.code {
-            KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Enter => {
+        match edit_line(input, &press) {
+            Some(KeyCode::Enter) => {
                 let text = input.text().trim().to_string();
                 let index = *index;
                 self.mode = Mode::Normal;
                 self.commit_edit(index, text);
             }
-            _ if ctrl(&press, 'w') => input.delete_word(),
-            _ if ctrl(&press, 'a') => input.home(),
-            _ if ctrl(&press, 'e') => input.end(),
-            KeyCode::Backspace => input.backspace(),
-            KeyCode::Delete => input.delete(),
-            KeyCode::Left => input.left(),
-            KeyCode::Right => input.right(),
-            KeyCode::Home => input.home(),
-            KeyCode::End => input.end(),
-            _ => {
-                if let KeyCode::Char(c) = typed.code
-                    && !typed
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                {
-                    input.insert(c);
+            Some(_) => self.mode = Mode::Normal,
+            None => {}
+        }
+    }
+
+    /// Дата из поля ввода; относительные (`+1`) — от открытой страницы.
+    pub fn input_date(&self, input: &LineInput) -> Option<Date> {
+        Date::parse_input(input.text(), self.date)
+    }
+
+    fn on_key_date(&mut self, press: Press) {
+        let Mode::Date { input, purpose } = &mut self.mode else {
+            return;
+        };
+        let purpose = *purpose;
+        match edit_line(input, &press) {
+            Some(KeyCode::Enter) => {
+                if input.text().trim().is_empty() {
+                    self.mode = Mode::Normal;
+                    return;
+                }
+                // Не дата — поле остаётся открытым, окно показывает, что не так.
+                let Some(date) = Date::parse_input(input.text(), self.date) else {
+                    return;
+                };
+                self.mode = Mode::Normal;
+                match purpose {
+                    DatePurpose::Go => self.open_page(date),
+                    DatePurpose::Postpone(index) => self.postpone(index, date),
                 }
             }
+            Some(_) => self.mode = Mode::Normal,
+            None => {}
         }
     }
 
@@ -225,6 +373,41 @@ impl App {
         }
     }
 
+    /// Окно даты для переноса; по умолчанию — день после открытой страницы, но не раньше
+    /// завтрашнего.
+    fn start_postpone(&mut self) {
+        let Some(index) = self.selected() else {
+            return;
+        };
+        if !self.board.list(self.active)[index].is_open() {
+            self.status = Some(Status::Info("Переносятся только невыполненные задачи".into()));
+            return;
+        }
+        let default = self.date.max(self.today).add_days(1);
+        self.mode = Mode::Date {
+            input: LineInput::new(default.to_string()),
+            purpose: DatePurpose::Postpone(index),
+        };
+    }
+
+    fn postpone(&mut self, index: usize, to: Date) {
+        if to == self.date {
+            self.status = Some(Status::Info("Это та же страница".into()));
+            return;
+        }
+        match self
+            .book
+            .postpone(&mut self.board, self.date, self.active, index, to)
+        {
+            Ok(true) => {
+                let when = to.format(c"%-d %B %Y");
+                self.status = Some(Status::Info(format!("Перенесено на {when}")));
+            }
+            Ok(false) => {}
+            Err(e) => self.status = Some(Status::Error(format!("Перенос: {e:#}"))),
+        }
+    }
+
     /// Пустой текст отменяет ввод: пустых задач не создаём, существующую не затираем.
     fn commit_edit(&mut self, index: Option<usize>, text: String) {
         if text.is_empty() {
@@ -247,10 +430,21 @@ impl App {
         let Some(index) = self.selected() else {
             return;
         };
-        if let Some(task) = self.board.get_mut(self.active, index) {
-            task.done = !task.done;
-            self.save();
-        }
+        let Some(task) = self.board.get_mut(self.active, index) else {
+            return;
+        };
+        task.state = match task.state {
+            State::Open => State::Done,
+            State::Done => State::Open,
+            State::Migrated(to) => {
+                let when = to.format(c"%-d %B");
+                self.status = Some(Status::Info(format!(
+                    "Задача перенесена на {when} — отметьте её там"
+                )));
+                return;
+            }
+        };
+        self.save();
     }
 
     /// Сдвиг внутри списка (`Board::move_up` / `move_down`).
@@ -265,10 +459,21 @@ impl App {
     }
 }
 
+pub fn carried_message(from: Date, count: usize) -> String {
+    format!(
+        "Перенесено невыполненных задач со страницы {}: {count}",
+        from.format(c"%-d %B")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::crossterm::event::KeyEvent;
+
+    fn d(day: u32) -> Date {
+        Date::new(2026, 10, day).unwrap()
+    }
 
     fn press(app: &mut App, code: KeyCode) {
         app.on_key(code);
@@ -285,10 +490,13 @@ mod tests {
     }
 
     fn test_app(name: &str) -> App {
-        let path = std::env::temp_dir()
-            .join(format!("ztaskmgr-app-{}-{name}", std::process::id()))
-            .join("tasks.md");
-        App::new(Board::default(), path)
+        let dir = std::env::temp_dir().join(format!("ztaskmgr-app-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        App::new(Book::new(dir), d(26))
+    }
+
+    fn cleanup(app: App) {
+        let _ = std::fs::remove_dir_all(app.book.dir());
     }
 
     fn texts(app: &App, category: Category) -> Vec<String> {
@@ -315,7 +523,7 @@ mod tests {
         assert_eq!(texts(&app, Category::Work), ["вторая", "первая"]);
 
         press(&mut app, KeyCode::Char(' '));
-        assert!(app.board.list(Category::Work)[0].done);
+        assert_eq!(app.board.list(Category::Work)[0].state, State::Done);
 
         press(&mut app, KeyCode::Char('m'));
         press(&mut app, KeyCode::Char('3'));
@@ -331,10 +539,9 @@ mod tests {
         assert!(app.board.list(Category::Work).is_empty());
         assert_eq!(app.selected(), None);
 
-        let saved = storage::load(&app.path).unwrap();
-        assert_eq!(saved, app.board);
+        assert_eq!(app.book.load(d(26)).unwrap(), app.board);
         assert_eq!(app.status, None);
-        std::fs::remove_dir_all(app.path.parent().unwrap()).unwrap();
+        cleanup(app);
     }
 
     #[test]
@@ -347,7 +554,7 @@ mod tests {
         assert_eq!(texts(&app, Category::Work), ["фото"]);
         // «ч» — x: выполнено; «в» + «н» — d + y: удалить.
         press(&mut app, KeyCode::Char('ч'));
-        assert!(app.board.list(Category::Work)[0].done);
+        assert_eq!(app.board.list(Category::Work)[0].state, State::Done);
         press(&mut app, KeyCode::Char('в'));
         press(&mut app, KeyCode::Char('н'));
         assert!(app.board.list(Category::Work).is_empty());
@@ -357,7 +564,11 @@ mod tests {
         press_with(&mut app, KeyCode::Char('ц'), KeyModifiers::CONTROL);
         let Mode::Edit { input, .. } = &app.mode else { panic!() };
         assert_eq!(input.text(), "два ");
-        std::fs::remove_dir_all(app.path.parent().unwrap()).unwrap();
+        // «х» / «ъ» — [ / ]: листание.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('ъ'));
+        assert_eq!(app.date, d(27));
+        cleanup(app);
     }
 
     #[test]
@@ -384,7 +595,85 @@ mod tests {
         type_text(&mut app, "   ");
         press(&mut app, KeyCode::Enter);
         assert_eq!(texts(&app, Category::Home).len(), 1);
-        std::fs::remove_dir_all(app.path.parent().unwrap()).unwrap();
+        cleanup(app);
+    }
+
+    #[test]
+    fn pages_and_postpone() {
+        let mut app = test_app("pages");
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "позвонить");
+        press(&mut app, KeyCode::Enter);
+
+        // Перенос: по умолчанию на завтра.
+        press(&mut app, KeyCode::Char('>'));
+        let Mode::Date { input, .. } = &app.mode else { panic!() };
+        assert_eq!(input.text(), "2026-10-27");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.board.list(Category::Work)[0].state, State::Migrated(d(27)));
+        assert!(matches!(app.status, Some(Status::Info(_))));
+        // Перенесённую не отметить и не перенести второй раз.
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.board.list(Category::Work)[0].state, State::Migrated(d(27)));
+        press(&mut app, KeyCode::Char('>'));
+        assert!(matches!(app.mode, Mode::Normal));
+
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.date, d(27));
+        assert_eq!(texts(&app, Category::Work), ["позвонить"]);
+        assert!(app.board.list(Category::Work)[0].is_open());
+
+        // Переход к дате: не дата — окно остаётся открытым.
+        press(&mut app, KeyCode::Char('D'));
+        type_text(&mut app, "31.02");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Date { .. }));
+        press_with(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        type_text(&mut app, "+3");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.date, d(30));
+        assert!(app.board.is_empty());
+
+        // Все задачи удалены — файла страницы нет.
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.date, d(26));
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.book.dates().unwrap(), [d(27)]);
+        cleanup(app);
+    }
+
+    #[test]
+    fn broken_page_is_read_only() {
+        let app = test_app("broken");
+        let path = app.book.dir().join("2026-10-25.md");
+        std::fs::create_dir_all(app.book.dir()).unwrap();
+        std::fs::write(&path, "## Работа\nпросто текст\n").unwrap();
+        let mut app = app;
+        press(&mut app, KeyCode::Char('['));
+        assert!(app.page_error.is_some());
+        press(&mut app, KeyCode::Char('a'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(matches!(app.status, Some(Status::Error(_))));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "## Работа\nпросто текст\n");
+        press(&mut app, KeyCode::Char(']'));
+        assert!(app.page_error.is_none() && app.status.is_none());
+        cleanup(app);
+    }
+
+    #[test]
+    fn new_day_carries_over() {
+        let mut app = test_app("midnight");
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "недоделано");
+        press(&mut app, KeyCode::Enter);
+        app.on_new_day(d(27));
+        assert_eq!(app.date, d(27));
+        assert_eq!(texts(&app, Category::Work), ["недоделано"]);
+        assert!(matches!(app.status, Some(Status::Info(_))));
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(app.board.list(Category::Work)[0].state, State::Migrated(d(27)));
+        cleanup(app);
     }
 
     #[test]
@@ -406,12 +695,11 @@ mod tests {
 
     #[test]
     fn navigation_stays_in_bounds() {
-        let mut board = Board::default();
+        let mut app = test_app("nav");
         for text in ["a", "b"] {
-            board.push(Category::Work, Task::new(text));
+            app.board.push(Category::Work, Task::new(text));
         }
-        let mut app = App::new(board, PathBuf::from("/nonexistent/tasks.md"));
-        assert_eq!(app.selected(), Some(0));
+        app.select(Category::Work, Some(0));
         press(&mut app, KeyCode::Char('k'));
         assert_eq!(app.selected(), Some(0));
         for _ in 0..5 {

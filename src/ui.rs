@@ -14,10 +14,11 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Mode};
-use crate::clock;
+use crate::app::{App, DatePurpose, Mode, Status};
+use crate::clock::{self, Date};
+use crate::field::LineInput;
 use crate::keymap::{self, Action as A, Section};
-use crate::model::Category;
+use crate::model::{Category, State};
 
 const ACCENT: Color = Color::Cyan;
 const SUB: Color = Color::Gray;
@@ -55,6 +56,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Vec<Link> {
 
     match &app.mode {
         Mode::Edit { .. } => draw_edit(frame, app),
+        Mode::Date { .. } => draw_date(frame, app),
         Mode::ConfirmDelete => draw_confirm(frame, app),
         Mode::Normal | Mode::MoveTo => {}
     }
@@ -116,18 +118,41 @@ fn truncate_start(text: &str, width: usize) -> String {
     out
 }
 
-/// Шапка: название, открытый файл слева, дата и время справа.
+/// Дата страницы целиком: «Понедельник, 26 октября 2026».
+fn page_date(date: Date) -> String {
+    date.format(c"%A, %-d %B %Y")
+}
+
+/// Дата, на которую перенесена задача: год — только если он не тот, что у страницы.
+fn short_date(date: Date, page: Date) -> String {
+    if date.year() == page.year() {
+        date.format(c"%-d %B")
+    } else {
+        date.format(c"%-d %B %Y")
+    }
+}
+
+/// Шапка: название, дата открытой страницы и каталог книжки слева, текущие дата и время справа.
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let right = Line::from(format!("{} ", clock::now()).fg(SUB));
+    let relative = match app.today.days_until(app.date) {
+        0 => " · сегодня",
+        -1 => " · вчера",
+        1 => " · завтра",
+        _ => "",
+    };
     let title = [
         Span::raw(" ≡ ").fg(Color::Black).bg(ACCENT).bold(),
         Span::raw(" ztaskmgr ").fg(ACCENT).bold(),
         Span::raw("  "),
+        Span::raw(page_date(app.date)).bold(),
+        Span::raw(relative).fg(MUTED),
+        Span::raw("   "),
     ];
     let title_w: usize = title.iter().map(Span::width).sum();
     // Между путём и часами — хотя бы два пробела; на узком экране путь обрезается слева.
     let room = usize::from(area.width).saturating_sub(title_w + right.width() + 2);
-    let path = truncate_start(&display_path(&app.path), room);
+    let path = truncate_start(&display_path(app.book.dir()), room);
     let mut left = title.to_vec();
     left.push(Span::raw(path).fg(SUB));
     frame.render_widget(Line::from(left), area);
@@ -150,7 +175,12 @@ fn any_key_closes() -> Line<'static> {
 fn draw_list(frame: &mut Frame, app: &mut App, category: Category, area: Rect) {
     let active = app.active == category;
     let tasks = app.board.list(category);
-    let done = tasks.iter().filter(|t| t.done).count();
+    // Перенесённые — уже не дела этой страницы, в счётчике их нет.
+    let done = tasks.iter().filter(|t| t.state == State::Done).count();
+    let total = tasks
+        .iter()
+        .filter(|t| !matches!(t.state, State::Migrated(_)))
+        .count();
 
     let border_style = if active {
         Style::new().fg(ACCENT).bold()
@@ -161,7 +191,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, category: Category, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(border_style)
         .title(format!(" {} {} ", category.index() + 1, category.title()))
-        .title(Line::from(format!(" {done}/{} ", tasks.len())).right_aligned());
+        .title(Line::from(format!(" {done}/{total} ")).right_aligned());
 
     if tasks.is_empty() {
         let hint = Paragraph::new("пусто".fg(MUTED)).centered().block(block);
@@ -172,13 +202,17 @@ fn draw_list(frame: &mut Frame, app: &mut App, category: Category, area: Rect) {
     let items: Vec<ListItem> = tasks
         .iter()
         .map(|task| {
-            if task.done {
-                Line::from(vec![
+            match task.state {
+                State::Open => Line::raw(format!("[ ] {}", task.text)),
+                State::Done => Line::from(vec![
                     Span::raw("[x] ").fg(MUTED),
                     Span::raw(task.text.as_str()).fg(MUTED).crossed_out(),
-                ])
-            } else {
-                Line::raw(format!("[ ] {}", task.text))
+                ]),
+                State::Migrated(to) => Line::from(vec![
+                    Span::raw("[>] ").fg(MUTED),
+                    Span::raw(task.text.as_str()).fg(MUTED),
+                    Span::raw(format!(" → {}", short_date(to, app.date))).fg(MUTED).italic(),
+                ]),
             }
             .into()
         })
@@ -206,9 +240,16 @@ fn key_hint(key: &str, action: &str) -> [Span<'static>; 2] {
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    if let Some(status) = &app.status {
-        frame.render_widget(Line::from(format!(" {status}").red()), area);
-        return;
+    match &app.status {
+        Some(Status::Error(text)) => {
+            frame.render_widget(Line::from(format!(" {text}").red()), area);
+            return;
+        }
+        Some(Status::Info(text)) => {
+            frame.render_widget(Line::from(format!(" {text}").fg(ACCENT)), area);
+            return;
+        }
+        None => {}
     }
     let hints: Vec<(String, &str)> = match app.mode {
         Mode::Normal => {
@@ -216,6 +257,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 (&[A::Add], "добавить"),
                 (&[A::Edit], "правка"),
                 (&[A::Toggle], "готово"),
+                (&[A::PrevDay, A::NextDay], "день"),
+                (&[A::Postpone], "на дату"),
                 (&[A::MoveUp, A::MoveDown], "сдвиг"),
                 (&[A::MoveTo], "перенос"),
                 (&[A::Delete], "удалить"),
@@ -228,6 +271,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 .collect()
         }
         Mode::Edit { .. } => vec![("Enter".into(), "сохранить"), ("Esc".into(), "отмена")],
+        Mode::Date { purpose, .. } => {
+            let enter = match purpose {
+                DatePurpose::Go => "перейти",
+                DatePurpose::Postpone(_) => "перенести",
+            };
+            vec![("Enter".into(), enter), ("Esc".into(), "отмена")]
+        }
         Mode::ConfirmDelete => vec![("y/Enter".into(), "удалить"), ("другая".into(), "отмена")],
         Mode::MoveTo => {
             frame.render_widget(move_to_hint(app.active), area);
@@ -288,8 +338,36 @@ fn draw_edit(frame: &mut Frame, app: &App) {
         return;
     };
     let action = if index.is_some() { "Правка" } else { "Новая задача" };
+    draw_field(frame, panel(format!("{action} · {}", app.active.title())), input);
+}
+
+/// Окно даты; внизу — во что разбирается введённое.
+fn draw_date(frame: &mut Frame, app: &App) {
+    let Mode::Date { input, purpose } = &app.mode else {
+        return;
+    };
+    let title = match purpose {
+        DatePurpose::Go => "Перейти к дате".to_string(),
+        DatePurpose::Postpone(index) => {
+            let text = app.board.list(app.active).get(*index).map_or("", |t| t.text.as_str());
+            format!("Перенести «{text}» на дату")
+        }
+    };
+    let preview = if input.text().trim().is_empty() {
+        " 2026-10-27 · 27.10 · +1 · -3 ".fg(MUTED)
+    } else {
+        match app.input_date(input) {
+            Some(date) => format!(" {} ", page_date(date)).fg(ACCENT),
+            None => " не дата ".red(),
+        }
+    };
+    let block = panel(title).title_bottom(Line::from(preview).centered());
+    draw_field(frame, block, input);
+}
+
+/// Окно с однострочным полем ввода.
+fn draw_field(frame: &mut Frame, block: Block<'static>, input: &LineInput) {
     let area = popup_area(frame.area(), 70, 3);
-    let block = panel(format!("{action} · {}", app.active.title()));
     let inner = block.inner(area);
 
     // Горизонтальная прокрутка, чтобы курсор оставался в поле.
@@ -350,7 +428,7 @@ fn draw_help(frame: &mut Frame) {
     let columns = if area.width >= 2 * COL + 6 {
         vec![
             render(&[Section::Tasks, Section::Field]),
-            render(&[Section::Navigation]),
+            render(&[Section::Pages, Section::Navigation]),
         ]
     } else {
         vec![render(&Section::ALL)]
