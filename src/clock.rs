@@ -7,13 +7,83 @@ use std::fmt;
 /// Формат часов в шапке: «Пн, 26 октября 2026  16:42» в ru_RU.
 const CLOCK_FORMAT: &CStr = c"%a, %-d %B %Y  %H:%M";
 
-/// Включает системную локаль для дат. Вызывать в начале `main`, пока потоков больше нет:
-/// `setlocale` не потокобезопасна.
+/// Включает системную локаль для дат и часовой пояс телефона на Android. Вызывать в начале
+/// `main`, пока потоков больше нет: `setlocale` и `set_var` не потокобезопасны.
 pub fn init() {
+    android_timezone();
     // SAFETY: пустая строка — «взять из окружения»; вызывается до запуска других потоков.
     unsafe {
         libc::setlocale(libc::LC_TIME, c"".as_ptr());
     }
+}
+
+/// Где Android хранит базу часовых поясов (новые версии — первыми).
+const ANDROID_TZDATA: &[&str] = &[
+    "/apex/com.android.tzdata/etc/tz/tzdata",
+    "/data/misc/zoneinfo/current/tzdata",
+    "/system/usr/share/zoneinfo/tzdata",
+];
+
+/// На Android часовой пояс — системное свойство, а не `TZ` и не `/etc/localtime`; статический
+/// (musl) бинарник в Termux его не видит и живёт по UTC. Если `TZ` не задан, а это Android
+/// (есть `getprop`; проверяется при запуске — сборка-то под `linux`), берём пояс у системы
+/// и правило для него (`MSK-3`) — из системной базы поясов.
+fn android_timezone() {
+    if std::env::var_os("TZ").is_some_and(|tz| !tz.is_empty()) {
+        return;
+    }
+    let getprop = std::path::Path::new("/system/bin/getprop");
+    if !getprop.exists() {
+        return;
+    }
+    let Some(name) = std::process::Command::new(getprop)
+        .arg("persist.sys.timezone")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+    else {
+        return;
+    };
+    let rule = ANDROID_TZDATA
+        .iter()
+        .filter_map(|path| std::fs::read(path).ok())
+        .find_map(|bundle| zone_rule(&bundle, &name));
+    if let Some(rule) = rule {
+        // SAFETY: вызывается из `init`, до запуска других потоков.
+        unsafe { std::env::set_var("TZ", rule) };
+    }
+}
+
+/// Правило пояса `name` (POSIX-строка вроде `MSK-3`) из базы поясов Android. База: заголовок
+/// (`tzdata2024a` в 12 байтах, затем смещения таблицы, данных и zone.tab — big-endian u32),
+/// таблица по 52 байта (имя в 40 байтах с нулями, начало от смещения данных, длина, запас)
+/// и сами TZif-данные. Правило — последняя строка TZif версии 2 и выше.
+fn zone_rule(bundle: &[u8], name: &str) -> Option<String> {
+    let u32_at = |at: usize| -> Option<usize> {
+        let bytes = bundle.get(at..at + 4)?;
+        Some(u32::from_be_bytes(bytes.try_into().ok()?) as usize)
+    };
+    if !bundle.starts_with(b"tzdata") {
+        return None;
+    }
+    let (index, data) = (u32_at(12)?, u32_at(16)?);
+    let entry = (index..data).step_by(52).find(|&at| {
+        bundle
+            .get(at..at + 40)
+            .is_some_and(|raw| raw.split(|&b| b == 0).next() == Some(name.as_bytes()))
+    })?;
+    let (start, length) = (u32_at(entry + 40)?, u32_at(entry + 44)?);
+    let tzif = bundle.get(data + start..data + start + length)?;
+    // Версия 2+: «TZif2…» … «\n<правило>\n» в самом конце.
+    if !tzif.starts_with(b"TZif") || tzif.get(4).is_none_or(|&v| v < b'2') {
+        return None;
+    }
+    let body = tzif.strip_suffix(b"\n")?;
+    let rule = &body[body.iter().rposition(|&b| b == b'\n')? + 1..];
+    let rule = std::str::from_utf8(rule).ok()?;
+    (!rule.is_empty()).then(|| rule.to_string())
 }
 
 fn local_tm() -> Option<libc::tm> {
@@ -32,9 +102,9 @@ fn strftime(format: &CStr, tm: &libc::tm) -> String {
     String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
-/// Метка заметки: `2026-10-26 19:40`, не зависит от локали.
+/// Метка заметки: `26.10.2026 19:40`, не зависит от локали.
 pub fn stamp() -> String {
-    local_tm().map_or_else(String::new, |tm| strftime(c"%Y-%m-%d %H:%M", &tm))
+    local_tm().map_or_else(String::new, |tm| strftime(c"%d.%m.%Y %H:%M", &tm))
 }
 
 /// Часы и минуты — для шапки на узком экране.
@@ -188,6 +258,62 @@ mod tests {
         Date::new(y, m, day).unwrap()
     }
 
+    /// База поясов Android из одной-двух зон, как её собирает ZoneCompactor.
+    fn bundle(zones: &[(&str, &[u8])]) -> Vec<u8> {
+        let index = 24;
+        let data = index + 52 * zones.len();
+        let mut out = b"tzdata2026a\0".to_vec();
+        out.extend((index as u32).to_be_bytes());
+        out.extend((data as u32).to_be_bytes());
+        out.extend(0u32.to_be_bytes());
+        let mut start = 0;
+        for (name, tzif) in zones {
+            let mut raw = [0u8; 40];
+            raw[..name.len()].copy_from_slice(name.as_bytes());
+            out.extend(raw);
+            out.extend((start as u32).to_be_bytes());
+            out.extend((tzif.len() as u32).to_be_bytes());
+            out.extend(0u32.to_be_bytes());
+            start += tzif.len();
+        }
+        for (_, tzif) in zones {
+            out.extend(*tzif);
+        }
+        out
+    }
+
+    #[test]
+    fn android_zone_rule() {
+        let moscow: &[u8] = b"TZif2\0\0\0 v1 data TZif2 v2 data\nMSK-3\n";
+        let berlin: &[u8] = b"TZif3 data\nCET-1CEST,M3.5.0,M10.5.0/3\n";
+        let base = bundle(&[("Europe/Berlin", berlin), ("Europe/Moscow", moscow)]);
+        assert_eq!(zone_rule(&base, "Europe/Moscow").as_deref(), Some("MSK-3"));
+        assert_eq!(zone_rule(&base, "Europe/Berlin").as_deref(), Some("CET-1CEST,M3.5.0,M10.5.0/3"));
+        // Префикс имени — не та зона.
+        assert_eq!(zone_rule(&base, "Europe/Mos"), None);
+        assert_eq!(zone_rule(&base, "Asia/Tokyo"), None);
+        // TZif версии 1 — правила нет; не база — ничего.
+        assert_eq!(zone_rule(&bundle(&[("UTC", b"TZif\0 old")]), "UTC"), None);
+        assert_eq!(zone_rule(b"not a bundle", "UTC"), None);
+        assert_eq!(zone_rule(&base[..30], "Europe/Moscow"), None);
+    }
+
+    /// Настоящая база Android: `ZTASKMGR_TZDATA=…/tzdata cargo test -- --ignored android_real`.
+    #[test]
+    #[ignore]
+    fn android_real_bundle() {
+        let path = std::env::var("ZTASKMGR_TZDATA").expect("путь к tzdata в ZTASKMGR_TZDATA");
+        let base = std::fs::read(path).unwrap();
+        for (zone, rule) in [
+            ("Europe/Moscow", "MSK-3"),
+            ("Asia/Yekaterinburg", "<+05>-5"),
+            ("Europe/Berlin", "CET-1CEST,M3.5.0,M10.5.0/3"),
+            ("America/New_York", "EST5EDT,M3.2.0,M11.1.0"),
+        ] {
+            assert_eq!(zone_rule(&base, zone).as_deref(), Some(rule), "{zone}");
+        }
+    }
+
     #[test]
     fn formats_current_time() {
         // В тестах локаль не включается: «C», английские названия.
@@ -195,7 +321,7 @@ mod tests {
         assert!(text.contains(&Date::today().year().to_string()), "{text}");
         assert!(text.contains(':') && text.contains(", "), "{text}");
         let stamp = stamp();
-        assert!(stamp.starts_with(&Date::today().to_string()), "{stamp}");
+        assert!(stamp.starts_with(&Date::today().format(c"%d.%m.%Y")), "{stamp}");
         assert_eq!(stamp.len(), 16);
     }
 

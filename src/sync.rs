@@ -282,7 +282,7 @@ mod tests {
         let mut other = Notes::default();
         other.add_subtask("купить");
         other.toggle(0);
-        other.add_note("2026-10-26 09:00", "с телефона");
+        other.add_note("26.10.2026 09:00", "с телефона");
         fs::write(dir.join("notes/aa.sync-conflict-20261026-091500-PHONE.md"), other.serialize()).unwrap();
 
         fs::write(dir.join("2026-10-27.sync-conflict-20261026-091500-PHONE.md"), "испорчено\n").unwrap();
@@ -292,7 +292,7 @@ mod tests {
         assert_eq!(report.merged, ["2026-10-26.md", "aa.md"]);
         assert_eq!(report.failed, ["2026-10-27.sync-conflict-20261026-091500-PHONE.md"]);
         assert_eq!(texts(&book.load(d(26)).unwrap(), Category::Work), ["с компьютера", "с телефона"]);
-        assert_eq!(book.load_notes("aa").unwrap().serialize(), "- [x] купить\n- 2026-10-26 09:00 с телефона\n");
+        assert_eq!(book.load_notes("aa").unwrap().serialize(), "- [x] купить\n- 26.10.2026 09:00 с телефона\n");
         assert!(!dir.join("2026-10-26.sync-conflict-20261026-091500-PHONE.md").exists());
         // Чужие файлы не тронуты, испорченная копия осталась.
         assert!(dir.join("photo.sync-conflict-20261026-091500-PHONE.jpg").exists());

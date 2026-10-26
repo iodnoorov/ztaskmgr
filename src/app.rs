@@ -1644,7 +1644,7 @@ mod tests {
         let notes = app.book.load_notes(&id).unwrap().serialize();
         let lines: Vec<&str> = notes.lines().collect();
         assert_eq!(lines[0], "- [x] купить прокладку");
-        assert!(lines[1].starts_with("- 2026-") && lines[1].ends_with(" мастер сказал"), "{notes}");
+        assert!(lines[1].starts_with("- 26.10.") && lines[1].ends_with(" мастер сказал"), "{notes}");
         assert_eq!(app.summaries[&id].subtasks_done, 1);
         // id сохранён на странице.
         assert_eq!(app.book.load(d(26)).unwrap(), app.board);
@@ -1954,7 +1954,7 @@ mod tests {
         assert!(app.tick(Instant::now() + AUTOSAVE));
         let id = app.board.list(Category::Work)[1].id.clone().unwrap();
         let mut notes = app.book.load_notes(&id).unwrap();
-        notes.add_note("2026-10-26 09:00", "заметка агента");
+        notes.add_note("26.10.2026 09:00", "заметка агента");
         app.book.save_notes(&id, &notes).unwrap();
         type_text(&mut app, " длиннее");
         save_note(&mut app);

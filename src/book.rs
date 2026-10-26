@@ -395,15 +395,15 @@ mod tests {
 
         // Удалили копию на 26-м — запись на 25-м осталась, записи живы.
         book.save(d(26), &Board::default()).unwrap();
-        assert!(!book.archive_notes(&task, d(26), "2026-10-26 19:40").unwrap());
+        assert!(!book.archive_notes(&task, d(26), "26.10.2026 19:40").unwrap());
         assert!(book.notes_path(&id).exists());
 
         // Удалили последнюю — записи в DELETED_NOTES.md.
         book.save(d(25), &Board::default()).unwrap();
-        assert!(book.archive_notes(&task, d(25), "2026-10-26 19:41").unwrap());
+        assert!(book.archive_notes(&task, d(25), "26.10.2026 19:41").unwrap());
         assert!(!book.notes_path(&id).exists());
         let deleted = fs::read_to_string(book.dir().join(DELETED_NOTES)).unwrap();
-        assert!(deleted.starts_with("## 2026-10-26 19:41 — кран\n"), "{deleted}");
+        assert!(deleted.starts_with("## 26.10.2026 19:41 — кран\n"), "{deleted}");
         assert!(deleted.contains(&format!("id:{id}, страница 2026-10-25")));
         assert!(deleted.contains("- [ ] купить\n"));
         // Пустые записи — без файла.
@@ -423,9 +423,9 @@ mod tests {
         fs::write(book.dir().join(AI_HIDDEN), "- Отпуск\n").unwrap();
         assert!(book.hidden().is_err());
 
-        book.archive_entry("кран", "abc", d(26), "2026-10-26 21:00", "- [ ] купить\n").unwrap();
+        book.archive_entry("кран", "abc", d(26), "26.10.2026 21:00", "- [ ] купить\n").unwrap();
         let deleted = fs::read_to_string(book.dir().join(DELETED_NOTES)).unwrap();
-        assert!(deleted.starts_with("## 2026-10-26 21:00 — кран · удалённый пункт записей\n"));
+        assert!(deleted.starts_with("## 26.10.2026 21:00 — кран · удалённый пункт записей\n"));
         assert!(deleted.ends_with("\n\n- [ ] купить\n\n"), "{deleted:?}");
 
         assert_eq!(book.page_stamp(d(26)), None);

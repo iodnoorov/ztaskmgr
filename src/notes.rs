@@ -1,4 +1,4 @@
-//! Доп. записи по задаче: Markdown-список в `notes/<id>.md`. Заметка — `- 2026-10-26 19:40 текст`,
+//! Доп. записи по задаче: Markdown-список в `notes/<id>.md`. Заметка — `- 26.10.2026 19:40 текст`,
 //! её следующие строки — с отступом в два пробела (пустые строки внутри заметки — пустые);
 //! подзадача — `- [ ] текст`. Файл правится и во внешнем редакторе, поэтому любые другие строки
 //! сохраняются как есть, а пустые между пунктами — на своих местах.
@@ -59,16 +59,27 @@ pub struct Summary {
     pub subtasks: usize,
 }
 
-/// `2026-10-26 19:40` — метка заметки.
+/// Строка по маске: `d` — цифра, остальное — как есть.
+fn matches_mask(s: &str, mask: &str) -> bool {
+    s.len() == mask.len()
+        && s.bytes().zip(mask.bytes()).all(|(c, m)| if m == b'd' { c.is_ascii_digit() } else { c == m })
+}
+
+/// `26.10.2026 19:40` — метка заметки.
 fn is_stamp(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() == 16
-        && b.iter().enumerate().all(|(i, &c)| match i {
-            4 | 7 => c == b'-',
-            10 => c == b' ',
-            13 => c == b':',
-            _ => c.is_ascii_digit(),
-        })
+    matches_mask(s, "dd.dd.dddd dd:dd")
+}
+
+/// Первая строка заметки с меткой прежнего вида (`- 26.10.2026 19:40 …`) — в нынешнем виде;
+/// остальные строки — как есть. Файл обновится при следующем сохранении записей.
+fn modern_head(line: &str) -> String {
+    match line.strip_prefix("- ") {
+        Some(rest) if rest.is_char_boundary(16) && matches_mask(&rest[..16], "dddd-dd-dd dd:dd") => {
+            let (date, tail) = rest.split_at(16);
+            format!("- {}.{}.{} {}{tail}", &date[8..10], &date[5..7], &date[..4], &date[11..])
+        }
+        _ => line.to_string(),
+    }
 }
 
 /// Вид и текст первой строки пункта.
@@ -131,7 +142,7 @@ impl Notes {
                     _ => entries.push(Entry { lines: vec![String::new()] }),
                 }
             } else {
-                entries.push(Entry { lines: vec![line.to_string()] });
+                entries.push(Entry { lines: vec![modern_head(line)] });
             }
             i += 1;
         }
@@ -284,7 +295,7 @@ mod tests {
 - [ ] купить прокладку
 - [x] перекрыть воду
 
-- 2026-10-26 19:40 мастер сказал:
+- 26.10.2026 19:40 мастер сказал:
   менять смеситель целиком
 
   прокладку можно не покупать
@@ -298,11 +309,11 @@ mod tests {
         assert_eq!(notes.item(0).kind, Kind::Subtask { done: false });
         assert_eq!(notes.item(0).head, "купить прокладку");
         let note = notes.item(3);
-        assert_eq!(note.kind, Kind::Note { stamp: "2026-10-26 19:40" });
+        assert_eq!(note.kind, Kind::Note { stamp: "26.10.2026 19:40" });
         assert_eq!(note.head, "мастер сказал:");
         assert_eq!(note.body, ["менять смеситель целиком", "", "прокладку можно не покупать"]);
         assert_eq!(notes.item(4).kind, Kind::Text);
-        assert_eq!(head_kind("- 2026-10-2x 19:40 нет").0, Kind::Text);
+        assert_eq!(head_kind("- 26.1x.2026 19:40 нет").0, Kind::Text);
         assert_eq!(head_kind("- коротко").0, Kind::Text);
         assert_eq!(
             notes.summary(),
@@ -315,15 +326,25 @@ mod tests {
     }
 
     #[test]
+    fn old_stamps_are_converted() {
+        let notes = Notes::parse("- 2026-10-26 19:40 по-старому\n  дальше\n- [ ] 2026-10-26 19:40 не метка\n");
+        assert_eq!(notes.item(0).kind, Kind::Note { stamp: "26.10.2026 19:40" });
+        assert_eq!(
+            notes.serialize(),
+            "- 26.10.2026 19:40 по-старому\n  дальше\n- [ ] 2026-10-26 19:40 не метка\n"
+        );
+    }
+
+    #[test]
     fn multiline_note_round_trip() {
         let mut notes = Notes::default();
-        notes.add_note("2026-10-26 19:40", "первая\n\nтретья");
-        assert_eq!(notes.serialize(), "- 2026-10-26 19:40 первая\n\n  третья\n");
+        notes.add_note("26.10.2026 19:40", "первая\n\nтретья");
+        assert_eq!(notes.serialize(), "- 26.10.2026 19:40 первая\n\n  третья\n");
         assert_eq!(Notes::parse(&notes.serialize()), notes);
         assert!(notes.is_multiline(0));
         assert_eq!(notes.editable_text(0), "первая\n\nтретья");
         notes.set_text(0, "одна строка");
-        assert_eq!(notes.serialize(), "- 2026-10-26 19:40 одна строка\n");
+        assert_eq!(notes.serialize(), "- 26.10.2026 19:40 одна строка\n");
     }
 
     #[test]
@@ -331,7 +352,7 @@ mod tests {
         let mut notes = Notes::default();
         assert!(notes.is_empty());
         notes.add_subtask("купить");
-        notes.add_note("2026-10-26 19:40", "позвонил");
+        notes.add_note("26.10.2026 19:40", "позвонил");
         assert!(notes.toggle(0));
         assert!(!notes.toggle(1));
         assert!(!notes.is_multiline(0));
@@ -340,11 +361,11 @@ mod tests {
         notes.set_text(1, "позвонил ещё раз");
         assert_eq!(
             notes.serialize(),
-            "- [x] купить две\n- 2026-10-26 19:40 позвонил ещё раз\n"
+            "- [x] купить две\n- 26.10.2026 19:40 позвонил ещё раз\n"
         );
         notes.swap(0, 1);
         notes.remove(1);
-        assert_eq!(notes.serialize(), "- 2026-10-26 19:40 позвонил ещё раз\n");
+        assert_eq!(notes.serialize(), "- 26.10.2026 19:40 позвонил ещё раз\n");
         // Продолжение подзадачи из редактора при правке первой строки остаётся.
         let mut notes = Notes::parse("- [ ] пункт\n  подробности\n");
         notes.set_text(0, "пункт поправлен");

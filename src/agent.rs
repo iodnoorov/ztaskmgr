@@ -625,7 +625,7 @@ mod tests {
         // Удаление пункта и задачи — в архив.
         agent.delete_note(&id, 1).unwrap();
         let deleted = fs::read_to_string(agent.book().dir().join(crate::book::DELETED_NOTES)).unwrap();
-        assert!(deleted.contains("- 2026-") && deleted.contains("  продолжение\n"), "{deleted}");
+        assert!(deleted.contains(&format!("- {}", Date::today().format(c"%d.%m.%Y"))) && deleted.contains("  продолжение\n"), "{deleted}");
         agent.delete_task(&format!("{}/Работа/1", d(27))).unwrap();
         // Копия-запись на 26-м ещё есть — записи живы.
         assert!(agent.get_task(&id).unwrap().contains("собрать цифры"));
