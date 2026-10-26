@@ -80,8 +80,6 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     // Вставленный текст приходит одним событием, а не потоком горячих клавиш.
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
-    // Мышь — это касания в Termux: тапы и свайпы.
-    input::mouse_on();
     let mut kitty = false;
     let result = run(&mut terminal, &mut app, &mut kitty);
     if kitty {
@@ -99,7 +97,18 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool) -> Resul
     let mut size = terminal::size()?;
     let mut time = clock::now();
     let mut dirty = true;
+    // Мышь — это касания в Termux: тапы и свайпы. Пока открыто поле ввода, она выключена,
+    // чтобы тап вызывал клавиатуру (см. `App::wants_text`).
+    let mut mouse = false;
     while !app.quit {
+        if mouse == app.wants_text() {
+            mouse = !mouse;
+            if mouse {
+                input::mouse_on();
+            } else {
+                input::mouse_off();
+            }
+        }
         if dirty {
             let mut links = Vec::new();
             terminal.draw(|frame| links = ui::draw(frame, app))?;

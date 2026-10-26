@@ -629,6 +629,16 @@ impl App {
         }
     }
 
+    /// Открыто ли поле ввода. Тогда отслеживание мыши выключается: в Termux тап по экрану
+    /// снова вызывает клавиатуру, а не уходит программе.
+    pub fn wants_text(&self) -> bool {
+        let notes_field = self
+            .notes
+            .as_ref()
+            .is_some_and(|v| matches!(v.mode, NotesMode::Edit { .. } | NotesMode::Text(Draft { confirm_close: false, .. })));
+        notes_field || (self.notes.is_none() && matches!(self.mode, Mode::Edit { .. } | Mode::Date { .. }))
+    }
+
     /// Тап (щелчок) и свайп (прокрутка): что под пальцем — по карте попаданий кадра.
     pub fn on_mouse(&mut self, mouse: Mouse) {
         let point = Position::new(mouse.column, mouse.row);
@@ -970,12 +980,12 @@ impl App {
         let Some(index) = self.selected() else {
             return;
         };
-        let Some(task) = self.board.get_mut(self.active, index) else {
+        let Some(task) = self.board.list(self.active).get(index) else {
             return;
         };
-        task.state = match task.state {
-            State::Open => State::Done,
-            State::Done => State::Open,
+        let done = match task.state {
+            State::Open => true,
+            State::Done => false,
             State::Migrated(to) => {
                 let when = to.format(c"%-d %B");
                 self.status = Some(Status::Info(format!(
@@ -984,6 +994,12 @@ impl App {
                 return;
             }
         };
+        // Выполненная уезжает вниз, а выделение остаётся на месте — на следующей задаче:
+        // так удобно отмечать подряд. Снятая отметка — выделение едет за задачей.
+        let moved = self.board.set_done(self.active, index, done);
+        if !done {
+            self.select(self.active, moved);
+        }
         self.save();
     }
 
@@ -1430,9 +1446,19 @@ mod tests {
         press(&mut app, KeyCode::Char('J'));
         assert_eq!(texts(&app, Category::Work), ["вторая", "первая"]);
 
+        // Выполненная — вниз, выделение — на следующей задаче.
         press(&mut app, KeyCode::Char(' '));
-        assert_eq!(app.board.list(Category::Work)[0].state, State::Done);
+        assert_eq!(texts(&app, Category::Work), ["первая", "вторая"]);
+        assert_eq!(app.board.list(Category::Work)[1].state, State::Done);
+        assert_eq!(app.selected(), Some(0));
+        // Снятая отметка — в конец открытых, выделение за ней.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.board.list(Category::Work)[1].state, State::Open);
+        assert_eq!(app.selected(), Some(1));
+        press(&mut app, KeyCode::Char(' '));
 
+        press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('m'));
         press(&mut app, KeyCode::Char('3'));
         assert_eq!(texts(&app, Category::Work), ["первая"]);
@@ -1992,6 +2018,26 @@ mod tests {
         app.after_editor(Some("Редактор «nope» не запустился".into()));
         assert!(matches!(app.status, Some(Status::Error(_))));
         assert!(app.notes.is_some());
+        cleanup(app);
+    }
+
+    #[test]
+    fn text_fields_release_the_mouse() {
+        let mut app = test_app("keyboard");
+        assert!(!app.wants_text());
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.wants_text());
+        type_text(&mut app, "x");
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.wants_text());
+        press(&mut app, KeyCode::Char('n'));
+        assert!(!app.wants_text());
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.wants_text());
+        type_text(&mut app, "заметка");
+        press(&mut app, KeyCode::Esc);
+        // Вопрос «закрыть?» — кнопки-подсказки снова нужны.
+        assert!(!app.wants_text());
         cleanup(app);
     }
 

@@ -141,6 +141,25 @@ impl Board {
         Some(index + 1)
     }
 
+    /// Отмечает задачу выполненной или снимает отметку. Выполненная уезжает в конец списка,
+    /// снятая — в конец невыполненных (после последней открытой). Возвращает новый индекс.
+    pub fn set_done(&mut self, category: Category, index: usize, done: bool) -> Option<usize> {
+        let list = self.list_mut(category);
+        let mut task = list.get(index)?.clone();
+        if matches!(task.state, State::Migrated(_)) || (task.state == State::Done) == done {
+            return Some(index);
+        }
+        list.remove(index);
+        task.state = if done { State::Done } else { State::Open };
+        let at = if done {
+            list.len()
+        } else {
+            list.iter().rposition(Task::is_open).map_or(0, |i| i + 1)
+        };
+        list.insert(at, task);
+        Some(at)
+    }
+
     /// Вставляет задачу в список на место `index` (не дальше конца).
     pub fn insert(&mut self, category: Category, index: usize, task: Task) {
         let list = self.list_mut(category);
@@ -232,6 +251,25 @@ mod tests {
         assert_eq!(texts(&board, Category::Home), ["x", "a"]);
         assert_eq!(board.move_to(Category::Work, 0, Category::Work), None);
         assert_eq!(board.move_to(Category::Work, 5, Category::Home), None);
+    }
+
+    #[test]
+    fn done_sinks_down() {
+        let order = |b: &Board| b.list(Category::Work).iter().map(|t| t.text.clone()).collect::<Vec<_>>();
+        // Порядок: открытые, затем выполненные в порядке отметки.
+        let mut board = board_with(Category::Work, &["a", "b", "c"]);
+        assert_eq!(board.set_done(Category::Work, 0, true), Some(2));
+        assert_eq!(board.set_done(Category::Work, 0, true), Some(2));
+        assert_eq!(order(&board), ["c", "a", "b"]);
+        // Уже выполненную повторно — на месте.
+        assert_eq!(board.set_done(Category::Work, 1, true), Some(1));
+        // Снятая отметка — в конец открытых.
+        assert_eq!(board.set_done(Category::Work, 2, false), Some(1));
+        assert_eq!(order(&board), ["c", "b", "a"]);
+        assert_eq!(board.set_done(Category::Work, 9, true), None);
+        // Перенесённую не трогаем.
+        board.get_mut(Category::Work, 0).unwrap().state = State::Migrated(Date::new(2026, 10, 27).unwrap());
+        assert_eq!(board.set_done(Category::Work, 0, true), Some(0));
     }
 
     #[test]

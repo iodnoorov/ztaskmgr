@@ -1014,7 +1014,8 @@ mod tests {
         // `[ ]` — отметить; вкладка — другой список; ▶ — следующий день.
         render(&mut terminal, &mut app);
         tap(&mut app, Hit::Check(Category::Work, 0));
-        assert_eq!(app.board.list(Category::Work)[0].state, State::Done);
+        let work = app.board.list(Category::Work);
+        assert_eq!((work[1].text.as_str(), work[1].state), ("раз", State::Done));
         render(&mut terminal, &mut app);
         tap(&mut app, Hit::List(Category::Home));
         assert_eq!(app.active, Category::Home);

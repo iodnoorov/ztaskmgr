@@ -397,12 +397,11 @@ impl Agent {
             found.task_mut().text = text.to_string();
         }
         if let Some(done) = done {
-            let task = found.task_mut();
-            task.state = match (task.state, done) {
-                (State::Migrated(to), _) => bail!("task was moved to {to}; change it there"),
-                (_, true) => State::Done,
-                (_, false) => State::Open,
-            };
+            if let State::Migrated(to) = found.task().state {
+                bail!("task was moved to {to}; change it there");
+            }
+            // Как в программе: выполненная — в конец списка, снятая — в конец открытых.
+            found.index = found.board.set_done(found.category, found.index, done).unwrap();
         }
         if let Some(to) = list
             && to != found.category
