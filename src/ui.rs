@@ -14,12 +14,13 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, DatePurpose, Mode, NoteTarget, NotesMode, NotesView, Status};
+use crate::app::{App, AUTOSAVE, DatePurpose, Draft, Mode, NoteTarget, NotesMode, NotesView, Status};
 use crate::clock::{self, Date};
 use crate::field::LineInput;
 use crate::keymap::{self, Action as A, Section};
 use crate::model::{Category, State, Task};
-use crate::notes::{self, Item};
+use crate::field::TextArea;
+use crate::notes::Kind;
 
 const ACCENT: Color = Color::Cyan;
 const SUB: Color = Color::Gray;
@@ -330,6 +331,16 @@ fn draw_notes_status(frame: &mut Frame, view: &NotesView, area: Rect) {
                 .collect()
         }
         NotesMode::Edit { .. } => vec![("Enter".into(), "сохранить"), ("Esc".into(), "отмена")],
+        NotesMode::Text(Draft { confirm_close: true, .. }) => vec![
+            ("y/Enter".into(), "закрыть"),
+            ("s/Ctrl+S".into(), "сохранить и закрыть"),
+            ("другая".into(), "вернуться"),
+        ],
+        NotesMode::Text(_) => vec![
+            ("Ctrl+S".into(), "сохранить"),
+            ("Enter".into(), "новая строка"),
+            ("Esc".into(), "закрыть"),
+        ],
         NotesMode::ConfirmDelete => vec![("y/Enter".into(), "удалить"), ("другая".into(), "отмена")],
     };
     let help = keymap::hint_keys_in(keymap::NOTES_ROWS, &[A::Help]);
@@ -369,32 +380,34 @@ fn draw_notes(frame: &mut Frame, app: &mut App) {
     let items: Vec<ListItem> = visible
         .iter()
         .map(|&i| {
-            let (prefix, text, style): (Vec<Span>, &str, Style) = match notes::item(view.notes.line(i)) {
-                Item::Subtask { done: false, text } => (vec![Span::raw("[ ] ")], text, Style::new()),
-                Item::Subtask { done: true, text } => (
+            let item = view.notes.item(i);
+            let (prefix, style): (Vec<Span>, Style) = match item.kind {
+                Kind::Subtask { done: false } => (vec![Span::raw("[ ] ")], Style::new()),
+                Kind::Subtask { done: true } => (
                     vec![Span::raw("[x] ").fg(MUTED)],
-                    text,
                     Style::new().fg(MUTED).crossed_out(),
                 ),
-                Item::Note { stamp, text } => (
-                    vec![Span::raw(format!("{stamp}  ")).fg(MUTED)],
-                    text,
-                    Style::new(),
-                ),
-                Item::Text(text) => (vec![], text, Style::new()),
+                Kind::Note { stamp } => (vec![Span::raw(format!("{stamp}  ")).fg(MUTED)], Style::new()),
+                Kind::Text => (vec![], Style::new()),
             };
-            // Длинные записи переносятся по словам, продолжение — с отступом префикса.
+            // Строки пункта и длинные строки (по словам) — с отступом под префикс.
             let indent: usize = prefix.iter().map(Span::width).sum();
-            let mut lines = Vec::new();
-            for (n, chunk) in wrap(text, text_width.saturating_sub(indent).max(5)).into_iter().enumerate() {
-                let mut spans = if n == 0 {
-                    prefix.clone()
-                } else {
-                    vec![Span::raw(" ".repeat(indent))]
-                };
-                spans.push(Span::styled(chunk, style));
-                lines.push(Line::from(spans));
-            }
+            let wrap_width = text_width.saturating_sub(indent).max(5);
+            let chunks = std::iter::once(item.head)
+                .chain(item.body.iter().copied())
+                .flat_map(|line| wrap(line, wrap_width));
+            let lines: Vec<Line> = chunks
+                .enumerate()
+                .map(|(n, chunk)| {
+                    let mut spans = if n == 0 {
+                        prefix.clone()
+                    } else {
+                        vec![Span::raw(" ".repeat(indent))]
+                    };
+                    spans.push(Span::styled(chunk, style));
+                    Line::from(spans)
+                })
+                .collect();
             ListItem::new(lines)
         })
         .collect();
@@ -407,21 +420,77 @@ fn draw_notes(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Clear, area);
     frame.render_stateful_widget(list, area, &mut view.list);
 
-    match &view.mode {
+    match &mut view.mode {
         NotesMode::List => {}
         NotesMode::Edit { input, target } => {
             let title = match target {
-                NoteTarget::Note => "Новая заметка",
-                NoteTarget::Subtask => "Новая подзадача",
-                NoteTarget::Line(_) => "Правка строки",
+                NoteTarget::Entry(_) => "Правка подзадачи",
+                _ => "Новая подзадача",
             };
             draw_field(frame, panel(title), input);
         }
+        NotesMode::Text(draft) => {
+            let title = match draft.target {
+                NoteTarget::Note => "Новая заметка",
+                _ => "Заметка",
+            };
+            let saved = match &draft.saved_label {
+                Some(time) if !draft.is_changed() => format!(" сохранено в {time} "),
+                Some(time) => format!(" сохранено в {time} · автосохранение раз в {} с ", AUTOSAVE.as_secs()),
+                None => format!(" автосохранение раз в {} с ", AUTOSAVE.as_secs()),
+            };
+            draw_text_area(frame, title, &saved, &mut draft.area);
+            if draft.confirm_close {
+                let answers = Line::from(vec![
+                    Span::raw("y").red().bold(),
+                    Span::raw(" — закрыть без них · ").fg(MUTED),
+                    Span::raw("s").fg(ACCENT).bold(),
+                    Span::raw(" — сохранить · другая — назад").fg(MUTED),
+                ]);
+                draw_question_with(
+                    frame,
+                    "Закрыть заметку?",
+                    "Последние изменения ещё не сохранены.",
+                    None,
+                    answers,
+                );
+            }
+        }
         NotesMode::ConfirmDelete => {
-            let line = view.selected_line().map_or("", |i| view.notes.editable_text(i));
-            draw_question(frame, "Удаление", &format!("Удалить «{line}»?"), None);
+            let text = view.selected_entry().map(|i| view.notes.editable_text(i)).unwrap_or_default();
+            // В вопросе — первая строка пункта.
+            let first = text.lines().next().unwrap_or("");
+            draw_question(frame, "Удаление", &format!("Удалить «{first}»?"), None);
         }
     }
+}
+
+/// Многострочное поле: высота по тексту (от 3 до 12 строк), прокрутка за курсором.
+fn draw_text_area(frame: &mut Frame, title: &str, saved: &str, area: &mut TextArea) {
+    let screen = frame.area();
+    let width = 70.min(screen.width.saturating_sub(4)).max(20);
+    let probe = panel("").inner(Rect::new(0, 0, width, 3));
+    area.set_width(usize::from(probe.width));
+    let rows = area.rows();
+    let max_rows = 12.min(screen.height.saturating_sub(6)).max(3);
+    let height = (rows.len() as u16).clamp(3, max_rows);
+    let rect = centered(screen, width, height + 2);
+    let block = panel(title)
+        .title_bottom(Line::from(" Ctrl+S — сохранить · Esc — закрыть ".fg(MUTED)))
+        .title_bottom(Line::from(saved.to_string().fg(MUTED)).right_aligned());
+    let inner = block.inner(rect);
+
+    let (row, col) = area.cursor_pos();
+    let offset = row.saturating_sub(usize::from(inner.height) - 1);
+    let lines: Vec<Line> = rows
+        .iter()
+        .skip(offset)
+        .take(usize::from(inner.height))
+        .map(|&(start, end)| Line::raw(&area.text()[start..end]))
+        .collect();
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
+    frame.set_cursor_position((inner.x + col as u16, inner.y + (row - offset) as u16));
 }
 
 /// Перенос по словам в строки не шире `width` колонок; слишком длинные слова режутся.
@@ -560,18 +629,28 @@ fn draw_confirm(frame: &mut Frame, app: &App) {
 
 /// Окно «y — да» с вопросом и необязательным пояснением.
 fn draw_question(frame: &mut Frame, title: &str, question: &str, note: Option<&str>) {
+    let answers = Line::from(vec![
+        Span::raw("y").red().bold(),
+        Span::raw(" — да, любая другая клавиша — нет").fg(MUTED),
+    ]);
+    draw_question_with(frame, title, question, note, answers);
+}
+
+/// То же со своими вариантами ответа.
+fn draw_question_with(
+    frame: &mut Frame,
+    title: &str,
+    question: &str,
+    note: Option<&str>,
+    answers: Line<'static>,
+) {
     let area = popup_area(frame.area(), 60, if note.is_some() { 6 } else { 5 });
     let block = panel(title).border_style(Style::new().red());
     let mut text = vec![Line::from(question.to_string())];
     if let Some(note) = note {
         text.push(Line::from(note.to_string().fg(SUB)));
     }
-    text.extend([
-        Line::from(vec![
-            Span::raw("y").red().bold(),
-            Span::raw(" — да, любая другая клавиша — нет").fg(MUTED),
-        ]),
-    ]);
+    text.push(answers);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: true }).block(block),

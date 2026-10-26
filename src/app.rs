@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::widgets::ListState;
 
 use crate::book::{Book, DELETED_NOTES};
 use crate::clock::{self, Date};
-use crate::field::LineInput;
+use crate::field::{LineInput, TextArea};
 use crate::input::Press;
 use crate::keymap::{self, Action};
 use crate::model::{Board, Category, State, Task};
@@ -39,14 +40,17 @@ pub struct NotesView {
     /// id записей; у задачи без записей — новый, задаче он достаётся с первой записью.
     pub id: String,
     pub notes: Notes,
-    /// Выделение — среди видимых (непустых) строк, `Notes::visible`.
+    /// Выделение — среди пунктов, `Notes::visible`.
     pub list: ListState,
     pub mode: NotesMode,
 }
 
 pub enum NotesMode {
     List,
+    /// Однострочное поле — подзадача.
     Edit { input: LineInput, target: NoteTarget },
+    /// Многострочное поле — заметка или прочий текст: Enter — новая строка, Ctrl+S — сохранить.
+    Text(Draft),
     ConfirmDelete,
 }
 
@@ -54,13 +58,99 @@ pub enum NotesMode {
 pub enum NoteTarget {
     Note,
     Subtask,
-    /// Правка строки с этим номером в файле.
-    Line(usize),
+    /// Правка пункта с этим номером.
+    Entry(usize),
+}
+
+/// Как часто сохранять заметку, пока её пишут.
+pub const AUTOSAVE: Duration = Duration::from_secs(10);
+
+/// Многострочная заметка в работе. Сохраняется сама раз в `AUTOSAVE`; Esc закрывает поле,
+/// не трогая уже сохранённое, а при несохранённых изменениях сначала спрашивает.
+pub struct Draft {
+    pub area: TextArea,
+    /// `Note` — новая заметка до первого сохранения, потом (и при правке) — `Entry`.
+    pub target: NoteTarget,
+    /// Метка новой заметки — когда её начали писать.
+    stamp: String,
+    /// Текст на момент последнего сохранения.
+    saved: String,
+    saved_at: Instant,
+    /// Когда сохранилось в последний раз (`20:46:10`) — для показа.
+    pub saved_label: Option<String>,
+    /// Esc при несохранённых изменениях: окно вопроса.
+    pub confirm_close: bool,
+}
+
+/// Пустые строки по краям заметки не нужны, внутри — остаются.
+fn normalize(text: &str) -> String {
+    text.trim_end().trim_start_matches('\n').to_string()
+}
+
+impl Draft {
+    fn new(text: String, target: NoteTarget) -> Self {
+        Self {
+            saved: normalize(&text),
+            area: TextArea::new(text),
+            target,
+            stamp: clock::stamp(),
+            saved_at: Instant::now(),
+            saved_label: None,
+            confirm_close: false,
+        }
+    }
+
+    /// Изменился ли текст с последнего сохранения.
+    pub fn is_changed(&self) -> bool {
+        normalize(self.area.text()) != self.saved
+    }
+
+    /// Стёрт ли весь текст.
+    pub fn is_empty(&self) -> bool {
+        self.area.text().trim().is_empty()
+    }
+}
+
+/// Чем закончилась правка поля.
+enum Done {
+    Save,
+    Cancel,
+}
+
+/// Правка многострочного поля. Возвращает, если поле пора закрыть.
+fn edit_area(area: &mut TextArea, press: &Press) -> Option<Done> {
+    let typed = press.typed;
+    match press.hotkey.code {
+        KeyCode::Esc => return Some(Done::Cancel),
+        _ if ctrl(press, 's') => return Some(Done::Save),
+        KeyCode::Enter => area.newline(),
+        _ if ctrl(press, 'w') => area.delete_word(),
+        _ if ctrl(press, 'a') => area.home(),
+        _ if ctrl(press, 'e') => area.end(),
+        KeyCode::Backspace => area.backspace(),
+        KeyCode::Delete => area.delete(),
+        KeyCode::Left => area.left(),
+        KeyCode::Right => area.right(),
+        KeyCode::Up => area.up(),
+        KeyCode::Down => area.down(),
+        KeyCode::Home => area.home(),
+        KeyCode::End => area.end(),
+        _ => {
+            if let KeyCode::Char(c) = typed.code
+                && !typed
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                area.insert(c);
+            }
+        }
+    }
+    None
 }
 
 impl NotesView {
-    /// Номер выделенной строки в файле записей.
-    pub fn selected_line(&self) -> Option<usize> {
+    /// Номер выделенного пункта.
+    pub fn selected_entry(&self) -> Option<usize> {
         self.notes.visible().get(self.list.selected()?).copied()
     }
 
@@ -188,6 +278,8 @@ impl App {
 
     /// Открывает страницу на дату; активный список остаётся тем же.
     pub fn open_page(&mut self, date: Date) {
+        // Окно записей закроется — начатую заметку сохраняем, пока страница прежняя.
+        self.save_draft(false);
         self.date = date;
         match self.book.load(date) {
             Ok(board) => {
@@ -257,6 +349,8 @@ impl App {
     pub fn on_key(&mut self, press: impl Into<Press>) {
         let press = press.into();
         if ctrl(&press, 'c') {
+            // Начатая заметка не пропадает и при выходе.
+            self.save_draft(false);
             self.quit = true;
             return;
         }
@@ -292,6 +386,14 @@ impl App {
         let input = match (&mut self.notes, &mut self.mode) {
             (Some(view), _) => match &mut view.mode {
                 NotesMode::Edit { input, .. } => Some(input),
+                // В многострочное — с переводами строк.
+                NotesMode::Text(Draft { area, .. }) => {
+                    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                    text.chars()
+                        .filter(|&c| c == '\n' || !c.is_control())
+                        .for_each(|c| area.insert(c));
+                    return;
+                }
                 _ => None,
             },
             (None, Mode::Edit { input, .. } | Mode::Date { input, .. }) => Some(input),
@@ -596,32 +698,37 @@ impl App {
             }
             NotesMode::Edit { input, target } => match edit_line(input, &press) {
                 Some(KeyCode::Enter) => {
-                    let text = input.text().trim().to_string();
-                    let target = *target;
-                    view.mode = NotesMode::List;
-                    if !text.is_empty() {
-                        match target {
-                            NoteTarget::Note => view.notes.add_note(&clock::stamp(), &text),
-                            NoteTarget::Subtask => view.notes.add_subtask(&text),
-                            NoteTarget::Line(line) => view.notes.set_text(line, &text),
-                        }
-                        // Новая строка — в конце, выделяем её.
-                        if !matches!(target, NoteTarget::Line(_)) {
-                            view.list.select(Some(usize::MAX));
-                            view.clamp();
-                        }
-                        self.save_notes();
-                    }
+                    let (text, target) = (input.text().trim().to_string(), *target);
+                    self.commit_note(target, &text);
                 }
                 Some(_) => view.mode = NotesMode::List,
+                None => {}
+            },
+            NotesMode::Text(draft) if draft.confirm_close => {
+                if ctrl(&press, 's') || press.hotkey.code == KeyCode::Char('s') {
+                    self.save_draft(true);
+                    self.close_draft();
+                } else if matches!(press.hotkey.code, KeyCode::Char('y') | KeyCode::Enter) {
+                    self.close_draft();
+                } else {
+                    draft.confirm_close = false;
+                }
+            }
+            NotesMode::Text(draft) => match edit_area(&mut draft.area, &press) {
+                Some(Done::Save) => {
+                    self.save_draft(true);
+                    self.close_draft();
+                }
+                Some(Done::Cancel) if draft.is_changed() => draft.confirm_close = true,
+                Some(Done::Cancel) => self.close_draft(),
                 None => {}
             },
             NotesMode::ConfirmDelete => {
                 view.mode = NotesMode::List;
                 if matches!(press.hotkey.code, KeyCode::Char('y') | KeyCode::Enter)
-                    && let Some(line) = view.selected_line()
+                    && let Some(entry) = view.selected_entry()
                 {
-                    view.notes.remove(line);
+                    view.notes.remove(entry);
                     view.clamp();
                     self.save_notes();
                 }
@@ -629,11 +736,109 @@ impl App {
         }
     }
 
+    /// Сохраняет многострочную заметку, если есть что: новая при первом сохранении
+    /// добавляется в конец записей, дальше — обновляется на месте. Стёртый весь текст
+    /// удаляет заметку, но только при явном сохранении (`explicit`): автосохранение и
+    /// сохранение при выходе пустоту не пишут — вдруг текст стёрли, чтобы набрать заново.
+    fn save_draft(&mut self, explicit: bool) {
+        let Some(view) = &mut self.notes else {
+            return;
+        };
+        let NotesMode::Text(draft) = &mut view.mode else {
+            return;
+        };
+        if !draft.is_changed() {
+            return;
+        }
+        if draft.is_empty() {
+            if explicit && let NoteTarget::Entry(entry) = draft.target {
+                draft.target = NoteTarget::Note;
+                draft.saved = String::new();
+                view.notes.remove(entry);
+                view.clamp();
+                self.save_notes();
+            }
+            return;
+        }
+        let text = normalize(draft.area.text());
+        let added = match draft.target {
+            NoteTarget::Entry(entry) => {
+                view.notes.set_text(entry, &text);
+                false
+            }
+            NoteTarget::Note | NoteTarget::Subtask => {
+                draft.target = NoteTarget::Entry(view.notes.add_note(&draft.stamp, &text));
+                true
+            }
+        };
+        draft.saved = text;
+        draft.saved_at = Instant::now();
+        draft.saved_label = Some(clock::time());
+        if added {
+            view.list.select(Some(usize::MAX));
+            view.clamp();
+        }
+        self.save_notes();
+    }
+
+    /// Закрывает многострочное поле; сохранённое остаётся как есть.
+    fn close_draft(&mut self) {
+        if let Some(view) = &mut self.notes {
+            view.mode = NotesMode::List;
+        }
+    }
+
+    /// Ход часов: автосохранение заметки. Возвращает, сохранилось ли (перерисовать).
+    pub fn tick(&mut self, now: Instant) -> bool {
+        let due = match &self.notes {
+            Some(NotesView { mode: NotesMode::Text(draft), .. }) => {
+                draft.is_changed()
+                    && !draft.is_empty()
+                    && now.duration_since(draft.saved_at) >= AUTOSAVE
+            }
+            _ => false,
+        };
+        if due {
+            self.save_draft(false);
+        }
+        due
+    }
+
+    /// Закрывает однострочное поле окна записей и сохраняет введённое. Пустое у нового
+    /// пункта — отмена, у существующего — удаление пункта.
+    fn commit_note(&mut self, target: NoteTarget, text: &str) {
+        let Some(view) = &mut self.notes else {
+            return;
+        };
+        view.mode = NotesMode::List;
+        if text.trim().is_empty() {
+            if let NoteTarget::Entry(entry) = target {
+                view.notes.remove(entry);
+                view.clamp();
+                self.save_notes();
+            }
+            return;
+        }
+        match target {
+            NoteTarget::Note => {
+                view.notes.add_note(&clock::stamp(), text);
+            }
+            NoteTarget::Subtask => view.notes.add_subtask(text),
+            NoteTarget::Entry(entry) => view.notes.set_text(entry, text),
+        }
+        // Новый пункт — в конце, выделяем его.
+        if !matches!(target, NoteTarget::Entry(_)) {
+            view.list.select(Some(usize::MAX));
+            view.clamp();
+        }
+        self.save_notes();
+    }
+
     fn act_notes(&mut self, action: Action) {
         let Some(view) = &mut self.notes else {
             return;
         };
-        let selected = view.selected_line();
+        let selected = view.selected_entry();
         match action {
             Action::Close => self.notes = None,
             Action::Help => self.show_help = true,
@@ -653,22 +858,24 @@ impl App {
                 view.list.select(Some(usize::MAX));
                 view.clamp();
             }
-            Action::Add | Action::AddSubtask => {
-                let target = if action == Action::Add {
-                    NoteTarget::Note
-                } else {
-                    NoteTarget::Subtask
-                };
+            Action::Add => view.mode = NotesMode::Text(Draft::new(String::new(), NoteTarget::Note)),
+            Action::AddSubtask => {
                 view.mode = NotesMode::Edit {
                     input: LineInput::default(),
-                    target,
+                    target: NoteTarget::Subtask,
                 };
             }
             Action::Edit => {
-                if let Some(line) = selected {
-                    view.mode = NotesMode::Edit {
-                        input: LineInput::new(view.notes.editable_text(line)),
-                        target: NoteTarget::Line(line),
+                if let Some(entry) = selected {
+                    let text = view.notes.editable_text(entry);
+                    let target = NoteTarget::Entry(entry);
+                    view.mode = if view.notes.is_multiline(entry) {
+                        NotesMode::Text(Draft::new(text, target))
+                    } else {
+                        NotesMode::Edit {
+                            input: LineInput::new(text),
+                            target,
+                        }
                     };
                 }
             }
@@ -782,6 +989,11 @@ mod tests {
         for c in text.chars() {
             press(app, KeyCode::Char(c));
         }
+    }
+
+    /// Ctrl+S — сохранить многострочное поле.
+    fn save_note(app: &mut App) {
+        press_with(app, KeyCode::Char('s'), KeyModifiers::CONTROL);
     }
 
     fn test_app(name: &str) -> App {
@@ -992,7 +1204,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('a'));
         app.on_paste("мастер сказал");
-        press(&mut app, KeyCode::Enter);
+        save_note(&mut app);
         // Горячие клавиши окна не трогают страницу: «x» — подзадача, а не задача.
         press(&mut app, KeyCode::Char('k'));
         press(&mut app, KeyCode::Char('x'));
@@ -1037,7 +1249,7 @@ mod tests {
         press(&mut app, KeyCode::Char('n'));
         press(&mut app, KeyCode::Char('a'));
         type_text(&mut app, "начал");
-        press(&mut app, KeyCode::Enter);
+        save_note(&mut app);
         press(&mut app, KeyCode::Esc);
         let id = app.board.list(Category::Work)[0].id.clone().unwrap();
 
@@ -1060,6 +1272,163 @@ mod tests {
         let deleted = std::fs::read_to_string(app.book.dir().join(DELETED_NOTES)).unwrap();
         assert!(deleted.contains("— отчёт\n") && deleted.contains(" начал\n"), "{deleted}");
         assert!(matches!(app.status, Some(Status::Info(_))));
+        cleanup(app);
+    }
+
+    #[test]
+    fn multiline_note() {
+        let mut app = test_app("multiline");
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "смеситель");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('a'));
+        // Enter — новая строка, пустые строки по краям отбрасываются.
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "мастер сказал:");
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "менять целиком");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        app.on_paste("и ещё\r\nдве строки\n");
+        press(&mut app, KeyCode::Enter);
+        save_note(&mut app);
+
+        let view = app.notes.as_ref().unwrap();
+        assert!(matches!(view.mode, NotesMode::List));
+        let item = view.notes.item(0);
+        assert_eq!(item.head, "мастер сказал:");
+        assert_eq!(item.body, ["менять целиком", "", "и ещё", "две строки"]);
+        let id = app.board.list(Category::Work)[0].id.clone().unwrap();
+        let file = app.book.load_notes(&id).unwrap().serialize();
+        assert!(file.ends_with(" мастер сказал:\n  менять целиком\n\n  и ещё\n  две строки\n"), "{file}");
+
+        // Правка — в многострочном поле с тем же текстом; Esc — отмена.
+        press(&mut app, KeyCode::Char('e'));
+        let Some(NotesView { mode: NotesMode::Text(Draft { area, .. }), .. }) = &app.notes else {
+            panic!()
+        };
+        assert_eq!(area.text(), "мастер сказал:\nменять целиком\n\nи ещё\nдве строки");
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::End);
+        type_text(&mut app, "!");
+        save_note(&mut app);
+        assert_eq!(app.notes.as_ref().unwrap().notes.item(0).body[2], "и ещё!");
+
+        // Подзадача — однострочная: Enter сохраняет.
+        press(&mut app, KeyCode::Char('s'));
+        type_text(&mut app, "купить");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.notes.as_ref().unwrap().notes.visible().len(), 2);
+        press(&mut app, KeyCode::Char('e'));
+        assert!(matches!(app.notes.as_ref().unwrap().mode, NotesMode::Edit { .. }));
+        press(&mut app, KeyCode::Esc);
+        // Пустая заметка — не сохраняется.
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Enter);
+        save_note(&mut app);
+        assert_eq!(app.notes.as_ref().unwrap().notes.visible().len(), 2);
+        cleanup(app);
+    }
+
+    /// Текст первой заметки в файле записей задачи из «Работы».
+    fn saved_note(app: &App) -> Option<String> {
+        let id = app.board.list(Category::Work)[0].id.clone()?;
+        let notes = app.book.load_notes(&id).unwrap();
+        notes.visible().first().map(|&i| notes.editable_text(i))
+    }
+
+    fn draft(app: &App) -> &Draft {
+        match &app.notes.as_ref().unwrap().mode {
+            NotesMode::Text(draft) => draft,
+            _ => panic!("ожидалось многострочное поле"),
+        }
+    }
+
+    #[test]
+    fn note_autosave_and_close() {
+        let mut app = test_app("autosave");
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "задача");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "черновик");
+
+        // Раньше 10 секунд — не сохраняется, потом — сохраняется сама.
+        assert!(!app.tick(Instant::now()));
+        assert_eq!(saved_note(&app), None);
+        assert!(app.tick(Instant::now() + AUTOSAVE));
+        assert_eq!(saved_note(&app).as_deref(), Some("черновик"));
+        assert!(draft(&app).saved_label.is_some() && !draft(&app).is_changed());
+
+        // Дописали — Esc спрашивает; «другая клавиша» возвращает к правке.
+        type_text(&mut app, " ещё");
+        press(&mut app, KeyCode::Esc);
+        assert!(draft(&app).confirm_close);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!draft(&app).confirm_close);
+        assert_eq!(draft(&app).area.text(), "черновик ещё");
+
+        // «y» — закрыть без последних изменений; сохранённое остаётся.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(app.notes.as_ref().unwrap().mode, NotesMode::List));
+        assert_eq!(saved_note(&app).as_deref(), Some("черновик"));
+        // Заметка одна: автосохранение обновляет её, а не добавляет новую.
+        assert_eq!(app.notes.as_ref().unwrap().notes.visible().len(), 1);
+
+        // «s» в вопросе — сохранить и закрыть.
+        press(&mut app, KeyCode::Char('e'));
+        type_text(&mut app, "!");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('s'));
+        assert!(matches!(app.notes.as_ref().unwrap().mode, NotesMode::List));
+        assert_eq!(saved_note(&app).as_deref(), Some("черновик!"));
+
+        // Без изменений Esc закрывает сразу.
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.notes.as_ref().unwrap().mode, NotesMode::List));
+
+        // Стёрли всё: автосохранение и Esc + «y» заметку не трогают…
+        press(&mut app, KeyCode::Char('e'));
+        press_with(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert!(draft(&app).is_empty());
+        assert!(!app.tick(Instant::now() + AUTOSAVE));
+        press(&mut app, KeyCode::Esc);
+        assert!(draft(&app).confirm_close);
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(saved_note(&app).as_deref(), Some("черновик!"));
+        // …а Ctrl+S — удаляет. Подзадача, стёртая и сохранённая Enter, — тоже.
+        press(&mut app, KeyCode::Char('s'));
+        type_text(&mut app, "пункт");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('e'));
+        press_with(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        save_note(&mut app);
+        assert!(matches!(app.notes.as_ref().unwrap().mode, NotesMode::List));
+        let notes = &app.notes.as_ref().unwrap().notes;
+        assert_eq!(notes.visible().len(), 1);
+        assert_eq!(notes.editable_text(notes.visible()[0]), "пункт");
+        press(&mut app, KeyCode::Char('e'));
+        press_with(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.notes.as_ref().unwrap().notes.is_empty());
+        // Файла записей нет, значка у задачи нет.
+        assert_eq!(saved_note(&app), None);
+        assert!(app.summaries.is_empty());
+
+        // Ctrl+C с начатой заметкой — сначала сохранить.
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "черновик!");
+        save_note(&mut app);
+        press(&mut app, KeyCode::Char('e'));
+        type_text(&mut app, "?");
+        press_with(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.quit);
+        assert_eq!(saved_note(&app).as_deref(), Some("черновик!?"));
         cleanup(app);
     }
 

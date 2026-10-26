@@ -37,6 +37,11 @@ pub fn stamp() -> String {
     local_tm().map_or_else(String::new, |tm| strftime(c"%Y-%m-%d %H:%M", &tm))
 }
 
+/// Время с секундами: `20:46:10` — когда сохранился черновик.
+pub fn time() -> String {
+    local_tm().map_or_else(String::new, |tm| strftime(c"%H:%M:%S", &tm))
+}
+
 /// Текущие дата и время для шапки. Меняются раз в минуту — по смене этой строки главный цикл
 /// и перерисовывает экран.
 pub fn now() -> String {

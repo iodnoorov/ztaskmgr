@@ -217,6 +217,8 @@ pub const ROWS: &[Row] = &[
     labeled(Section::Field, "Enter  Esc", "сохранить / отмена", &[]),
     labeled(Section::Field, "Ctrl+W", "удалить слово", &[]),
     labeled(Section::Field, "Ctrl+A  Ctrl+E", "в начало / в конец строки", &[]),
+    labeled(Section::Field, "заметка", "Enter — строка, Ctrl+S — сохранить", &[]),
+    labeled(Section::Field, "", "сама сохраняется раз в 10 с; Esc — закрыть", &[]),
     labeled(Section::Field, "дата", "2026-10-27  27.10  +1  -3", &[]),
 ];
 

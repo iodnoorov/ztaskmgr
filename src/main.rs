@@ -11,7 +11,7 @@ mod ui;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
@@ -91,6 +91,9 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool) -> Resul
                 Input::Key(press) => app.on_key(press),
                 Input::Paste(text) => app.on_paste(&text),
             }
+            dirty = true;
+        }
+        if app.tick(Instant::now()) {
             dirty = true;
         }
         if let Some(path) = app.editor_request.take() {
