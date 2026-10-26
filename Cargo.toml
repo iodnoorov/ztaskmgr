@@ -1,0 +1,13 @@
+[package]
+name = "ztaskmgr"
+version = "0.1.0"
+edition = "2024"
+description = "Четыре списка задач в терминале"
+repository = "https://github.com/iodnoorov/ztaskmgr"
+
+[dependencies]
+anyhow = "1.0.104"
+directories = "6.0.0"
+libc = "0.2.191"
+ratatui = "0.30.2"
+unicode-width = "0.2.2"
