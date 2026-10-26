@@ -58,6 +58,9 @@ pub enum State {
 pub struct Task {
     pub text: String,
     pub state: State,
+    /// Ключ доп. записей (`notes/<id>.md`); появляется с первой записью и переезжает
+    /// вместе с задачей при переносе.
+    pub id: Option<String>,
 }
 
 impl Task {
@@ -65,6 +68,16 @@ impl Task {
         Self {
             text: text.into(),
             state: State::Open,
+            id: None,
+        }
+    }
+
+    /// Копия для страницы, на которую задачу переносят: снова открыта, записи те же.
+    pub fn carried(&self) -> Self {
+        Self {
+            text: self.text.clone(),
+            state: State::Open,
+            id: self.id.clone(),
         }
     }
 
@@ -123,6 +136,10 @@ impl Board {
         Some(index + 1)
     }
 
+    pub fn tasks(&self) -> impl Iterator<Item = &Task> {
+        self.lists.iter().flatten()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.lists.iter().all(Vec::is_empty)
     }
@@ -133,7 +150,7 @@ impl Board {
         let mut moved = Vec::new();
         for category in Category::ALL {
             for task in self.list_mut(category).iter_mut().filter(|t| t.is_open()) {
-                moved.push((category, Task::new(task.text.clone())));
+                moved.push((category, task.carried()));
                 task.state = State::Migrated(to);
             }
         }

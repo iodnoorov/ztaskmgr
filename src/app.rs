@@ -1,12 +1,16 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::widgets::ListState;
 
-use crate::book::Book;
-use crate::clock::Date;
+use crate::book::{Book, DELETED_NOTES};
+use crate::clock::{self, Date};
 use crate::field::LineInput;
 use crate::input::Press;
 use crate::keymap::{self, Action};
 use crate::model::{Board, Category, State, Task};
+use crate::notes::{Notes, Summary};
 
 #[derive(Debug)]
 pub enum Mode {
@@ -25,6 +29,49 @@ pub enum DatePurpose {
     Go,
     /// Перенос задачи с этим индексом в активном списке.
     Postpone(usize),
+}
+
+/// Окно доп. записей задачи, поверх страницы.
+pub struct NotesView {
+    pub category: Category,
+    /// Индекс задачи в списке; пока окно открыто, страница не меняется.
+    pub index: usize,
+    /// id записей; у задачи без записей — новый, задаче он достаётся с первой записью.
+    pub id: String,
+    pub notes: Notes,
+    /// Выделение — среди видимых (непустых) строк, `Notes::visible`.
+    pub list: ListState,
+    pub mode: NotesMode,
+}
+
+pub enum NotesMode {
+    List,
+    Edit { input: LineInput, target: NoteTarget },
+    ConfirmDelete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoteTarget {
+    Note,
+    Subtask,
+    /// Правка строки с этим номером в файле.
+    Line(usize),
+}
+
+impl NotesView {
+    /// Номер выделенной строки в файле записей.
+    pub fn selected_line(&self) -> Option<usize> {
+        self.notes.visible().get(self.list.selected()?).copied()
+    }
+
+    fn clamp(&mut self) {
+        let len = self.notes.visible().len();
+        self.list.select(match (len, self.list.selected()) {
+            (0, _) => None,
+            (_, None) => Some(0),
+            (_, Some(i)) => Some(i.min(len - 1)),
+        });
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -51,6 +98,13 @@ pub struct App {
     pub show_help: bool,
     pub show_about: bool,
     pub status: Option<Status>,
+    /// Окно записей выделенной задачи.
+    pub notes: Option<NotesView>,
+    /// Сводка записей задач открытой страницы по id — для значка `✎`.
+    pub summaries: HashMap<String, Summary>,
+    /// Файл, который надо открыть во внешнем редакторе: это делает главный цикл,
+    /// ему принадлежит терминал. Потом — `after_editor`.
+    pub editor_request: Option<PathBuf>,
     pub quit: bool,
 }
 
@@ -99,6 +153,9 @@ impl App {
             show_help: false,
             show_about: false,
             status: None,
+            notes: None,
+            summaries: HashMap::new(),
+            editor_request: None,
             quit: false,
         };
         app.open_page(today);
@@ -151,6 +208,9 @@ impl App {
         for category in Category::ALL {
             self.clamp_selection(category);
         }
+        // Окно записей привязано к задаче прежней страницы.
+        self.notes = None;
+        self.summaries = self.book.summaries(&self.board);
     }
 
     /// Наступил новый день (программа открыта через полночь): автоперенос, и если была
@@ -208,6 +268,10 @@ impl App {
             self.show_about = false;
             return;
         }
+        if self.notes.is_some() {
+            self.on_key_notes(press);
+            return;
+        }
         match self.mode {
             Mode::Normal => {
                 let key = (press.hotkey.code, press.hotkey.modifiers);
@@ -225,7 +289,15 @@ impl App {
     /// Вставленный текст идёт в открытое поле ввода как есть, иначе игнорируется:
     /// на главном экране он сработал бы как горячие клавиши.
     pub fn on_paste(&mut self, text: &str) {
-        if let Mode::Edit { input, .. } | Mode::Date { input, .. } = &mut self.mode {
+        let input = match (&mut self.notes, &mut self.mode) {
+            (Some(view), _) => match &mut view.mode {
+                NotesMode::Edit { input, .. } => Some(input),
+                _ => None,
+            },
+            (None, Mode::Edit { input, .. } | Mode::Date { input, .. }) => Some(input),
+            (None, _) => None,
+        };
+        if let Some(input) = input {
             text.chars()
                 .filter(|c| !c.is_control())
                 .for_each(|c| input.insert(c));
@@ -243,6 +315,7 @@ impl App {
                 | Action::MoveTo
                 | Action::Postpone
                 | Action::Delete
+                | Action::Notes
         );
         if edits && !self.editable() {
             return;
@@ -295,7 +368,10 @@ impl App {
             Action::Postpone => self.start_postpone(),
             Action::MoveTo if self.selected_task().is_some() => self.mode = Mode::MoveTo,
             Action::Delete if self.selected_task().is_some() => self.mode = Mode::ConfirmDelete,
+            Action::Notes => self.open_notes(),
             Action::MoveTo | Action::Delete => {}
+            // Только в окне записей.
+            Action::AddSubtask | Action::OpenEditor | Action::Close => {}
         }
     }
 
@@ -351,10 +427,27 @@ impl App {
         if matches!(press.hotkey.code, KeyCode::Char('y') | KeyCode::Enter)
             && let Some(index) = self.selected()
         {
-            self.board.remove(self.active, index);
+            let task = self.board.remove(self.active, index);
             self.clamp_selection(self.active);
             self.save();
+            if let Some(task) = task {
+                self.archive_notes(&task);
+            }
         }
+    }
+
+    /// Записи удалённой задачи — в `DELETED_NOTES.md`, если её копий больше нигде нет.
+    fn archive_notes(&mut self, task: &Task) {
+        match self.book.archive_notes(task, self.date, &clock::stamp()) {
+            Ok(true) => {
+                self.status = Some(Status::Info(format!(
+                    "Записи задачи сохранены в {DELETED_NOTES}"
+                )));
+            }
+            Ok(false) => {}
+            Err(e) => self.status = Some(Status::Error(format!("Записи задачи: {e:#}"))),
+        }
+        self.summaries = self.book.summaries(&self.board);
     }
 
     fn on_key_move_to(&mut self, press: Press) {
@@ -455,6 +548,208 @@ impl App {
         if let Some(new_index) = shift(&mut self.board, self.active, index) {
             self.select(self.active, Some(new_index));
             self.save();
+        }
+    }
+}
+
+/// Окно доп. записей.
+impl App {
+    fn open_notes(&mut self) {
+        let Some(index) = self.selected() else {
+            return;
+        };
+        let task = &self.board.list(self.active)[index];
+        let id = task.id.clone().unwrap_or_else(|| self.book.new_id());
+        match self.book.load_notes(&id) {
+            Ok(notes) => {
+                let mut view = NotesView {
+                    category: self.active,
+                    index,
+                    id,
+                    notes,
+                    list: ListState::default(),
+                    mode: NotesMode::List,
+                };
+                view.clamp();
+                self.notes = Some(view);
+            }
+            Err(e) => self.status = Some(Status::Error(format!("Записи задачи: {e:#}"))),
+        }
+    }
+
+    /// Задача, чьи записи открыты.
+    pub fn notes_task(&self) -> Option<&Task> {
+        let view = self.notes.as_ref()?;
+        self.board.list(view.category).get(view.index)
+    }
+
+    fn on_key_notes(&mut self, press: Press) {
+        let Some(view) = &mut self.notes else {
+            return;
+        };
+        match &mut view.mode {
+            NotesMode::List => {
+                let key = (press.hotkey.code, press.hotkey.modifiers);
+                if let Some(action) = keymap::notes_action(key) {
+                    self.act_notes(action);
+                }
+            }
+            NotesMode::Edit { input, target } => match edit_line(input, &press) {
+                Some(KeyCode::Enter) => {
+                    let text = input.text().trim().to_string();
+                    let target = *target;
+                    view.mode = NotesMode::List;
+                    if !text.is_empty() {
+                        match target {
+                            NoteTarget::Note => view.notes.add_note(&clock::stamp(), &text),
+                            NoteTarget::Subtask => view.notes.add_subtask(&text),
+                            NoteTarget::Line(line) => view.notes.set_text(line, &text),
+                        }
+                        // Новая строка — в конце, выделяем её.
+                        if !matches!(target, NoteTarget::Line(_)) {
+                            view.list.select(Some(usize::MAX));
+                            view.clamp();
+                        }
+                        self.save_notes();
+                    }
+                }
+                Some(_) => view.mode = NotesMode::List,
+                None => {}
+            },
+            NotesMode::ConfirmDelete => {
+                view.mode = NotesMode::List;
+                if matches!(press.hotkey.code, KeyCode::Char('y') | KeyCode::Enter)
+                    && let Some(line) = view.selected_line()
+                {
+                    view.notes.remove(line);
+                    view.clamp();
+                    self.save_notes();
+                }
+            }
+        }
+    }
+
+    fn act_notes(&mut self, action: Action) {
+        let Some(view) = &mut self.notes else {
+            return;
+        };
+        let selected = view.selected_line();
+        match action {
+            Action::Close => self.notes = None,
+            Action::Help => self.show_help = true,
+            Action::Up => {
+                view.list.select_previous();
+                view.clamp();
+            }
+            Action::Down => {
+                view.list.select_next();
+                view.clamp();
+            }
+            Action::Top => {
+                view.list.select(Some(0));
+                view.clamp();
+            }
+            Action::Bottom => {
+                view.list.select(Some(usize::MAX));
+                view.clamp();
+            }
+            Action::Add | Action::AddSubtask => {
+                let target = if action == Action::Add {
+                    NoteTarget::Note
+                } else {
+                    NoteTarget::Subtask
+                };
+                view.mode = NotesMode::Edit {
+                    input: LineInput::default(),
+                    target,
+                };
+            }
+            Action::Edit => {
+                if let Some(line) = selected {
+                    view.mode = NotesMode::Edit {
+                        input: LineInput::new(view.notes.editable_text(line)),
+                        target: NoteTarget::Line(line),
+                    };
+                }
+            }
+            Action::Toggle => {
+                if let Some(line) = selected
+                    && view.notes.toggle(line)
+                {
+                    self.save_notes();
+                }
+            }
+            Action::MoveUp | Action::MoveDown => {
+                let visible = view.notes.visible();
+                let Some(i) = view.list.selected() else {
+                    return;
+                };
+                let j = if action == Action::MoveUp {
+                    i.checked_sub(1)
+                } else {
+                    Some(i + 1).filter(|&j| j < visible.len())
+                };
+                if let Some(j) = j {
+                    view.notes.swap(visible[i], visible[j]);
+                    view.list.select(Some(j));
+                    self.save_notes();
+                }
+            }
+            Action::Delete => {
+                if selected.is_some() {
+                    view.mode = NotesMode::ConfirmDelete;
+                }
+            }
+            Action::OpenEditor => match self.book.notes_file(&view.id) {
+                Ok(path) => self.editor_request = Some(path),
+                Err(e) => self.status = Some(Status::Error(format!("Записи задачи: {e:#}"))),
+            },
+            _ => {}
+        }
+    }
+
+    /// Сохраняет записи открытого окна. Задача без id получает его с первой записью
+    /// (и страница сохраняется); пустые записи — без файла.
+    fn save_notes(&mut self) {
+        let Some(view) = &self.notes else {
+            return;
+        };
+        let (id, category, index) = (view.id.clone(), view.category, view.index);
+        let summary = view.notes.summary();
+        if let Err(e) = self.book.save_notes(&id, &view.notes) {
+            self.status = Some(Status::Error(format!("Записи задачи: {e:#}")));
+            return;
+        }
+        if summary.any {
+            self.summaries.insert(id.clone(), summary);
+        } else {
+            self.summaries.remove(&id);
+        }
+        if let Some(task) = self.board.get_mut(category, index)
+            && task.id.is_none()
+            && summary.any
+        {
+            task.id = Some(id);
+            self.save();
+        }
+    }
+
+    /// Редактор закрылся (`error` — если не запустился): перечитать записи.
+    pub fn after_editor(&mut self, error: Option<String>) {
+        if let Some(e) = error {
+            self.status = Some(Status::Error(e));
+        }
+        let Some(view) = &mut self.notes else {
+            return;
+        };
+        match self.book.load_notes(&view.id) {
+            Ok(notes) => {
+                view.notes = notes;
+                view.clamp();
+                // Пустой файл из редактора удаляется, непустой — привязывается к задаче.
+                self.save_notes();
+            }
+            Err(e) => self.status = Some(Status::Error(format!("Записи задачи: {e:#}"))),
         }
     }
 }
@@ -673,6 +968,122 @@ mod tests {
         assert!(matches!(app.status, Some(Status::Info(_))));
         press(&mut app, KeyCode::Char('['));
         assert_eq!(app.board.list(Category::Work)[0].state, State::Migrated(d(27)));
+        cleanup(app);
+    }
+
+    #[test]
+    fn notes_window() {
+        let mut app = test_app("notes");
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "кран");
+        press(&mut app, KeyCode::Enter);
+
+        // Открыли и закрыли без записей — id у задачи не появился.
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.notes.is_some());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.notes.is_none());
+        assert_eq!(app.board.list(Category::Home)[0].id, None);
+
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('s'));
+        type_text(&mut app, "купить прокладку");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('a'));
+        app.on_paste("мастер сказал");
+        press(&mut app, KeyCode::Enter);
+        // Горячие клавиши окна не трогают страницу: «x» — подзадача, а не задача.
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('x'));
+
+        let id = app.board.list(Category::Home)[0].id.clone().expect("id с первой записью");
+        assert_eq!(app.board.list(Category::Home)[0].state, State::Open);
+        let notes = app.book.load_notes(&id).unwrap().serialize();
+        let lines: Vec<&str> = notes.lines().collect();
+        assert_eq!(lines[0], "- [x] купить прокладку");
+        assert!(lines[1].starts_with("- 2026-") && lines[1].ends_with(" мастер сказал"), "{notes}");
+        assert_eq!(app.summaries[&id].subtasks_done, 1);
+        // id сохранён на странице.
+        assert_eq!(app.book.load(d(26)).unwrap(), app.board);
+
+        // Сдвиг и правка строки.
+        press_with(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Char('e'));
+        press_with(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        type_text(&mut app, "смеситель");
+        press(&mut app, KeyCode::Enter);
+        let notes = app.book.load_notes(&id).unwrap().serialize();
+        assert!(notes.ends_with("- [x] купить смеситель\n"), "{notes}");
+
+        // Удаление строки с подтверждением.
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.notes.as_ref().unwrap().notes.is_empty());
+        assert!(!app.summaries.contains_key(&id));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit);
+        cleanup(app);
+    }
+
+    #[test]
+    fn notes_follow_postpone_and_archive_on_delete() {
+        let mut app = test_app("archive");
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "отчёт");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "начал");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        let id = app.board.list(Category::Work)[0].id.clone().unwrap();
+
+        // Перенос — копия с теми же записями.
+        press(&mut app, KeyCode::Char('>'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.board.list(Category::Work)[0].id.as_deref(), Some(id.as_str()));
+        assert!(app.summaries.contains_key(&id));
+
+        // Удалили копию — запись [>] на 26-м осталась, записи на месте.
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.book.load_notes(&id).unwrap().summary().any);
+        // Удалили и её — записи ушли в DELETED_NOTES.md.
+        press(&mut app, KeyCode::Char('['));
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.book.load_notes(&id).unwrap().is_empty());
+        let deleted = std::fs::read_to_string(app.book.dir().join(DELETED_NOTES)).unwrap();
+        assert!(deleted.contains("— отчёт\n") && deleted.contains(" начал\n"), "{deleted}");
+        assert!(matches!(app.status, Some(Status::Info(_))));
+        cleanup(app);
+    }
+
+    #[test]
+    fn editor_round_trip() {
+        let mut app = test_app("editor");
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "длинное");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('E'));
+        let path = app.editor_request.take().expect("запрос редактора");
+        // «Редактор» записал файл.
+        std::fs::write(&path, "Абзац из редактора\n- [ ] пункт\n").unwrap();
+        app.after_editor(None);
+        let task = &app.board.list(Category::Work)[0];
+        let id = task.id.clone().expect("id после редактора");
+        assert!(path.ends_with(format!("{id}.md")));
+        assert_eq!(app.summaries[&id].subtasks, 1);
+        assert_eq!(app.notes.as_ref().unwrap().notes.visible().len(), 2);
+        // Редактор не запустился — ошибка в строке состояния, окно на месте.
+        app.after_editor(Some("Редактор «nope» не запустился".into()));
+        assert!(matches!(app.status, Some(Status::Error(_))));
+        assert!(app.notes.is_some());
         cleanup(app);
     }
 

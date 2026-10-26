@@ -41,7 +41,24 @@ pub fn parse(text: &str) -> Result<Board> {
     Ok(board)
 }
 
+/// `<!-- id:k3x9ab -->` в конце строки задачи — ключ её доп. записей.
+fn split_id(line: &str) -> Option<(&str, Option<String>)> {
+    let Some(rest) = line.strip_suffix(" -->") else {
+        return Some((line, None));
+    };
+    let Some((line, id)) = rest.rsplit_once(" <!-- id:") else {
+        return Some((line, None));
+    };
+    is_valid_id(id).then(|| (line, Some(id.to_string())))
+}
+
+/// id записей: латинские строчные буквы и цифры (он же имя файла).
+pub fn is_valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 16 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
 fn parse_task(line: &str) -> Option<Task> {
+    let (line, id) = split_id(line)?;
     let rest = line.strip_prefix("- [")?;
     let (mark, text) = rest.split_once("] ").or_else(|| {
         // Пустой текст: «- [ ]» без пробела в конце после trim_end.
@@ -59,6 +76,7 @@ fn parse_task(line: &str) -> Option<Task> {
     Some(Task {
         text: text.to_string(),
         state,
+        id,
     })
 }
 
@@ -85,6 +103,11 @@ pub fn serialize(board: &Board) -> String {
                 out.push_str(MIGRATED_SEP);
                 out.push_str(&date.to_string());
             }
+            if let Some(id) = &task.id {
+                out.push_str(" <!-- id:");
+                out.push_str(id);
+                out.push_str(" -->");
+            }
             out.push('\n');
         }
     }
@@ -100,8 +123,12 @@ pub fn load(path: &Path) -> Result<Board> {
     }
 }
 
-/// Сохраняет через временный файл и rename, чтобы сбой посреди записи не испортил данные.
 pub fn save(path: &Path, board: &Board) -> Result<()> {
+    write_atomic(path, &serialize(board))
+}
+
+/// Пишет через временный файл и rename, чтобы сбой посреди записи не испортил данные.
+pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         fs::create_dir_all(dir).with_context(|| format!("создание {}", dir.display()))?;
     }
@@ -111,7 +138,7 @@ pub fn save(path: &Path, board: &Board) -> Result<()> {
     let tmp = Path::new(&tmp_name);
 
     let mut file = fs::File::create(tmp).with_context(|| format!("запись {}", tmp.display()))?;
-    file.write_all(serialize(board).as_bytes())?;
+    file.write_all(text.as_bytes())?;
     file.sync_all()?;
     drop(file);
 
@@ -129,7 +156,8 @@ mod tests {
 
 ## Дом
 - [ ] Починить кран
-- [>] Позвонить мастеру → 2026-10-27
+- [>] Позвонить мастеру → 2026-10-27 <!-- id:k3x9ab -->
+- [ ] С записями <!-- id:q1 -->
 
 ## Личное
 
@@ -145,8 +173,12 @@ mod tests {
         assert_eq!(work[0], Task::new("Написать отчёт"));
         assert_eq!(work[1].state, State::Done);
         let home = board.list(Category::Home);
-        assert_eq!(home.len(), 2);
+        assert_eq!(home.len(), 3);
         assert_eq!(home[1].text, "Позвонить мастеру");
+        assert_eq!(home[1].id.as_deref(), Some("k3x9ab"));
+        assert_eq!(home[2].text, "С записями");
+        assert_eq!(home[2].id.as_deref(), Some("q1"));
+        assert_eq!(home[0].id, None);
         assert_eq!(home[1].state, State::Migrated(Date::new(2026, 10, 27).unwrap()));
         assert!(board.list(Category::Personal).is_empty());
         assert_eq!(board.list(Category::Other)[0].state, State::Done);
@@ -192,6 +224,11 @@ mod tests {
         assert!(parse("## Работа\n- [>] плохая → 2026-13-01\n").is_err());
         let board = parse("## Работа\n- [>] a → b → 2026-10-27\n").unwrap();
         assert_eq!(board.list(Category::Work)[0].text, "a → b");
+        // Испорченный id — ошибка, а не часть текста.
+        assert!(parse("## Работа\n- [ ] x <!-- id:Bad! -->\n").is_err());
+        // Обычный комментарий в тексте — текст.
+        let board = parse("## Работа\n- [ ] x <!-- не id -->\n").unwrap();
+        assert_eq!(board.list(Category::Work)[0].text, "x <!-- не id -->");
     }
 
     #[test]

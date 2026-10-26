@@ -5,17 +5,20 @@ mod field;
 mod input;
 mod keymap;
 mod model;
+mod notes;
 mod storage;
 mod ui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
-use ratatui::crossterm::{execute, terminal};
+use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::crossterm::{cursor, execute, terminal};
 
 use crate::app::{App, Status};
 use crate::book::Book;
@@ -90,6 +93,11 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool) -> Resul
             }
             dirty = true;
         }
+        if let Some(path) = app.editor_request.take() {
+            let error = run_editor(terminal, &path, *kitty)?;
+            app.after_editor(error);
+            dirty = true;
+        }
         let now = terminal::size()?;
         if now != size {
             size = now;
@@ -106,6 +114,38 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool) -> Resul
         }
     }
     Ok(())
+}
+
+/// Внешний редактор (`$VISUAL`, `$EDITOR`, иначе `vi`): терминал на это время отдаётся ему.
+/// Возвращает ошибку запуска редактора для строки состояния.
+fn run_editor(terminal: &mut DefaultTerminal, path: &Path, kitty: bool) -> Result<Option<String>> {
+    let editor = ["VISUAL", "EDITOR"]
+        .into_iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .find(|e| !e.trim().is_empty())
+        .unwrap_or_else(|| "vi".into());
+    // Значение может быть с аргументами: `code -w`.
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("vi");
+
+    if kitty {
+        input::kitty_off();
+    }
+    execute!(std::io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, cursor::Show)?;
+    terminal::disable_raw_mode()?;
+    let status = Command::new(program).args(parts).arg(path).status();
+    terminal::enable_raw_mode()?;
+    execute!(std::io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+    if kitty {
+        input::kitty_on();
+    }
+    terminal.clear()?;
+
+    Ok(match status {
+        Ok(s) if s.success() => None,
+        Ok(s) => Some(format!("Редактор «{editor}» завершился с ошибкой: {s}")),
+        Err(e) => Some(format!("Редактор «{editor}» не запустился: {e}")),
+    })
 }
 
 /// `None` — запрошена справка.

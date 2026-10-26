@@ -32,6 +32,11 @@ fn strftime(format: &CStr, tm: &libc::tm) -> String {
     String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
+/// Метка заметки: `2026-10-26 19:40`, не зависит от локали.
+pub fn stamp() -> String {
+    local_tm().map_or_else(String::new, |tm| strftime(c"%Y-%m-%d %H:%M", &tm))
+}
+
 /// Текущие дата и время для шапки. Меняются раз в минуту — по смене этой строки главный цикл
 /// и перерисовывает экран.
 pub fn now() -> String {
@@ -179,6 +184,9 @@ mod tests {
         let text = now();
         assert!(text.contains(&Date::today().year().to_string()), "{text}");
         assert!(text.contains(':') && text.contains(", "), "{text}");
+        let stamp = stamp();
+        assert!(stamp.starts_with(&Date::today().to_string()), "{stamp}");
+        assert_eq!(stamp.len(), 16);
     }
 
     #[test]

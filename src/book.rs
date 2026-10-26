@@ -1,14 +1,20 @@
 //! Книжка: каталог со страницами по датам, `2026-10-26.md` — четыре списка на этот день.
 
+use std::collections::HashMap;
 use std::fs;
-use std::io::ErrorKind;
+use std::hash::{BuildHasher, RandomState};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use crate::clock::Date;
 use crate::model::{Board, Category, State, Task};
+use crate::notes::{Notes, Summary};
 use crate::storage;
+
+/// Куда уходят записи удалённых задач, чтобы не терять их.
+pub const DELETED_NOTES: &str = "DELETED_NOTES.md";
 
 pub struct Book {
     dir: PathBuf,
@@ -45,6 +51,109 @@ impl Book {
             }
             _ => Ok(()),
         }
+    }
+
+    fn notes_path(&self, id: &str) -> PathBuf {
+        self.dir.join("notes").join(format!("{id}.md"))
+    }
+
+    /// Записи задачи; нет файла — записей нет.
+    pub fn load_notes(&self, id: &str) -> Result<Notes> {
+        let path = self.notes_path(id);
+        match fs::read_to_string(&path) {
+            Ok(text) => Ok(Notes::parse(&text)),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(Notes::default()),
+            Err(e) => Err(e).with_context(|| format!("чтение {}", path.display())),
+        }
+    }
+
+    /// Сохраняет записи; пустые — без файла, как и пустая страница.
+    pub fn save_notes(&self, id: &str, notes: &Notes) -> Result<()> {
+        let path = self.notes_path(id);
+        if !notes.is_empty() {
+            return storage::write_atomic(&path, &notes.serialize());
+        }
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() != ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("удаление {}", path.display()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Путь к файлу записей для внешнего редактора; каталог создаётся заранее.
+    pub fn notes_file(&self, id: &str) -> Result<PathBuf> {
+        let path = self.notes_path(id);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("создание {}", dir.display()))?;
+        }
+        Ok(path)
+    }
+
+    /// Новый id записей, которого ещё нет в книжке: 6 знаков base36 из случайного хеша.
+    pub fn new_id(&self) -> String {
+        loop {
+            let mut n = RandomState::new().hash_one(std::time::SystemTime::now());
+            let id: String = (0..6)
+                .map(|_| {
+                    let c = char::from_digit((n % 36) as u32, 36).unwrap_or('0');
+                    n /= 36;
+                    c
+                })
+                .collect();
+            if !self.notes_path(&id).exists() {
+                return id;
+            }
+        }
+    }
+
+    /// Сводка записей для задач страницы — для значка `✎ 1/3`.
+    pub fn summaries(&self, board: &Board) -> HashMap<String, Summary> {
+        board
+            .tasks()
+            .filter_map(|t| t.id.clone())
+            .filter_map(|id| {
+                let summary = self.load_notes(&id).ok()?.summary();
+                summary.any.then_some((id, summary))
+            })
+            .collect()
+    }
+
+    /// Есть ли задача с этим id хоть на одной сохранённой странице.
+    pub fn is_referenced(&self, id: &str) -> Result<bool> {
+        for date in self.dates()? {
+            if self.load(date)?.tasks().any(|t| t.id.as_deref() == Some(id)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Удалена задача с записями: если её копий больше нет ни на одной странице, записи
+    /// дописываются в `DELETED_NOTES.md`, а их файл удаляется. Возвращает, перенесены ли.
+    pub fn archive_notes(&self, task: &Task, page: Date, stamp: &str) -> Result<bool> {
+        let Some(id) = &task.id else {
+            return Ok(false);
+        };
+        let notes = self.load_notes(id)?;
+        if notes.is_empty() || self.is_referenced(id)? {
+            return Ok(false);
+        }
+        let path = self.dir.join(DELETED_NOTES);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("запись {}", path.display()))?;
+        write!(
+            file,
+            "## {stamp} — {}\n<!-- id:{id}, страница {page} -->\n\n{}\n",
+            task.text,
+            notes.serialize()
+        )?;
+        file.sync_all()?;
+        self.save_notes(id, &Notes::default())?;
+        Ok(true)
     }
 
     /// Даты всех страниц книжки, по возрастанию. Посторонние файлы не учитываются.
@@ -104,7 +213,7 @@ impl Book {
             return Ok(false);
         };
         let mut target = self.load(to)?;
-        target.push(category, Task::new(task.text.clone()));
+        target.push(category, task.carried());
         self.save(to, &target)?;
         task.state = State::Migrated(to);
         self.save(from, board)?;
@@ -193,6 +302,47 @@ mod tests {
         // Только с последней страницы; повторный запуск ничего не делает.
         assert_eq!(book.load(d(20)).unwrap(), older);
         assert_eq!(book.carry_over(d(26)).unwrap(), None);
+        fs::remove_dir_all(book.dir()).unwrap();
+    }
+
+    #[test]
+    fn notes_follow_task_and_archive() {
+        let book = temp_book("notes");
+        let id = book.new_id();
+        assert_eq!(id.len(), 6);
+        let mut notes = Notes::default();
+        notes.add_subtask("купить");
+        book.save_notes(&id, &notes).unwrap();
+        assert_eq!(book.load_notes(&id).unwrap(), notes);
+
+        let mut task = Task::new("кран");
+        task.id = Some(id.clone());
+        let mut page = Board::default();
+        page.push(Category::Home, task.clone());
+        book.save(d(25), &page).unwrap();
+        assert_eq!(book.summaries(&page)[&id].subtasks, 1);
+
+        // Перенос: копия с тем же id.
+        assert_eq!(book.carry_over(d(26)).unwrap(), Some((d(25), 1)));
+        let today = book.load(d(26)).unwrap();
+        assert_eq!(today.list(Category::Home)[0].id.as_deref(), Some(id.as_str()));
+
+        // Удалили копию на 26-м — запись на 25-м осталась, записи живы.
+        book.save(d(26), &Board::default()).unwrap();
+        assert!(!book.archive_notes(&task, d(26), "2026-10-26 19:40").unwrap());
+        assert!(book.notes_path(&id).exists());
+
+        // Удалили последнюю — записи в DELETED_NOTES.md.
+        book.save(d(25), &Board::default()).unwrap();
+        assert!(book.archive_notes(&task, d(25), "2026-10-26 19:41").unwrap());
+        assert!(!book.notes_path(&id).exists());
+        let deleted = fs::read_to_string(book.dir().join(DELETED_NOTES)).unwrap();
+        assert!(deleted.starts_with("## 2026-10-26 19:41 — кран\n"), "{deleted}");
+        assert!(deleted.contains(&format!("id:{id}, страница 2026-10-25")));
+        assert!(deleted.contains("- [ ] купить\n"));
+        // Пустые записи — без файла.
+        book.save_notes(&id, &Notes::default()).unwrap();
+        assert!(!book.notes_path(&id).exists());
         fs::remove_dir_all(book.dir()).unwrap();
     }
 
