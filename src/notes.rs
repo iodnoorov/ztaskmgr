@@ -239,6 +239,28 @@ impl Notes {
         true
     }
 
+    /// Сливает записи с другого устройства: пункты, которых здесь нет, дописываются в конец;
+    /// подзадача, отмеченная хоть на одном устройстве, отмечена.
+    pub fn merge(&mut self, other: &Notes) {
+        for entry in other.entries.iter().filter(|e| !e.is_blank()) {
+            if self.entries.contains(entry) {
+                continue;
+            }
+            let (kind, head) = head_kind(entry.head());
+            let same_subtask = self.entries.iter().position(|e| {
+                matches!(head_kind(e.head()), (Kind::Subtask { .. }, h) if h == head)
+            });
+            match (kind, same_subtask) {
+                (Kind::Subtask { done }, Some(i)) => {
+                    if done && !matches!(head_kind(self.entries[i].head()).0, Kind::Subtask { done: true }) {
+                        self.toggle(i);
+                    }
+                }
+                _ => self.entries.push(entry.clone()),
+            }
+        }
+    }
+
     /// Пункт как в файле — для архива удалённого.
     pub fn raw(&self, i: usize) -> String {
         self.entries[i].lines.iter().map(|l| format!("{l}\n")).collect()

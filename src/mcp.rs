@@ -219,6 +219,8 @@ pub fn handle(agent: &Agent, message: &Value) -> Option<Value> {
         "ping" => json!({}),
         "tools/list" => json!({"tools": tools()}),
         "tools/call" => {
+            // Сначала — то, что пришло с других устройств, чтобы агент видел всё.
+            let _ = agent.book().merge_conflicts();
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             match call(agent, name, &args) {

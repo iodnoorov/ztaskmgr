@@ -58,8 +58,9 @@ pub enum State {
 pub struct Task {
     pub text: String,
     pub state: State,
-    /// Ключ доп. записей (`notes/<id>.md`); появляется с первой записью и переезжает
-    /// вместе с задачей при переносе.
+    /// Постоянный ключ задачи: по нему её узнают при слиянии копий с разных устройств,
+    /// он же — имя файла доп. записей (`notes/<id>.md`). Переезжает вместе с задачей при
+    /// переносе. Задача, написанная руками без id, получает его при первом сохранении.
     pub id: Option<String>,
     /// Скрыта от ИИ сама по себе (вдобавок к скрытым спискам); едет с задачей при переносе.
     pub private: bool,
@@ -138,6 +139,22 @@ impl Board {
         }
         list.swap(index, index + 1);
         Some(index + 1)
+    }
+
+    /// Вставляет задачу в список на место `index` (не дальше конца).
+    pub fn insert(&mut self, category: Category, index: usize, task: Task) {
+        let list = self.list_mut(category);
+        list.insert(index.min(list.len()), task);
+    }
+
+    /// Даёт id задачам, у которых его нет. Возвращает, были ли такие.
+    pub fn assign_ids(&mut self, mut new_id: impl FnMut() -> String) -> bool {
+        let mut any = false;
+        for task in self.lists.iter_mut().flatten().filter(|t| t.id.is_none()) {
+            task.id = Some(new_id());
+            any = true;
+        }
+        any
     }
 
     pub fn tasks(&self) -> impl Iterator<Item = &Task> {

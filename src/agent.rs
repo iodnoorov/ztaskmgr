@@ -70,7 +70,6 @@ impl Agent {
         Self { book }
     }
 
-    #[cfg(test)]
     pub fn book(&self) -> &Book {
         &self.book
     }

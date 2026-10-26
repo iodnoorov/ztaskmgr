@@ -286,6 +286,14 @@ pub const NOTES_ROWS: &[Row] = &[
     },
 ];
 
+/// Первая клавиша действия — её «нажимает» тап по подсказке.
+pub fn first_key(rows: &[Row], action: Action) -> Option<Key> {
+    rows.iter()
+        .flat_map(|r| r.keys)
+        .find(|(_, a)| *a == action)
+        .map(|&(k, _)| k)
+}
+
 fn find(rows: &[Row], key: Key) -> Option<Action> {
     rows.iter()
         .flat_map(|r| r.keys)

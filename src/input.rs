@@ -45,8 +45,58 @@ impl From<KeyCode> for Press {
 pub enum Input {
     Key(Press),
     Paste(String),
+    /// Мышь — на телефоне (Termux) это касания: тап — щелчок, свайп вверх/вниз — прокрутка.
+    Mouse(Mouse),
     /// Терминал ответил, что знает kitty keyboard protocol: включить его — `kitty_on`.
     KittyProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseKind {
+    /// Нажатие левой кнопки (тап).
+    Click,
+    ScrollUp,
+    ScrollDown,
+}
+
+/// Событие мыши: что и где (колонка и строка с нуля).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mouse {
+    pub kind: MouseKind,
+    pub column: u16,
+    pub row: u16,
+}
+
+/// Включает отчёты мыши: нажатия и колесо (1000) в формате SGR (1006).
+pub fn mouse_on() {
+    let mut out = io::stdout();
+    let _ = out.write_all(b"\x1b[?1000h\x1b[?1006h").and_then(|()| out.flush());
+}
+
+pub fn mouse_off() {
+    let mut out = io::stdout();
+    let _ = out.write_all(b"\x1b[?1006l\x1b[?1000l").and_then(|()| out.flush());
+}
+
+/// Мышь в SGR: `CSI < кнопка ; x ; y M` (нажатие) или `m` (отпускание), x и y — с единицы.
+fn sgr_mouse(params: &str, last: u8) -> Option<Input> {
+    let mut nums = params.split(';').map(|n| n.parse::<u16>().ok());
+    let (button, x, y) = (nums.next()??, nums.next()??, nums.next()??);
+    // Отпускания и движение (бит 32) не нужны.
+    if last == b'm' || button & 32 != 0 {
+        return None;
+    }
+    let kind = match button & !(4 | 8 | 16) {
+        0 => MouseKind::Click,
+        64 => MouseKind::ScrollUp,
+        65 => MouseKind::ScrollDown,
+        _ => return None,
+    };
+    Some(Input::Mouse(Mouse {
+        kind,
+        column: x.saturating_sub(1),
+        row: y.saturating_sub(1),
+    }))
 }
 
 impl From<Press> for Input {
@@ -285,6 +335,11 @@ fn parse(buf: &[u8]) -> Parsed {
                     Parsed::Done(None, len)
                 };
             }
+            if let Some(p) = params.strip_prefix('<')
+                && matches!(last, b'M' | b'm')
+            {
+                return Parsed::Done(sgr_mouse(p, last), len);
+            }
             if last == b'u' {
                 return Parsed::Done(kitty_key(&params), len);
             }
@@ -417,7 +472,7 @@ impl Reader {
 }
 
 /// Есть ли данные в stdin в пределах `timeout`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn wait(timeout: Duration) -> io::Result<bool> {
     let mut fd = libc::pollfd {
         fd: io::stdin().as_raw_fd(),
@@ -547,6 +602,16 @@ mod tests {
         // Оборванная последовательность ждёт продолжения.
         assert_eq!(parse(b"\x1b[1;5"), Parsed::Incomplete);
         assert_eq!(parse(&"д".as_bytes()[..1]), Parsed::Incomplete);
+    }
+
+    #[test]
+    fn mouse() {
+        let at = |kind, column, row| vec![Input::Mouse(Mouse { kind, column, row })];
+        assert_eq!(parse_all(b"\x1b[<0;10;5M"), at(MouseKind::Click, 9, 4));
+        assert_eq!(parse_all(b"\x1b[<64;1;1M"), at(MouseKind::ScrollUp, 0, 0));
+        assert_eq!(parse_all(b"\x1b[<65;3;2M"), at(MouseKind::ScrollDown, 2, 1));
+        // Отпускание, правая кнопка, движение — ничего.
+        assert!(parse_all(b"\x1b[<0;10;5m\x1b[<2;1;1M\x1b[<32;1;1M").is_empty());
     }
 
     #[test]

@@ -20,6 +20,17 @@ pub const DELETED_NOTES: &str = "DELETED_NOTES.md";
 /// Какие списки скрыты от ИИ: `- Личное` по строке на список.
 pub const AI_HIDDEN: &str = "AI_HIDDEN.md";
 
+/// Скрытые списки из текста `AI_HIDDEN.md`: `- Личное` по строке на список.
+pub fn parse_hidden(text: &str) -> Result<[bool; 4]> {
+    let mut hidden = [false; 4];
+    for line in text.lines().filter_map(|l| l.trim().strip_prefix("- ")) {
+        let category = Category::from_title(line.trim())
+            .with_context(|| format!("неизвестный список «{line}»"))?;
+        hidden[category.index()] = true;
+    }
+    Ok(hidden)
+}
+
 /// Отпечаток файла: время изменения, размер и inode. По нему видно правки снаружи (агент,
 /// синхронизация, редактор). Время в Linux грубое (миллисекунды), две записи подряд могут
 /// его не сдвинуть, поэтому ещё размер и inode: запись через rename всегда даёт новый inode.
@@ -184,13 +195,7 @@ impl Book {
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok([false; 4]),
             Err(e) => return Err(e).with_context(|| format!("чтение {}", path.display())),
         };
-        let mut hidden = [false; 4];
-        for line in text.lines().filter_map(|l| l.trim().strip_prefix("- ")) {
-            let category = Category::from_title(line.trim())
-                .with_context(|| format!("{}: неизвестный список «{line}»", path.display()))?;
-            hidden[category.index()] = true;
-        }
-        Ok(hidden)
+        parse_hidden(&text).with_context(|| path.display().to_string())
     }
 
     pub fn set_hidden(&self, hidden: [bool; 4]) -> Result<()> {
@@ -239,6 +244,9 @@ impl Book {
             return Ok(None);
         };
         let mut source = self.load(from)?;
+        // Копии на сегодня — с теми же id, что и на исходной странице: если перенос сделают
+        // два устройства сразу, при слиянии это будут одни и те же задачи, а не дубли.
+        source.assign_ids(|| self.new_id());
         let moved = source.migrate_open(today);
         if moved.is_empty() {
             return Ok(None);
@@ -265,6 +273,7 @@ impl Book {
         index: usize,
         to: Date,
     ) -> Result<bool> {
+        board.assign_ids(|| self.new_id());
         let Some(task) = board.get_mut(category, index).filter(|t| t.is_open() && from != to)
         else {
             return Ok(false);

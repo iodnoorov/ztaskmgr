@@ -14,10 +14,11 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, AUTOSAVE, DatePurpose, Draft, Mode, NoteTarget, NotesMode, NotesView, Status};
+use crate::app::{App, AUTOSAVE, DatePurpose, Draft, Hit, Mode, NoteTarget, NotesMode, NotesView, Status};
 use crate::clock::{self, Date};
 use crate::field::LineInput;
-use crate::keymap::{self, Action as A, Section};
+use crate::keymap::{self, Action as A, Key, Row, Section};
+use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use crate::model::{Category, State, Task};
 use crate::field::TextArea;
 use crate::notes::Kind;
@@ -27,6 +28,40 @@ const SUB: Color = Color::Gray;
 const MUTED: Color = Color::DarkGray;
 
 pub const REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
+
+/// Уже этой ширины — телефон (Termux): вкладки и один список на экран вместо сетки 2×2.
+pub const NARROW: u16 = 80;
+
+/// Карта попаданий кадра: где что лежит, чтобы тап попал куда надо (`App::on_mouse`).
+type Hits = Vec<(Rect, Hit)>;
+
+/// Строка из кусков, часть которых тапабельна: куски кладутся подряд от `area.x`.
+fn place(area: Rect, parts: Vec<(Span<'static>, Option<Hit>)>, hits: &mut Hits) -> Line<'static> {
+    let mut x = area.x;
+    let mut spans = Vec::new();
+    for (span, hit) in parts {
+        let w = span.width() as u16;
+        if let Some(hit) = hit
+            && x < area.right()
+        {
+            hits.push((Rect::new(x, area.y, w.min(area.right() - x), 1), hit));
+        }
+        x = x.saturating_add(w);
+        spans.push(span);
+    }
+    Line::from(spans)
+}
+
+fn key_hit(rows: &[Row], action: A) -> Option<Hit> {
+    keymap::first_key(rows, action).map(Hit::Key)
+}
+
+/// Перенесённые — уже не дела этой страницы, в счётчике их нет.
+fn counts(tasks: &[Task]) -> (usize, usize) {
+    let done = tasks.iter().filter(|t| t.state == State::Done).count();
+    let total = tasks.iter().filter(|t| !matches!(t.state, State::Migrated(_))).count();
+    (done, total)
+}
 
 /// Кликабельная ссылка (OSC 8) поверх уже нарисованного кадра, см. `write_links`.
 pub struct Link {
@@ -38,40 +73,48 @@ pub struct Link {
 
 /// Рисует кадр; возвращает ссылки, которые надо дописать поверх него (`write_links`).
 pub fn draw(frame: &mut Frame, app: &mut App) -> Vec<Link> {
+    let mut hits = Hits::new();
+    let narrow = frame.area().width < NARROW;
+    // На узком экране подсказки — в две строки: ими удобно пользоваться как кнопками.
     let [header_area, board_area, status_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(if narrow { 2 } else { 1 }),
     ])
     .areas(frame.area());
-    draw_header(frame, app, header_area);
-    let rows: [Rect; 2] = Layout::vertical([Constraint::Ratio(1, 2); 2]).areas(board_area);
+    draw_header(frame, app, header_area, narrow, &mut hits);
 
-    // Раскладка 2×2: Работа | Дом / Личное | Прочее.
-    for category in Category::ALL {
-        let i = category.index();
-        let cols: [Rect; 2] = Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(rows[i / 2]);
-        draw_list(frame, app, category, cols[i % 2]);
+    if narrow {
+        let [tabs, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(board_area);
+        draw_tabs(frame, app, tabs, &mut hits);
+        draw_list(frame, app, app.active, list, &mut hits);
+    } else {
+        // Раскладка 2×2: Работа | Дом / Личное | Прочее.
+        let rows: [Rect; 2] = Layout::vertical([Constraint::Ratio(1, 2); 2]).areas(board_area);
+        for category in Category::ALL {
+            let i = category.index();
+            let cols: [Rect; 2] = Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(rows[i / 2]);
+            draw_list(frame, app, category, cols[i % 2], &mut hits);
+        }
     }
 
-    draw_status(frame, app, status_area);
+    draw_status(frame, app, status_area, &mut hits);
 
     match &app.mode {
-        Mode::Edit { .. } => draw_edit(frame, app),
-        Mode::Date { .. } => draw_date(frame, app),
-        Mode::ConfirmDelete => draw_confirm(frame, app),
+        Mode::Edit { .. } => draw_edit(frame, app, &mut hits),
+        Mode::Date { .. } => draw_date(frame, app, &mut hits),
+        Mode::ConfirmDelete => draw_confirm(frame, app, &mut hits),
         Mode::Normal | Mode::MoveTo => {}
     }
     if app.notes.is_some() {
-        draw_notes(frame, app);
+        draw_notes(frame, app, board_area, &mut hits);
     }
     if app.show_help {
         draw_help(frame, app.notes.is_some());
     }
-    if app.show_about {
-        return draw_about(frame);
-    }
-    Vec::new()
+    let links = if app.show_about { draw_about(frame) } else { Vec::new() };
+    app.hits = hits;
+    links
 }
 
 /// Дописывает ссылки в терминал напрямую. В буфер ratatui их не положить: unicode-width 0.2
@@ -137,31 +180,62 @@ fn short_date(date: Date, page: Date) -> String {
     }
 }
 
-/// Шапка: название, дата открытой страницы и каталог книжки слева, текущие дата и время справа.
-fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let right = Line::from(format!("{} ", clock::now()).fg(SUB));
+/// Шапка: название, ◀ дата открытой страницы ▶ и каталог книжки слева, текущие дата и время
+/// справа. Стрелки листают дни, тап по дате — сегодня. На узком экране — только дата и время.
+fn draw_header(frame: &mut Frame, app: &App, area: Rect, narrow: bool, hits: &mut Hits) {
+    let now = if narrow { clock::hm() } else { clock::now() };
+    let right = Line::from(format!("{now} ").fg(SUB));
     let relative = match app.today.days_until(app.date) {
         0 => " · сегодня",
         -1 => " · вчера",
         1 => " · завтра",
         _ => "",
     };
-    let title = [
-        Span::raw(" ≡ ").fg(Color::Black).bg(ACCENT).bold(),
-        Span::raw(" ztaskmgr ").fg(ACCENT).bold(),
-        Span::raw("  "),
-        Span::raw(page_date(app.date)).bold(),
-        Span::raw(relative).fg(MUTED),
-        Span::raw("   "),
-    ];
-    let title_w: usize = title.iter().map(Span::width).sum();
-    // Между путём и часами — хотя бы два пробела; на узком экране путь обрезается слева.
-    let room = usize::from(area.width).saturating_sub(title_w + right.width() + 2);
-    let path = truncate_start(&display_path(app.book.dir()), room);
-    let mut left = title.to_vec();
-    left.push(Span::raw(path).fg(SUB));
-    frame.render_widget(Line::from(left), area);
+    let date = if narrow { app.date.format(c"%a, %-d %b") } else { page_date(app.date) };
+    let mut parts: Vec<(Span<'static>, Option<Hit>)> = Vec::new();
+    if !narrow {
+        parts.push((Span::raw(" ≡ ").fg(Color::Black).bg(ACCENT).bold(), None));
+        parts.push((Span::raw(" ztaskmgr ").fg(ACCENT).bold(), None));
+    }
+    parts.extend([
+        (Span::raw(" ◀ ").fg(ACCENT), key_hit(keymap::ROWS, A::PrevDay)),
+        (Span::raw(date).bold(), key_hit(keymap::ROWS, A::Today)),
+        (Span::raw(relative).fg(MUTED), key_hit(keymap::ROWS, A::Today)),
+        (Span::raw(" ▶ ").fg(ACCENT), key_hit(keymap::ROWS, A::NextDay)),
+    ]);
+    if !narrow {
+        let used: usize = parts.iter().map(|(s, _)| s.width()).sum();
+        // Между путём и часами — хотя бы два пробела; не помещается — путь обрезается слева.
+        let room = usize::from(area.width).saturating_sub(used + 2 + right.width() + 2);
+        let path = truncate_start(&display_path(app.book.dir()), room);
+        parts.push((Span::raw("  "), None));
+        parts.push((Span::raw(path).fg(SUB), None));
+    }
+    frame.render_widget(place(area, parts, hits), area);
     frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
+}
+
+/// Вкладки списков на узком экране: тап — список. Не помещаются — у неактивных только номера.
+fn draw_tabs(frame: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
+    let tab = |c: Category, full: bool| {
+        let lock = if app.is_hidden(c) { " 🔒" } else { "" };
+        if c == app.active {
+            let (done, total) = counts(app.board.list(c));
+            let label = format!(" {} {}{lock} {done}/{total} ", c.index() + 1, c.title());
+            Span::raw(label).fg(Color::Black).bg(ACCENT).bold()
+        } else if full {
+            Span::raw(format!(" {} {}{lock} ", c.index() + 1, c.title())).fg(SUB)
+        } else {
+            Span::raw(format!(" {} ", c.index() + 1)).fg(SUB)
+        }
+    };
+    let width = |full: bool| -> usize { Category::ALL.iter().map(|&c| tab(c, full).width()).sum() };
+    let full = width(true) <= usize::from(area.width);
+    let parts = Category::ALL
+        .into_iter()
+        .map(|c| (tab(c, full), Some(Hit::List(c))))
+        .collect();
+    frame.render_widget(place(area, parts, hits), area);
 }
 
 /// Окно с рамкой и заголовком, как у всех всплывающих окон.
@@ -177,15 +251,11 @@ fn any_key_closes() -> Line<'static> {
     Line::from(" любая клавиша — закрыть ".fg(MUTED)).centered()
 }
 
-fn draw_list(frame: &mut Frame, app: &mut App, category: Category, area: Rect) {
+fn draw_list(frame: &mut Frame, app: &mut App, category: Category, area: Rect, hits: &mut Hits) {
+    hits.push((area, Hit::List(category)));
     let active = app.active == category;
     let tasks = app.board.list(category);
-    // Перенесённые — уже не дела этой страницы, в счётчике их нет.
-    let done = tasks.iter().filter(|t| t.state == State::Done).count();
-    let total = tasks
-        .iter()
-        .filter(|t| !matches!(t.state, State::Migrated(_)))
-        .count();
+    let (done, total) = counts(tasks);
 
     let border_style = if active {
         Style::new().fg(ACCENT).bold()
@@ -240,13 +310,22 @@ fn draw_list(frame: &mut Frame, app: &mut App, category: Category, area: Rect) {
     } else {
         ("  ", Style::new())
     };
+    let inner = block.inner(area);
+    let len = tasks.len();
     let list = List::new(items)
         .block(block)
         .highlight_symbol(symbol)
         .highlight_style(highlight)
         .highlight_spacing(HighlightSpacing::Always);
 
-    frame.render_stateful_widget(list, area, &mut app.lists[category.index()]);
+    let state = &mut app.lists[category.index()];
+    frame.render_stateful_widget(list, area, state);
+    // Задачи — по строке; `[ ]` — после символа выделения (две колонки).
+    for (row, index) in (state.offset()..len).take(usize::from(inner.height)).enumerate() {
+        let y = inner.y + row as u16;
+        hits.push((Rect::new(inner.x, y, inner.width, 1), Hit::Task(category, index)));
+        hits.push((Rect::new(inner.x + 2, y, 3.min(inner.width.saturating_sub(2)), 1), Hit::Check(category, index)));
+    }
 }
 
 /// Значок доп. записей у задачи: « ✎», с подзадачами — « ✎ 1/3».
@@ -259,32 +338,76 @@ fn notes_mark(app: &App, task: &Task) -> Option<String> {
     })
 }
 
-fn key_hint(key: &str, action: &str) -> [Span<'static>; 2] {
-    [
-        Span::raw(key.to_string()).fg(ACCENT).bold(),
-        Span::raw(format!(" {action}   ")).fg(MUTED),
+/// Подсказка внизу: клавиша, что делает и что «нажимает» тап по ней.
+struct Hint {
+    key: String,
+    desc: &'static str,
+    press: Option<Key>,
+}
+
+impl Hint {
+    fn new(key: &str, desc: &'static str, code: KeyCode) -> Self {
+        Self::with(key, desc, code, KeyModifiers::NONE)
+    }
+
+    fn with(key: &str, desc: &'static str, code: KeyCode, modifiers: KeyModifiers) -> Self {
+        Self {
+            key: key.into(),
+            desc,
+            press: Some((code, modifiers)),
+        }
+    }
+
+    fn width(&self) -> usize {
+        self.key.width() + 1 + self.desc.width()
+    }
+}
+
+/// Подсказки к действиям из таблицы клавиш экрана.
+fn action_hints(rows: &[Row], actions: &[(&[A], &'static str)]) -> Vec<Hint> {
+    actions
+        .iter()
+        .map(|(a, desc)| Hint {
+            key: keymap::hint_keys_in(rows, a),
+            desc,
+            press: keymap::first_key(rows, a[0]),
+        })
+        .collect()
+}
+
+fn enter_esc(enter: &'static str, esc: &'static str) -> Vec<Hint> {
+    vec![Hint::new("Enter", enter, KeyCode::Enter), Hint::new("Esc", esc, KeyCode::Esc)]
+}
+
+fn yes_other(yes: &'static str, other: &'static str) -> Vec<Hint> {
+    vec![
+        Hint::new("y/Enter", yes, KeyCode::Char('y')),
+        Hint::new("другая", other, KeyCode::Esc),
     ]
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_status(frame: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     match &app.status {
         Some(Status::Error(text)) => {
-            frame.render_widget(Line::from(format!(" {text}").red()), area);
+            let text = Paragraph::new(format!(" {text}").red()).wrap(Wrap { trim: true });
+            frame.render_widget(text, area);
             return;
         }
         Some(Status::Info(text)) => {
-            frame.render_widget(Line::from(format!(" {text}").fg(ACCENT)), area);
+            let text = Paragraph::new(format!(" {text}").fg(ACCENT)).wrap(Wrap { trim: true });
+            frame.render_widget(text, area);
             return;
         }
         None => {}
     }
     if let Some(view) = &app.notes {
-        draw_notes_status(frame, view, area);
+        draw_notes_status(frame, view, area, hits);
         return;
     }
-    let hints: Vec<(String, &str)> = match app.mode {
-        Mode::Normal => {
-            let actions: &[(&[A], &str)] = &[
+    let hints = match app.mode {
+        Mode::Normal => action_hints(
+            keymap::ROWS,
+            &[
                 (&[A::Add], "добавить"),
                 (&[A::Edit], "правка"),
                 (&[A::Toggle], "готово"),
@@ -296,34 +419,35 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 (&[A::Delete], "удалить"),
                 (&[A::Help], "помощь"),
                 (&[A::Quit], "выход"),
-            ];
-            actions
-                .iter()
-                .map(|(a, d)| (keymap::hint_keys(a), *d))
-                .collect()
-        }
-        Mode::Edit { .. } => vec![("Enter".into(), "сохранить"), ("Esc".into(), "отмена")],
-        Mode::Date { purpose, .. } => {
-            let enter = match purpose {
-                DatePurpose::Go => "перейти",
-                DatePurpose::Postpone(_) => "перенести",
-            };
-            vec![("Enter".into(), enter), ("Esc".into(), "отмена")]
-        }
-        Mode::ConfirmDelete => vec![("y/Enter".into(), "удалить"), ("другая".into(), "отмена")],
+            ],
+        ),
+        Mode::Edit { .. } => enter_esc("сохранить", "отмена"),
+        Mode::Date { purpose, .. } => match purpose {
+            DatePurpose::Go => enter_esc("перейти", "отмена"),
+            DatePurpose::Postpone(_) => enter_esc("перенести", "отмена"),
+        },
+        Mode::ConfirmDelete => yes_other("удалить", "отмена"),
         Mode::MoveTo => {
-            frame.render_widget(move_to_hint(app.active), area);
+            // Куда перенести — цифры списков, их удобно нажимать и пальцем.
+            let mut hints = vec![Hint { key: String::new(), desc: "перенести в:", press: None }];
+            for c in Category::ALL.into_iter().filter(|&c| c != app.active) {
+                let n = char::from(b'1' + c.index() as u8);
+                hints.push(Hint::new(&n.to_string(), c.title(), KeyCode::Char(n)));
+            }
+            hints.push(Hint::new("Esc", "отмена", KeyCode::Esc));
+            draw_hint_line(frame, area, &hints, &["Esc"], false, hits);
             return;
         }
     };
     let main = matches!(app.mode, Mode::Normal);
-    draw_hint_line(frame, area, &hints, &keymap::hint_keys(&[A::Help]), main);
+    draw_hint_line(frame, area, &hints, &[&keymap::hint_keys(&[A::Help])], main, hits);
 }
 
-fn draw_notes_status(frame: &mut Frame, view: &NotesView, area: Rect) {
-    let hints: Vec<(String, &str)> = match view.mode {
-        NotesMode::List => {
-            let actions: &[(&[A], &str)] = &[
+fn draw_notes_status(frame: &mut Frame, view: &NotesView, area: Rect, hits: &mut Hits) {
+    let hints = match view.mode {
+        NotesMode::List => action_hints(
+            keymap::NOTES_ROWS,
+            &[
                 (&[A::Add], "заметка"),
                 (&[A::AddSubtask], "подзадача"),
                 (&[A::Edit], "правка"),
@@ -333,31 +457,29 @@ fn draw_notes_status(frame: &mut Frame, view: &NotesView, area: Rect) {
                 (&[A::OpenEditor], "редактор"),
                 (&[A::Help], "помощь"),
                 (&[A::Close], "закрыть"),
-            ];
-            actions
-                .iter()
-                .map(|(a, d)| (keymap::hint_keys_in(keymap::NOTES_ROWS, a), *d))
-                .collect()
-        }
-        NotesMode::Edit { .. } => vec![("Enter".into(), "сохранить"), ("Esc".into(), "отмена")],
+            ],
+        ),
+        NotesMode::Edit { .. } => enter_esc("сохранить", "отмена"),
         NotesMode::Text(Draft { confirm_close: true, .. }) => vec![
-            ("y/Enter".into(), "закрыть"),
-            ("s/Ctrl+S".into(), "сохранить и закрыть"),
-            ("другая".into(), "вернуться"),
+            Hint::new("y/Enter", "закрыть", KeyCode::Char('y')),
+            Hint::new("s/Ctrl+S", "сохранить и закрыть", KeyCode::Char('s')),
+            Hint::new("другая", "вернуться", KeyCode::Esc),
         ],
         NotesMode::Text(_) => vec![
-            ("Ctrl+S".into(), "сохранить"),
-            ("Enter".into(), "новая строка"),
-            ("Esc".into(), "закрыть"),
+            Hint::with("Ctrl+S", "сохранить", KeyCode::Char('s'), KeyModifiers::CONTROL),
+            Hint::new("Enter", "новая строка", KeyCode::Enter),
+            Hint::new("Esc", "закрыть", KeyCode::Esc),
         ],
-        NotesMode::ConfirmDelete => vec![("y/Enter".into(), "удалить"), ("другая".into(), "отмена")],
+        NotesMode::ConfirmDelete => yes_other("удалить", "отмена"),
     };
+    // Без «закрыть» из окна на телефоне не выйти — она остаётся вместе со справкой.
     let help = keymap::hint_keys_in(keymap::NOTES_ROWS, &[A::Help]);
-    draw_hint_line(frame, area, &hints, &help, false);
+    let close = keymap::hint_keys_in(keymap::NOTES_ROWS, &[A::Close]);
+    draw_hint_line(frame, area, &hints, &[&help, &close, "Esc"], false, hits);
 }
 
 /// Окно доп. записей задачи: подзадачи чекбоксами, заметки с датой, прочие строки как есть.
-fn draw_notes(frame: &mut Frame, app: &mut App) {
+fn draw_notes(frame: &mut Frame, app: &mut App, board: Rect, hits: &mut Hits) {
     let Some(title) = app.notes_task().map(|t| format!("Записи · {}", t.text)) else {
         return;
     };
@@ -365,9 +487,13 @@ fn draw_notes(frame: &mut Frame, app: &mut App) {
         return;
     };
     let screen = frame.area();
-    let width = (screen.width * 4 / 5).clamp(40, 100);
-    let height = (screen.height * 3 / 4).max(8);
-    let area = centered(screen, width, height);
+    // На узком экране — на всё место под шапкой, иначе окном по центру.
+    let area = if screen.width < NARROW {
+        board
+    } else {
+        centered(screen, (screen.width * 4 / 5).clamp(40, 100), (screen.height * 3 / 4).max(8))
+    };
+    hits.push((area, Hit::Block));
     let mut block = panel(title).padding(Padding::horizontal(1));
     let summary = view.notes.summary();
     if summary.subtasks > 0 {
@@ -386,10 +512,13 @@ fn draw_notes(frame: &mut Frame, app: &mut App) {
     // Отступ под символ выделения.
     let text_width = usize::from(inner.width).saturating_sub(2).max(10);
 
+    // Высота каждого пункта в строках и подзадача ли он — для карты попаданий.
+    let mut shapes: Vec<(usize, bool)> = Vec::new();
     let items: Vec<ListItem> = visible
         .iter()
         .map(|&i| {
             let item = view.notes.item(i);
+            let subtask = matches!(item.kind, Kind::Subtask { .. });
             let (prefix, style): (Vec<Span>, Style) = match item.kind {
                 Kind::Subtask { done: false } => (vec![Span::raw("[ ] ")], Style::new()),
                 Kind::Subtask { done: true } => (
@@ -417,6 +546,7 @@ fn draw_notes(frame: &mut Frame, app: &mut App) {
                     Line::from(spans)
                 })
                 .collect();
+            shapes.push((lines.len(), subtask));
             ListItem::new(lines)
         })
         .collect();
@@ -428,6 +558,19 @@ fn draw_notes(frame: &mut Frame, app: &mut App) {
         .highlight_spacing(HighlightSpacing::Always);
     frame.render_widget(Clear, area);
     frame.render_stateful_widget(list, area, &mut view.list);
+    let mut y = inner.y;
+    'items: for (n, &(height, subtask)) in shapes.iter().enumerate().skip(view.list.offset()) {
+        for line in 0..height {
+            if y >= inner.bottom() {
+                break 'items;
+            }
+            hits.push((Rect::new(inner.x, y, inner.width, 1), Hit::Entry(n)));
+            if line == 0 && subtask {
+                hits.push((Rect::new(inner.x + 2, y, 3, 1), Hit::EntryCheck(n)));
+            }
+            y += 1;
+        }
+    }
 
     match &mut view.mode {
         NotesMode::List => {}
@@ -436,7 +579,7 @@ fn draw_notes(frame: &mut Frame, app: &mut App) {
                 NoteTarget::Entry(_) => "Правка подзадачи",
                 _ => "Новая подзадача",
             };
-            draw_field(frame, panel(title), input);
+            draw_field(frame, panel(title), input, hits);
         }
         NotesMode::Text(draft) => {
             let title = match draft.target {
@@ -448,7 +591,7 @@ fn draw_notes(frame: &mut Frame, app: &mut App) {
                 Some(time) => format!(" сохранено в {time} · автосохранение раз в {} с ", AUTOSAVE.as_secs()),
                 None => format!(" автосохранение раз в {} с ", AUTOSAVE.as_secs()),
             };
-            draw_text_area(frame, title, &saved, &mut draft.area);
+            draw_text_area(frame, title, &saved, &mut draft.area, hits);
             if draft.confirm_close {
                 let answers = Line::from(vec![
                     Span::raw("y").red().bold(),
@@ -462,6 +605,7 @@ fn draw_notes(frame: &mut Frame, app: &mut App) {
                     "Последние изменения ещё не сохранены.",
                     None,
                     answers,
+                    hits,
                 );
             }
         }
@@ -469,13 +613,13 @@ fn draw_notes(frame: &mut Frame, app: &mut App) {
             let text = view.selected_entry().map(|i| view.notes.editable_text(i)).unwrap_or_default();
             // В вопросе — первая строка пункта.
             let first = text.lines().next().unwrap_or("");
-            draw_question(frame, "Удаление", &format!("Удалить «{first}»?"), None);
+            draw_question(frame, "Удаление", &format!("Удалить «{first}»?"), None, hits);
         }
     }
 }
 
 /// Многострочное поле: высота по тексту (от 3 до 12 строк), прокрутка за курсором.
-fn draw_text_area(frame: &mut Frame, title: &str, saved: &str, area: &mut TextArea) {
+fn draw_text_area(frame: &mut Frame, title: &str, saved: &str, area: &mut TextArea, hits: &mut Hits) {
     let screen = frame.area();
     let width = 70.min(screen.width.saturating_sub(4)).max(20);
     let probe = panel("").inner(Rect::new(0, 0, width, 3));
@@ -484,6 +628,7 @@ fn draw_text_area(frame: &mut Frame, title: &str, saved: &str, area: &mut TextAr
     let max_rows = 12.min(screen.height.saturating_sub(6)).max(3);
     let height = (rows.len() as u16).clamp(3, max_rows);
     let rect = centered(screen, width, height + 2);
+    hits.push((rect, Hit::Block));
     let block = panel(title)
         .title_bottom(Line::from(" Ctrl+S — сохранить · Esc — закрыть ".fg(MUTED)))
         .title_bottom(Line::from(saved.to_string().fg(MUTED)).right_aligned());
@@ -529,61 +674,90 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Подсказки, обрезанные с конца по ширине (подсказка `keep`, справка, остаётся),
-/// и «о программе» у правого края на главном экране.
-fn draw_hint_line(frame: &mut Frame, area: Rect, hints: &[(String, &str)], keep: &str, main: bool) {
+/// Между подсказками.
+const HINT_GAP: usize = 3;
+
+/// Раскладывает подсказки по строкам `area` (на узком экране их две); первая строка короче
+/// на `right` колонок. Возвращает (строка, колонка) каждой или `None`, если не все влезли.
+fn lay_out(hints: &[&Hint], area: Rect, right: usize) -> Option<Vec<(u16, usize)>> {
+    let mut places = Vec::new();
+    let (mut row, mut x) = (0u16, 1usize);
+    for hint in hints {
+        loop {
+            let limit = usize::from(area.width).saturating_sub(if row == 0 { right } else { 0 });
+            if x + hint.width() <= limit {
+                break;
+            }
+            row += 1;
+            x = 1;
+            if row >= area.height {
+                return None;
+            }
+        }
+        places.push((row, x));
+        x += hint.width() + HINT_GAP;
+    }
+    Some(places)
+}
+
+/// Подсказки, обрезанные с конца по месту (подсказки `keep` — справка, «закрыть» — остаются),
+/// и «о программе» у правого края на главном экране. Тап по подсказке — её клавиша.
+fn draw_hint_line(frame: &mut Frame, area: Rect, hints: &[Hint], keep: &[&str], main: bool, hits: &mut Hits) {
+    let about_key = keymap::hint_keys(&[A::About]);
     let about = main.then(|| {
         Line::from(vec![
-            Span::raw(keymap::hint_keys(&[A::About])).fg(ACCENT).bold(),
+            Span::raw(about_key.clone()).fg(ACCENT).bold(),
             Span::raw(" о программе ").fg(MUTED),
         ])
     });
     let right_w = about.as_ref().map_or(0, Line::width);
-    let hint_w = |(k, d): &&(String, &str)| Line::from(key_hint(k, d).to_vec()).width();
-    let mut shown: Vec<&(String, &str)> = hints.iter().collect();
-    while 1 + shown.iter().map(hint_w).sum::<usize>() + right_w > usize::from(area.width) {
-        let Some(last) = shown.iter().rposition(|(k, _)| k != keep) else {
-            break;
-        };
-        shown.remove(last);
+    let mut shown: Vec<&Hint> = hints.iter().collect();
+    let places = loop {
+        if let Some(places) = lay_out(&shown, area, right_w) {
+            break places;
+        }
+        match shown.iter().rposition(|h| !keep.contains(&h.key.as_str())) {
+            Some(last) => {
+                shown.remove(last);
+            }
+            None => break lay_out(&shown, area, right_w).unwrap_or_default(),
+        }
+    };
+    let mut lines: Vec<Vec<Span>> = vec![Vec::new(); usize::from(area.height)];
+    let mut ends = vec![0usize; lines.len()];
+    for (hint, &(row, x)) in shown.iter().zip(&places) {
+        let line = &mut lines[usize::from(row)];
+        line.push(Span::raw(" ".repeat(x - ends[usize::from(row)])));
+        line.push(Span::raw(hint.key.clone()).fg(ACCENT).bold());
+        line.push(Span::raw(format!(" {}", hint.desc)).fg(MUTED));
+        ends[usize::from(row)] = x + hint.width();
+        if let Some(press) = hint.press {
+            let rect = Rect::new(area.x + x as u16, area.y + row, hint.width() as u16, 1);
+            hits.push((rect.intersection(area), Hit::Key(press)));
+        }
     }
-    let mut spans = vec![Span::raw(" ")];
-    for (k, d) in shown {
-        spans.extend(key_hint(k, d));
-    }
-    frame.render_widget(Line::from(spans), area);
+    let lines: Vec<Line> = lines.into_iter().map(Line::from).collect();
+    frame.render_widget(Paragraph::new(lines), area);
     if let Some(about) = about {
+        let w = about.width() as u16;
+        let rect = Rect::new(area.right().saturating_sub(w), area.y, w.min(area.width), 1);
+        if let Some(key) = keymap::first_key(keymap::ROWS, A::About) {
+            hits.push((rect, Hit::Key(key)));
+        }
         frame.render_widget(Paragraph::new(about).alignment(Alignment::Right), area);
     }
 }
 
-fn move_to_hint(from: Category) -> Line<'static> {
-    let mut spans = vec![Span::raw(" Перенести в: ")];
-    for category in Category::ALL {
-        let key = Span::raw(format!("{} ", category.index() + 1));
-        let title = Span::raw(format!("{}  ", category.title()));
-        if category == from {
-            spans.push(key.fg(MUTED));
-            spans.push(title.fg(MUTED));
-        } else {
-            spans.push(key.fg(ACCENT).bold());
-            spans.push(title);
-        }
-    }
-    spans.push(Span::raw("(другая клавиша — отмена)").fg(MUTED));
-    Line::from(spans)
-}
-
-fn draw_edit(frame: &mut Frame, app: &App) {
+fn draw_edit(frame: &mut Frame, app: &App, hits: &mut Hits) {
     let Mode::Edit { input, index } = &app.mode else {
         return;
     };
     let action = if index.is_some() { "Правка" } else { "Новая задача" };
-    draw_field(frame, panel(format!("{action} · {}", app.active.title())), input);
+    draw_field(frame, panel(format!("{action} · {}", app.active.title())), input, hits);
 }
 
 /// Окно даты; внизу — во что разбирается введённое.
-fn draw_date(frame: &mut Frame, app: &App) {
+fn draw_date(frame: &mut Frame, app: &App, hits: &mut Hits) {
     let Mode::Date { input, purpose } = &app.mode else {
         return;
     };
@@ -603,12 +777,13 @@ fn draw_date(frame: &mut Frame, app: &App) {
         }
     };
     let block = panel(title).title_bottom(Line::from(preview).centered());
-    draw_field(frame, block, input);
+    draw_field(frame, block, input, hits);
 }
 
 /// Окно с однострочным полем ввода.
-fn draw_field(frame: &mut Frame, block: Block<'static>, input: &LineInput) {
+fn draw_field(frame: &mut Frame, block: Block<'static>, input: &LineInput, hits: &mut Hits) {
     let area = popup_area(frame.area(), 70, 3);
+    hits.push((area, Hit::Block));
     let inner = block.inner(area);
 
     // Горизонтальная прокрутка, чтобы курсор оставался в поле.
@@ -626,23 +801,23 @@ fn draw_field(frame: &mut Frame, block: Block<'static>, input: &LineInput) {
     frame.set_cursor_position((inner.x + (cursor - offset) as u16, inner.y));
 }
 
-fn draw_confirm(frame: &mut Frame, app: &App) {
+fn draw_confirm(frame: &mut Frame, app: &App, hits: &mut Hits) {
     let Some(task) = app.selected_task() else {
         return;
     };
     let note = notes_mark(app, task).map(|_| {
         format!("Записи задачи сохранятся в {}", crate::book::DELETED_NOTES)
     });
-    draw_question(frame, "Удаление", &format!("Удалить «{}»?", task.text), note.as_deref());
+    draw_question(frame, "Удаление", &format!("Удалить «{}»?", task.text), note.as_deref(), hits);
 }
 
 /// Окно «y — да» с вопросом и необязательным пояснением.
-fn draw_question(frame: &mut Frame, title: &str, question: &str, note: Option<&str>) {
+fn draw_question(frame: &mut Frame, title: &str, question: &str, note: Option<&str>, hits: &mut Hits) {
     let answers = Line::from(vec![
         Span::raw("y").red().bold(),
         Span::raw(" — да, любая другая клавиша — нет").fg(MUTED),
     ]);
-    draw_question_with(frame, title, question, note, answers);
+    draw_question_with(frame, title, question, note, answers, hits);
 }
 
 /// То же со своими вариантами ответа.
@@ -652,8 +827,10 @@ fn draw_question_with(
     question: &str,
     note: Option<&str>,
     answers: Line<'static>,
+    hits: &mut Hits,
 ) {
     let area = popup_area(frame.area(), 60, if note.is_some() { 6 } else { 5 });
+    hits.push((area, Hit::Block));
     let block = panel(title).border_style(Style::new().red());
     let mut text = vec![Line::from(question.to_string())];
     if let Some(note) = note {
@@ -779,6 +956,98 @@ fn popup_area(area: Rect, max_width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::book::Book;
+    use crate::input::{Mouse, MouseKind};
+    use crate::model::Task;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn render(terminal: &mut Terminal<TestBackend>, app: &mut App) -> Vec<String> {
+        terminal.draw(|f| {
+            draw(f, app);
+        }).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect()
+    }
+
+    fn tap(app: &mut App, hit: Hit) {
+        let (rect, _) = *app.hits.iter().rev().find(|(_, h)| *h == hit).unwrap_or_else(|| panic!("нет {hit:?}"));
+        app.on_mouse(Mouse { kind: MouseKind::Click, column: rect.x, row: rect.y });
+    }
+
+    fn phone_app(name: &str) -> App {
+        let dir = std::env::temp_dir().join(format!("ztaskmgr-ui-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new(Book::new(dir), Date::today());
+        for text in ["раз", "два"] {
+            app.board.push(Category::Work, Task::new(text));
+        }
+        app.lists[0].select(Some(0));
+        app
+    }
+
+    #[test]
+    fn phone_layout_and_taps() {
+        let mut app = phone_app("phone");
+        let mut terminal = Terminal::new(TestBackend::new(44, 16)).unwrap();
+        let screen = render(&mut terminal, &mut app);
+        // Узкий экран: вкладки и один список.
+        assert!(screen[1].contains("1 Работа 0/2"), "{screen:#?}");
+        assert!(screen[2].contains("1 Работа") && !screen.iter().any(|l| l.contains("╭ 2 Дом")), "{screen:#?}");
+        assert!(screen[3].contains("[ ] раз"), "{screen:#?}");
+
+        // Тап по задаче — выделить, по выделенной — записи, по подсказке «закрыть» — закрыть.
+        tap(&mut app, Hit::Task(Category::Work, 1));
+        assert_eq!(app.selected(), Some(1));
+        render(&mut terminal, &mut app);
+        tap(&mut app, Hit::Task(Category::Work, 1));
+        assert!(app.notes.is_some());
+        render(&mut terminal, &mut app);
+        // Окно записей закрывает собой список под ним.
+        let last = |f: fn(&Hit) -> bool| app.hits.iter().rposition(|(_, h)| f(h));
+        assert!(last(|h| *h == Hit::Block) > last(|h| matches!(h, Hit::Task(..))));
+        tap(&mut app, Hit::Key((KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(app.notes.is_none());
+
+        // `[ ]` — отметить; вкладка — другой список; ▶ — следующий день.
+        render(&mut terminal, &mut app);
+        tap(&mut app, Hit::Check(Category::Work, 0));
+        assert_eq!(app.board.list(Category::Work)[0].state, State::Done);
+        render(&mut terminal, &mut app);
+        tap(&mut app, Hit::List(Category::Home));
+        assert_eq!(app.active, Category::Home);
+        render(&mut terminal, &mut app);
+        let today = app.date;
+        tap(&mut app, Hit::Key((KeyCode::Char(']'), KeyModifiers::NONE)));
+        assert_eq!(app.date, today.add_days(1));
+        // Подсказка «добавить» — как нажать `a`.
+        render(&mut terminal, &mut app);
+        tap(&mut app, Hit::Key((KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert!(matches!(app.mode, Mode::Edit { .. }));
+        let _ = std::fs::remove_dir_all(app.book.dir());
+    }
+
+    #[test]
+    fn wide_layout_scroll_and_popup_block() {
+        let mut app = phone_app("wide");
+        app.board.push(Category::Home, Task::new("кран"));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let screen = render(&mut terminal, &mut app);
+        assert!(screen.iter().any(|l| l.contains("1 Работа") && l.contains("2 Дом")), "{screen:#?}");
+        // Свайп (прокрутка) над «Дом» — туда и выделение.
+        let (rect, _) = *app.hits.iter().find(|(_, h)| *h == Hit::List(Category::Home)).unwrap();
+        app.on_mouse(Mouse { kind: MouseKind::ScrollDown, column: rect.x + 3, row: rect.y + 3 });
+        assert_eq!(app.active, Category::Home);
+        // Под окном ввода список не тапается.
+        app.on_key(KeyCode::Char('a'));
+        render(&mut terminal, &mut app);
+        let (rect, _) = *app.hits.iter().rev().find(|(_, h)| *h == Hit::Block).unwrap();
+        app.on_mouse(Mouse { kind: MouseKind::Click, column: rect.x + 1, row: rect.y + 1 });
+        assert!(matches!(app.mode, Mode::Edit { .. }));
+        let _ = std::fs::remove_dir_all(app.book.dir());
+    }
 
     #[test]
     fn truncate_path() {

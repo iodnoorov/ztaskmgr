@@ -9,6 +9,7 @@ mod mcp;
 mod model;
 mod notes;
 mod storage;
+mod sync;
 mod ui;
 
 use std::path::{Path, PathBuf};
@@ -33,7 +34,9 @@ const USAGE: &str = "\
 
 Записная книжка дел: страница на каждую дату, на странице четыре списка —
 Работа, Дом, Личное, Прочее.
-КАТАЛОГ — где лежат страницы (ГГГГ-ММ-ДД.md), по умолчанию ~/.local/share/ztaskmgr.
+КАТАЛОГ — где лежат страницы (ГГГГ-ММ-ДД.md), по умолчанию $ZTASKMGR_DIR,
+иначе ~/.local/share/ztaskmgr. Синхронизация — Syncthing: копии, оставшиеся после
+правок на двух устройствах сразу, сливаются сами.
 
 mcp — MCP-сервер для ИИ-агентов (stdio): книжка как инструменты, без скрытого от ИИ.
   claude mcp add ztaskmgr -- ztaskmgr mcp";
@@ -56,23 +59,35 @@ fn main() -> Result<()> {
         return mcp::serve(&agent::Agent::new(book));
     }
     let today = Date::today();
-    // Автоперенос и страницу на сегодня — до перехода в TUI, чтобы ошибка разбора
-    // вывелась в обычный терминал.
+    // Синхронизация, автоперенос и страница на сегодня — до перехода в TUI, чтобы ошибки
+    // вывелись в обычный терминал. Копии с другого устройства сливаются до автопереноса:
+    // иначе перенос не увидит их задачи.
+    book.ensure_stignore()?;
+    let merge = book.merge_conflicts()?;
     let carried = book.carry_over(today)?;
     book.load(today)?;
     let mut app = App::new(book, today);
     if let Some((from, count)) = carried {
         app.status = Some(Status::Info(app::carried_message(from, count)));
     }
+    if !merge.failed.is_empty() {
+        app.status = Some(Status::Error(format!(
+            "Не удалось слить копии с другого устройства (исправьте вручную): {}",
+            merge.failed.join(", ")
+        )));
+    }
 
     let mut terminal = ratatui::init();
     // Вставленный текст приходит одним событием, а не потоком горячих клавиш.
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    // Мышь — это касания в Termux: тапы и свайпы.
+    input::mouse_on();
     let mut kitty = false;
     let result = run(&mut terminal, &mut app, &mut kitty);
     if kitty {
         input::kitty_off();
     }
+    input::mouse_off();
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
@@ -100,6 +115,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool) -> Resul
                 }
                 Input::Key(press) => app.on_key(press),
                 Input::Paste(text) => app.on_paste(&text),
+                Input::Mouse(mouse) => app.on_mouse(mouse),
             }
             dirty = true;
         }
@@ -148,11 +164,13 @@ fn run_editor(terminal: &mut DefaultTerminal, path: &Path, kitty: bool) -> Resul
     if kitty {
         input::kitty_off();
     }
+    input::mouse_off();
     execute!(std::io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, cursor::Show)?;
     terminal::disable_raw_mode()?;
     let status = Command::new(program).args(parts).arg(path).status();
     terminal::enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+    input::mouse_on();
     if kitty {
         input::kitty_on();
     }
@@ -190,7 +208,12 @@ fn parse_args() -> Result<Option<Run>> {
     Ok(Some(if mcp { Run::Mcp(dir) } else { Run::Tui(dir) }))
 }
 
+/// Каталог книжки по умолчанию: `$ZTASKMGR_DIR` (удобно в Termux — книжка в папке
+/// Syncthing), иначе `~/.local/share/ztaskmgr`.
 fn default_path() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("ZTASKMGR_DIR").filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
     ProjectDirs::from("", "", "ztaskmgr")
         .map(|dirs| dirs.data_dir().to_path_buf())
         .context("не удалось определить домашний каталог")

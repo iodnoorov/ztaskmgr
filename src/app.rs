@@ -1,14 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
 
 use crate::book::{Book, Stamp, DELETED_NOTES};
 use crate::clock::{self, Date};
 use crate::field::{LineInput, TextArea};
-use crate::input::Press;
+use crate::input::{Mouse, MouseKind, Press};
 use crate::keymap::{self, Action};
 use crate::model::{Board, Category, State, Task};
 use crate::notes::{Notes, Summary};
@@ -68,6 +69,9 @@ pub enum NoteTarget {
     /// Правка пункта с этим номером.
     Entry(usize),
 }
+
+/// Как часто искать конфликтные копии Syncthing, пока программа открыта.
+const MERGE_EVERY: Duration = Duration::from_secs(2);
 
 /// Как часто сохранять заметку, пока её пишут.
 pub const AUTOSAVE: Duration = Duration::from_secs(10);
@@ -171,6 +175,23 @@ impl NotesView {
     }
 }
 
+/// Что на экране под тапом (щелчком): карту попаданий строит отрисовка на каждом кадре.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hit {
+    /// Как нажать клавишу: подсказка внизу, стрелки дней в шапке.
+    Key(keymap::Key),
+    /// Список: его рамка, вкладка, пустое место.
+    List(Category),
+    Task(Category, usize),
+    /// `[ ]` у задачи — отметить.
+    Check(Category, usize),
+    /// Пункт записей (номер среди видимых) и `[ ]` у подзадачи.
+    Entry(usize),
+    EntryCheck(usize),
+    /// Всплывающее окно: тап мимо его кнопок ничего не делает, до списка под ним не доходит.
+    Block,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Status {
     /// Сообщение; пропадает при следующем нажатии.
@@ -207,6 +228,11 @@ pub struct App {
     /// Время изменения файлов страницы и скрытых списков, когда мы их читали или писали.
     page_stamp: Option<Stamp>,
     hidden_stamp: Option<Stamp>,
+    last_merge: Instant,
+    /// Копии, которые не удалось слить, — о них уже сказано.
+    merge_failed: HashSet<String>,
+    /// Карта попаданий последнего кадра; позже нарисованное — выше.
+    pub hits: Vec<(Rect, Hit)>,
     pub quit: bool,
 }
 
@@ -261,6 +287,9 @@ impl App {
             hidden: [false; 4],
             page_stamp: None,
             hidden_stamp: None,
+            last_merge: Instant::now(),
+            merge_failed: HashSet::new(),
+            hits: Vec::new(),
             quit: false,
         };
         app.load_hidden();
@@ -342,6 +371,8 @@ impl App {
     }
 
     fn save(&mut self) {
+        let book = &self.book;
+        self.board.assign_ids(|| book.new_id());
         match self.book.save(self.date, &self.board) {
             Ok(()) => {
                 if matches!(self.status, Some(Status::Error(_))) {
@@ -595,6 +626,91 @@ impl App {
             Mode::Date { .. } => self.on_key_date(press),
             Mode::ConfirmDelete => self.on_key_confirm(press),
             Mode::MoveTo => self.on_key_move_to(press),
+        }
+    }
+
+    /// Тап (щелчок) и свайп (прокрутка): что под пальцем — по карте попаданий кадра.
+    pub fn on_mouse(&mut self, mouse: Mouse) {
+        let point = Position::new(mouse.column, mouse.row);
+        let hit = self
+            .hits
+            .iter()
+            .rev()
+            .find(|(rect, _)| rect.contains(point))
+            .map(|&(_, hit)| hit);
+        if self.show_help || self.show_about {
+            // Окна, которые закрываются любой клавишей, закрываются и тапом.
+            if mouse.kind == MouseKind::Click {
+                self.on_key(KeyCode::Esc);
+            }
+            return;
+        }
+        let scroll = match mouse.kind {
+            MouseKind::Click => {
+                if let Some(hit) = hit {
+                    self.on_hit(hit);
+                }
+                return;
+            }
+            MouseKind::ScrollUp => Action::Up,
+            MouseKind::ScrollDown => Action::Down,
+        };
+        self.check_external();
+        match &self.notes {
+            Some(NotesView { mode: NotesMode::List, .. }) => self.act_notes(scroll),
+            Some(_) => {}
+            None if matches!(self.mode, Mode::Normal) => {
+                if let Some(Hit::List(c) | Hit::Task(c, _) | Hit::Check(c, _)) = hit {
+                    self.active = c;
+                }
+                self.act(scroll);
+            }
+            None => {}
+        }
+    }
+
+    fn on_hit(&mut self, hit: Hit) {
+        if let Hit::Key((code, modifiers)) = hit {
+            self.on_key(KeyEvent::new(code, modifiers));
+            return;
+        }
+        self.check_external();
+        if matches!(self.status, Some(Status::Info(_))) {
+            self.status = None;
+        }
+        if let Some(view) = &mut self.notes {
+            if !matches!(view.mode, NotesMode::List) {
+                return;
+            }
+            match hit {
+                // Тап по выделенному пункту — правка, по другому — выделить.
+                Hit::Entry(n) if view.list.selected() == Some(n) => self.act_notes(Action::Edit),
+                Hit::Entry(n) => view.list.select(Some(n)),
+                Hit::EntryCheck(n) => {
+                    view.list.select(Some(n));
+                    self.act_notes(Action::Toggle);
+                }
+                _ => {}
+            }
+            return;
+        }
+        if !matches!(self.mode, Mode::Normal) {
+            return;
+        }
+        match hit {
+            Hit::List(c) => self.active = c,
+            // Тап по выделенной задаче — её записи, по другой — выделить.
+            Hit::Task(c, i) if self.active == c && self.selected() == Some(i) => self.act(Action::Notes),
+            Hit::Task(c, i) => {
+                self.active = c;
+                self.select(c, Some(i));
+            }
+            Hit::Check(c, i) => {
+                self.active = c;
+                self.select(c, Some(i));
+                self.act(Action::Toggle);
+            }
+            _ => {}
         }
     }
 
@@ -1031,8 +1147,13 @@ impl App {
         }
     }
 
-    /// Ход часов: автосохранение заметки. Возвращает, сохранилось ли (перерисовать).
+    /// Ход часов: автосохранение заметки и слияние копий с других устройств. Возвращает,
+    /// было ли что (перерисовать).
     pub fn tick(&mut self, now: Instant) -> bool {
+        let merged = now.duration_since(self.last_merge) >= MERGE_EVERY && {
+            self.last_merge = now;
+            self.merge_conflicts()
+        };
         let due = match &self.notes {
             Some(NotesView { mode: NotesMode::Text(draft), .. }) => {
                 draft.is_changed()
@@ -1044,7 +1165,40 @@ impl App {
         if due {
             self.save_draft(false);
         }
-        due
+        due || merged
+    }
+
+    /// Сливает конфликтные копии Syncthing (сами файлы потом подхватит `check_external`).
+    /// Возвращает, было ли что сообщить.
+    pub fn merge_conflicts(&mut self) -> bool {
+        match self.book.merge_conflicts() {
+            Ok(report) => {
+                // О неслитой копии — один раз, а не каждые две секунды.
+                let failed: Vec<String> = report
+                    .failed
+                    .into_iter()
+                    .filter(|f| self.merge_failed.insert(f.clone()))
+                    .collect();
+                if !failed.is_empty() {
+                    self.status = Some(Status::Error(format!(
+                        "Не удалось слить копии с другого устройства (исправьте вручную): {}",
+                        failed.join(", ")
+                    )));
+                } else if !report.merged.is_empty() {
+                    self.status = Some(Status::Info(format!(
+                        "Слиты изменения с другого устройства: {}",
+                        report.merged.join(", ")
+                    )));
+                } else {
+                    return false;
+                }
+                true
+            }
+            Err(e) => {
+                self.status = Some(Status::Error(format!("Слияние копий: {e:#}")));
+                true
+            }
+        }
     }
 
     /// Закрывает однострочное поле окна записей и сохраняет введённое. Пустое у нового
@@ -1438,12 +1592,14 @@ mod tests {
         type_text(&mut app, "кран");
         press(&mut app, KeyCode::Enter);
 
-        // Открыли и закрыли без записей — id у задачи не появился.
+        // id у задачи с самого начала; открыли и закрыли без записей — файла записей нет.
+        let first_id = app.board.list(Category::Home)[0].id.clone().expect("id при создании");
         press(&mut app, KeyCode::Char('n'));
         assert!(app.notes.is_some());
         press(&mut app, KeyCode::Esc);
         assert!(app.notes.is_none());
-        assert_eq!(app.board.list(Category::Home)[0].id, None);
+        assert!(app.book.load_notes(&first_id).unwrap().is_empty());
+        assert!(app.summaries.is_empty());
 
         press(&mut app, KeyCode::Char('n'));
         press(&mut app, KeyCode::Char('s'));
@@ -1456,7 +1612,8 @@ mod tests {
         press(&mut app, KeyCode::Char('k'));
         press(&mut app, KeyCode::Char('x'));
 
-        let id = app.board.list(Category::Home)[0].id.clone().expect("id с первой записью");
+        let id = app.board.list(Category::Home)[0].id.clone().unwrap();
+        assert_eq!(id, first_id);
         assert_eq!(app.board.list(Category::Home)[0].state, State::Open);
         let notes = app.book.load_notes(&id).unwrap().serialize();
         let lines: Vec<&str> = notes.lines().collect();
@@ -1779,12 +1936,17 @@ mod tests {
         assert!(file.contains(" моя длиннее\n") && file.contains(" заметка агента\n"), "{file}");
         assert!(!file.contains(" моя\n"), "{file}");
 
-        // Окно записей у задачи без id, агент дал ей id и запись — окно на месте, запись видна.
+        // Задачу дописали снаружи без id (руками на телефоне); у неё открыто окно записей,
+        // а агент дал ей id и запись — окно на месте, запись видна.
         press(&mut app, KeyCode::Esc);
-        press(&mut app, KeyCode::Char('g'));
-        press(&mut app, KeyCode::Char('n'));
         let mut board = app.book.load(d(26)).unwrap();
-        board.get_mut(Category::Work, 0).unwrap().id = Some("agent1".into());
+        board.push(Category::Home, Task::new("снаружи"));
+        app.book.save(d(26), &board).unwrap();
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.board.list(Category::Home)[0].id.is_none());
+        let mut board = app.book.load(d(26)).unwrap();
+        board.get_mut(Category::Home, 0).unwrap().id = Some("agent1".into());
         app.book.save(d(26), &board).unwrap();
         let mut notes = crate::notes::Notes::default();
         notes.add_subtask("от агента");
@@ -1794,6 +1956,8 @@ mod tests {
         assert_eq!(view.id, "agent1");
         assert_eq!(view.notes.visible().len(), 1);
         press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('g'));
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('n'));
 
