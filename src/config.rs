@@ -16,6 +16,10 @@ const HEADER: &str = "# ztaskmgr: настройки этого устройст
 
 /// Ключи файла.
 const PREVIEW: &str = "preview";
+pub const WEBDAV_URL: &str = "webdav_url";
+pub const WEBDAV_USER: &str = "webdav_user";
+pub const WEBDAV_PASSWORD: &str = "webdav_password";
+pub const WEBDAV_PASSWORD_COMMAND: &str = "webdav_password_command";
 
 #[derive(Debug, Default)]
 pub struct Config {
@@ -62,12 +66,12 @@ impl Config {
         self.path.as_deref()
     }
 
-    fn get(&self, key: &str) -> Option<&str> {
+    pub fn get(&self, key: &str) -> Option<&str> {
         self.lines.iter().rev().find_map(|line| value_of(line, key))
     }
 
     /// Меняет строку ключа (последнюю, она и действует) или дописывает её, и сохраняет.
-    fn set(&mut self, key: &str, value: &str) -> Result<()> {
+    pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         let line = format!("{key} = {value}");
         match self.lines.iter().rposition(|l| value_of(l, key).is_some()) {
             Some(i) => self.lines[i] = line,
@@ -116,6 +120,18 @@ impl Config {
 
     pub fn set_preview(&mut self, on: bool) -> Result<()> {
         self.set(PREVIEW, if on { "on" } else { "off" })
+    }
+
+    /// WebDAV — если задан адрес.
+    pub fn webdav(&self) -> Option<crate::webdav::Settings> {
+        let get = |key| self.get(key).unwrap_or("").to_string();
+        let url = get(WEBDAV_URL);
+        (!url.is_empty()).then(|| crate::webdav::Settings {
+            url,
+            user: get(WEBDAV_USER),
+            password: get(WEBDAV_PASSWORD),
+            password_command: get(WEBDAV_PASSWORD_COMMAND),
+        })
     }
 }
 

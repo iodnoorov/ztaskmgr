@@ -3,6 +3,7 @@
 //! по-английски: их лучше понимают любые модели; данные книжки — как есть, по-русски.
 
 use std::io::{self, BufRead, Write};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -10,6 +11,7 @@ use serde_json::{Value, json};
 use crate::agent::{Agent, list_names, parse_date, parse_list, parse_status};
 use crate::clock::Date;
 use crate::model::ListId;
+use crate::webdav;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -246,15 +248,35 @@ pub fn handle(agent: &Agent, message: &Value) -> Option<Value> {
 }
 
 /// Цикл сервера: читает сообщения из stdin, пишет ответы в stdout до конца ввода.
-pub fn serve(agent: &Agent) -> Result<()> {
+/// С WebDAV: перед вызовом инструмента — синхронизация, если давно не было, после правки —
+/// сразу, чтобы она ушла на сервер. Ошибки синхронизации агенту не мешают — в stderr.
+pub fn serve(agent: &Agent, webdav: Option<webdav::Settings>) -> Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
+    let mut last_sync: Option<Instant> = None;
+    let sync = |last: &mut Option<Instant>| {
+        if let Some(settings) = &webdav {
+            if let Err(e) = webdav::sync(agent.book(), settings) {
+                eprintln!("ztaskmgr: WebDAV: {e:#}");
+            }
+            *last = Some(Instant::now());
+        }
+    };
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let reply = match serde_json::from_str::<Value>(&line) {
+        let message = serde_json::from_str::<Value>(&line);
+        let tool = message
+            .as_ref()
+            .ok()
+            .filter(|m| m["method"] == "tools/call")
+            .map(|m| m["params"]["name"].as_str().unwrap_or("").to_string());
+        if tool.is_some() && last_sync.is_none_or(|t| t.elapsed() > webdav::EVERY / 2) {
+            sync(&mut last_sync);
+        }
+        let reply = match message {
             Ok(message) => handle(agent, &message),
             Err(e) => Some(json!({
                 "jsonrpc": "2.0",
@@ -265,6 +287,10 @@ pub fn serve(agent: &Agent) -> Result<()> {
         if let Some(reply) = reply {
             writeln!(stdout, "{reply}")?;
             stdout.flush()?;
+        }
+        let read_only = ["list_pages", "get_pages", "search", "get_task"];
+        if tool.is_some_and(|t| !read_only.contains(&t.as_str())) {
+            sync(&mut last_sync);
         }
     }
     Ok(())

@@ -119,6 +119,11 @@ pub fn time() -> String {
 
 /// Текущие дата и время для шапки. Меняются раз в минуту — по смене этой строки главный цикл
 /// и перерисовывает экран.
+/// Текущее время `ЧЧ:ММ` — когда была последняя синхронизация.
+pub fn now_hm() -> String {
+    local_tm().map_or_else(String::new, |tm| strftime(c"%H:%M", &tm))
+}
+
 pub fn now() -> String {
     local_tm().map_or_else(String::new, |tm| strftime(CLOCK_FORMAT, &tm))
 }

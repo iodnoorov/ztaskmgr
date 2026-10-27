@@ -16,10 +16,12 @@ use crate::model::{Board, ListId, State, Task};
 use crate::notes::Notes;
 use crate::storage;
 
-/// Временные файлы атомарной записи синхронизировать не нужно.
+/// Временные файлы атомарной записи и служебные файлы WebDAV этого устройства
+/// синхронизировать не нужно.
 const STIGNORE: &str = "\
-// ztaskmgr: временные файлы атомарной записи не синхронизировать
+// ztaskmgr: временные файлы атомарной записи и служебные файлы WebDAV не синхронизировать
 *.tmp
+.webdav-*
 ";
 
 /// Имя основного файла по имени конфликтной копии: `2026-10-26.sync-conflict-….md` → `2026-10-26.md`.
@@ -120,16 +122,29 @@ pub struct Report {
 }
 
 impl Book {
-    /// Кладёт `.stignore` (или дописывает в него `*.tmp`), чтобы Syncthing не возил
-    /// временные файлы. Каталог книжки создаётся, если его ещё нет.
+    /// Кладёт `.stignore` (или дописывает в него недостающие строки), чтобы Syncthing не возил
+    /// временные и служебные файлы. Каталог книжки создаётся, если его ещё нет.
     pub fn ensure_stignore(&self) -> Result<()> {
         fs::create_dir_all(self.dir()).with_context(|| format!("создание {}", self.dir().display()))?;
         let path = self.dir().join(".stignore");
-        match fs::read_to_string(&path) {
-            Ok(text) if text.lines().any(|l| l.trim() == "*.tmp") => Ok(()),
-            Ok(text) => storage::write_atomic(&path, &format!("{}{}{STIGNORE}", text, if text.ends_with('\n') || text.is_empty() { "" } else { "\n" })),
-            Err(_) => storage::write_atomic(&path, STIGNORE),
+        let Ok(mut text) = fs::read_to_string(&path) else {
+            return storage::write_atomic(&path, STIGNORE);
+        };
+        let missing: Vec<&str> = STIGNORE
+            .lines()
+            .filter(|l| !l.starts_with("//") && !text.lines().any(|t| t.trim() == *l))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
         }
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        for line in missing {
+            text.push_str(line);
+            text.push('\n');
+        }
+        storage::write_atomic(&path, &text)
     }
 
     /// Находит конфликтные копии Syncthing в книжке и сливает их с основными файлами.
@@ -163,32 +178,38 @@ impl Book {
     /// Сливает одну копию; `false` — файл не книжки, не трогаем.
     fn merge_one(&self, copy: &Path, base: &str, notes: bool) -> Result<bool> {
         let text = fs::read_to_string(copy)?;
+        self.merge_text(base, notes, &text)
+    }
+
+    /// Сливает другую версию файла книжки (`text`) с файлом `base` в книжке или в `notes/`
+    /// и сохраняет результат. `false` — файл не книжки, не трогаем.
+    pub fn merge_text(&self, base: &str, notes: bool, text: &str) -> Result<bool> {
         let stem = base.strip_suffix(".md");
         if notes {
             let Some(id) = stem.filter(|id| storage::is_valid_id(id)) else {
                 return Ok(false);
             };
             let mut current = self.load_notes(id)?;
-            current.merge(&Notes::parse(&text));
+            current.merge(&Notes::parse(text));
             self.save_notes(id, &current)?;
             return Ok(true);
         }
         if let Some(date) = stem.and_then(Date::parse_iso) {
-            let other = storage::parse(&text, &self.lists()?)?;
+            let other = storage::parse(text, &self.lists()?)?;
             let current = self.load(date)?;
             self.save(date, &merge_boards(&current, &other))?;
             return Ok(true);
         }
         if base == LISTS_FILE {
             let mut current = self.lists()?;
-            current.merge(&Lists::parse(&text)?);
+            current.merge(&Lists::parse(text)?);
             self.save_lists(&current)?;
             return Ok(true);
         }
         if base == AI_HIDDEN {
             // Копия файла прежних версий: скрыт хоть на одном устройстве — скрыт.
             let mut current = self.lists()?;
-            for id in parse_hidden(&text, &current)? {
+            for id in parse_hidden(text, &current)? {
                 current.set_hidden(id, true)?;
             }
             self.save_lists(&current)?;
@@ -198,7 +219,7 @@ impl Book {
             let path = self.dir().join(DELETED_NOTES);
             let mut current = fs::read_to_string(&path).unwrap_or_default();
             let have = sections(&current);
-            for section in sections(&text) {
+            for section in sections(text) {
                 if !have.contains(&section) {
                     current.push_str(&section);
                 }
@@ -316,6 +337,10 @@ mod tests {
         book.ensure_stignore().unwrap();
         book.ensure_stignore().unwrap();
         assert_eq!(fs::read_to_string(dir.join(".stignore")).unwrap(), STIGNORE);
+        // В имеющийся файл дописываются только недостающие строки.
+        fs::write(dir.join(".stignore"), "*.tmp").unwrap();
+        book.ensure_stignore().unwrap();
+        assert_eq!(fs::read_to_string(dir.join(".stignore")).unwrap(), "*.tmp\n.webdav-*\n");
 
         let mut pc = Board::default();
         pc.push(ListId::WORK, task("с компьютера", "aa"));

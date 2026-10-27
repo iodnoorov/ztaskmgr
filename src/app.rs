@@ -28,8 +28,9 @@ pub enum Mode {
     MoveTo(usize),
     /// Окно списков: выделена строка `row` (`list_rows`).
     Lists { row: usize, sub: ListsMode },
-    /// Окно настроек; выделен пункт с этим номером (`Setting::ALL`).
-    Settings(usize),
+    /// Окно настроек; выделен пункт с этим номером (`Setting::ALL`), у текстового пункта
+    /// может быть открыто поле.
+    Settings { row: usize, input: Option<LineInput> },
 }
 
 /// Что делается в окне списков.
@@ -48,28 +49,82 @@ pub enum ListsMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Setting {
     Preview,
+    WebdavUrl,
+    WebdavUser,
+    WebdavPassword,
+    WebdavPasswordCommand,
+    SyncNow,
 }
 
 impl Setting {
-    pub const ALL: [Setting; 1] = [Setting::Preview];
+    pub const ALL: [Setting; 6] = [
+        Setting::Preview,
+        Setting::WebdavUrl,
+        Setting::WebdavUser,
+        Setting::WebdavPassword,
+        Setting::WebdavPasswordCommand,
+        Setting::SyncNow,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Setting::Preview => "Превью задачи справа",
+            Setting::WebdavUrl => "WebDAV: адрес",
+            Setting::WebdavUser => "WebDAV: логин",
+            Setting::WebdavPassword => "WebDAV: пароль",
+            Setting::WebdavPasswordCommand => "WebDAV: команда пароля",
+            Setting::SyncNow => "Синхронизировать сейчас",
         }
     }
 
     pub fn help(self) -> &'static str {
         match self {
             Setting::Preview => "на экране от 120 колонок · v — переключить",
+            Setting::WebdavUrl => "каталог книжки на сервере; пусто — WebDAV выключен",
+            Setting::WebdavUser => "пусто — без входа",
+            Setting::WebdavPassword => "лежит в файле настроек, доступном только вам",
+            Setting::WebdavPasswordCommand => "например «pass ztaskmgr»; если задана — вместо пароля",
+            Setting::SyncNow => "иначе — раз в минуту и через пару секунд после правки",
+        }
+    }
+
+    /// Ключ в файле настроек у текстовых пунктов.
+    pub fn key(self) -> Option<&'static str> {
+        match self {
+            Setting::WebdavUrl => Some(crate::config::WEBDAV_URL),
+            Setting::WebdavUser => Some(crate::config::WEBDAV_USER),
+            Setting::WebdavPassword => Some(crate::config::WEBDAV_PASSWORD),
+            Setting::WebdavPasswordCommand => Some(crate::config::WEBDAV_PASSWORD_COMMAND),
+            Setting::Preview | Setting::SyncNow => None,
         }
     }
 
     pub fn is_on(self, config: &Config) -> bool {
         match self {
             Setting::Preview => config.preview(),
+            _ => false,
         }
     }
+
+    /// Значение текстового пункта для показа: пароль — точками, пустое — прочерком.
+    pub fn value(self, config: &Config) -> Option<String> {
+        let value = config.get(self.key()?).unwrap_or("");
+        Some(match self {
+            _ if value.is_empty() => "—".into(),
+            Setting::WebdavPassword => "•".repeat(value.chars().count().min(12)),
+            _ => value.to_string(),
+        })
+    }
+}
+
+/// Состояние синхронизации по WebDAV — для шапки.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SyncState {
+    #[default]
+    Off,
+    /// Последняя удалась, во столько-то.
+    Ok(String),
+    Error(String),
 }
 
 /// Что показывает превью: история задачи по страницам и её записи. Собирается заново, когда
@@ -305,6 +360,14 @@ pub struct App {
     pub hits: Vec<(Rect, Hit)>,
     /// Ширина экрана в последнем кадре.
     pub width: u16,
+    /// Было что сохранить — главный цикл попросит синхронизацию (через пару секунд,
+    /// чтобы правки подряд ушли одной).
+    pub edited: bool,
+    /// Пользователь попросил синхронизацию сейчас.
+    pub sync_requested: bool,
+    /// Поменялись настройки WebDAV.
+    pub webdav_changed: bool,
+    pub sync: SyncState,
     pub quit: bool,
 }
 
@@ -368,6 +431,10 @@ impl App {
             merge_failed: HashSet::new(),
             hits: Vec::new(),
             width: 0,
+            edited: false,
+            sync_requested: false,
+            webdav_changed: false,
+            sync: SyncState::Off,
             quit: false,
         };
         app.load_registry();
@@ -459,6 +526,7 @@ impl App {
             Ok(carried) => {
                 if let Some((from, count)) = carried {
                     self.status = Some(Status::Info(carried_message(from, count)));
+                    self.edited = true;
                 }
                 // Страницы, которых коснулся перенос, перечитываются.
                 if was_today || self.date == today || carried.is_some_and(|(f, _)| f == self.date) {
@@ -472,6 +540,7 @@ impl App {
     fn save(&mut self) {
         let book = &self.book;
         self.board.assign_ids(|| book.new_id());
+        self.edited = true;
         match self.book.save(self.date, &self.board) {
             Ok(()) => {
                 if matches!(self.status, Some(Status::Error(_))) {
@@ -503,6 +572,7 @@ impl App {
             Ok(()) => {
                 self.registry = lists;
                 self.refresh_shown();
+                self.edited = true;
                 true
             }
             Err(e) => {
@@ -748,7 +818,7 @@ impl App {
             Mode::ConfirmDelete => self.on_key_confirm(press),
             Mode::MoveTo(_) => self.on_key_move_to(press),
             Mode::Lists { .. } => self.on_key_lists(press),
-            Mode::Settings(_) => self.on_key_settings(press),
+            Mode::Settings { .. } => self.on_key_settings(press),
         }
     }
 
@@ -759,7 +829,10 @@ impl App {
             .notes
             .as_ref()
             .is_some_and(|v| matches!(v.mode, NotesMode::Edit { .. } | NotesMode::Text(Draft { confirm_close: false, .. })));
-        let lists_field = matches!(self.mode, Mode::Lists { sub: ListsMode::Add(_) | ListsMode::Rename(_), .. });
+        let lists_field = matches!(
+            self.mode,
+            Mode::Lists { sub: ListsMode::Add(_) | ListsMode::Rename(_), .. } | Mode::Settings { input: Some(_), .. }
+        );
         notes_field || (self.notes.is_none() && (lists_field || matches!(self.mode, Mode::Edit { .. } | Mode::Date { .. })))
     }
 
@@ -831,9 +904,9 @@ impl App {
             }
             return;
         }
-        if let (Mode::Settings(selected), Hit::Setting(i)) = (&mut self.mode, hit) {
-            *selected = i;
-            self.toggle_setting(Setting::ALL[i]);
+        if let (Mode::Settings { row, input: None }, Hit::Setting(i)) = (&mut self.mode, hit) {
+            *row = i;
+            self.on_key_settings(Press::from(KeyCode::Enter));
             return;
         }
         // Тап по варианту в окне выбора: перенести туда задачу, выделить строку списков,
@@ -986,7 +1059,7 @@ impl App {
             Action::Notes => self.open_notes(),
             Action::TogglePrivate => self.toggle_private(),
             Action::ToggleHidden => self.toggle_hidden(),
-            Action::Settings => self.mode = Mode::Settings(0),
+            Action::Settings => self.mode = Mode::Settings { row: 0, input: None },
             Action::Preview => self.toggle_preview(),
             Action::PreviewDown => self.preview_scroll = self.preview_scroll.saturating_add(1),
             Action::PreviewUp => self.preview_scroll = self.preview_scroll.saturating_sub(1),
@@ -1072,17 +1145,43 @@ impl App {
     }
 
     fn on_key_settings(&mut self, press: Press) {
-        let Mode::Settings(selected) = &mut self.mode else {
+        let Mode::Settings { row, input } = &mut self.mode else {
             return;
         };
+        let setting = Setting::ALL[*row];
+        if let Some(field) = input {
+            let Some(code) = edit_line(field, &press) else {
+                return;
+            };
+            let value = field.text().trim().to_string();
+            *input = None;
+            if let (KeyCode::Enter, Some(key)) = (code, setting.key()) {
+                match self.config.set(key, &value) {
+                    // Главный цикл передаст новые настройки синхронизации.
+                    Ok(()) => self.webdav_changed = true,
+                    Err(e) => self.status = Some(Status::Error(format!("Настройки не сохранены: {e:#}"))),
+                }
+            }
+            return;
+        }
         let last = Setting::ALL.len() - 1;
         match press.hotkey.code {
-            KeyCode::Char('j') | KeyCode::Down => *selected = (*selected + 1).min(last),
-            KeyCode::Char('k') | KeyCode::Up => *selected = selected.saturating_sub(1),
-            KeyCode::Char(' ' | 'x') | KeyCode::Enter => {
-                let setting = Setting::ALL[*selected];
-                self.toggle_setting(setting);
-            }
+            KeyCode::Char('j') | KeyCode::Down => *row = (*row + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => *row = row.saturating_sub(1),
+            KeyCode::Char(' ' | 'x') | KeyCode::Enter => match setting {
+                Setting::Preview => self.toggle_setting(setting),
+                Setting::SyncNow if self.config.webdav().is_none() => {
+                    self.status = Some(Status::Info("Сначала укажите адрес WebDAV".into()));
+                }
+                Setting::SyncNow => {
+                    self.sync_requested = true;
+                    self.status = Some(Status::Info("WebDAV: синхронизация…".into()));
+                }
+                _ => {
+                    let current = setting.key().and_then(|k| self.config.get(k)).unwrap_or("");
+                    *input = Some(LineInput::new(current.to_string()));
+                }
+            },
             KeyCode::Esc | KeyCode::Char('q' | 'S') => self.mode = Mode::Normal,
             _ => {}
         }
@@ -1092,9 +1191,33 @@ impl App {
         let on = !setting.is_on(&self.config);
         let saved = match setting {
             Setting::Preview => self.config.set_preview(on),
+            _ => Ok(()),
         };
         if let Err(e) = saved {
             self.status = Some(Status::Error(format!("Настройки не сохранены: {e:#}")));
+        }
+    }
+
+    /// Чем кончилась синхронизация в фоне. Ошибка — в строку состояния, но одна и та же —
+    /// один раз, а не каждую минуту.
+    pub fn on_sync(&mut self, outcome: crate::webdav::Outcome) {
+        match outcome {
+            Ok(_) => {
+                if matches!(self.sync, SyncState::Error(_)) {
+                    self.status = Some(Status::Info("WebDAV: снова на связи".into()));
+                } else if matches!(&self.status, Some(Status::Info(s)) if s.starts_with("WebDAV")) {
+                    self.status = Some(Status::Info("WebDAV: синхронизировано".into()));
+                }
+                self.sync = SyncState::Ok(clock::now_hm());
+                // Пришедшее с сервера — на экран.
+                self.check_external();
+            }
+            Err(e) => {
+                if self.sync != SyncState::Error(e.clone()) {
+                    self.status = Some(Status::Error(format!("WebDAV: {e}")));
+                }
+                self.sync = SyncState::Error(e);
+            }
         }
     }
 
@@ -1412,6 +1535,7 @@ impl App {
         {
             Ok(true) => {
                 self.page_stamp = self.book.page_stamp(self.date);
+                self.edited = true;
                 let when = to.format(c"%-d %B %Y");
                 self.status = Some(Status::Info(format!("Перенесено на {when}")));
             }
@@ -1819,6 +1943,7 @@ impl App {
         };
         let (id, category, index) = (view.id.clone(), view.category, view.index);
         let summary = view.notes.summary();
+        self.edited = true;
         if let Err(e) = self.book.save_notes(&id, &view.notes) {
             self.status = Some(Status::Error(format!("Записи задачи: {e:#}")));
             return;
@@ -1843,6 +1968,7 @@ impl App {
 
     /// Редактор закрылся (`error` — если не запустился): перечитать записи.
     pub fn after_editor(&mut self, error: Option<String>) {
+        self.edited = true;
         if let Some(e) = error {
             self.status = Some(Status::Error(e));
         }
@@ -2486,6 +2612,56 @@ mod tests {
         assert_eq!(at(&app), 5);
         press(&mut app, KeyCode::Tab);
         assert_eq!(at(&app), 0);
+        cleanup(app);
+    }
+
+    #[test]
+    fn webdav_settings() {
+        let mut app = test_app("webdav");
+        press(&mut app, KeyCode::Char('S'));
+        // «Синхронизировать сейчас» без адреса — подсказка.
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.sync_requested && app.status.is_some());
+        // Адрес: Enter открывает поле, Enter сохраняет.
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Char('k'));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.wants_text());
+        type_text(&mut app, " https://dav.example/книжка ");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.webdav_changed);
+        assert_eq!(app.config.webdav().unwrap().url, "https://dav.example/книжка");
+        // Пароль показывается точками; Esc в поле — без изменений.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "секрет");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(Setting::WebdavPassword.value(&app.config).unwrap(), "••••••");
+        press(&mut app, KeyCode::Enter);
+        type_text(&mut app, "другой");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.config.webdav().unwrap().password, "секрет");
+        // Теперь «сейчас» — просьба главному циклу.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.sync_requested);
+
+        // Итог синхронизации: ошибка — один раз, успех после ошибки — сообщение.
+        app.status = None;
+        app.on_sync(Err("нет сети".into()));
+        assert_eq!(app.status, Some(Status::Error("WebDAV: нет сети".into())));
+        app.status = None;
+        app.on_sync(Err("нет сети".into()));
+        assert_eq!(app.status, None);
+        app.on_sync(Ok(crate::webdav::Summary::default()));
+        assert!(matches!(app.sync, SyncState::Ok(_)));
+        assert_eq!(app.status, Some(Status::Info("WebDAV: снова на связи".into())));
         cleanup(app);
     }
 

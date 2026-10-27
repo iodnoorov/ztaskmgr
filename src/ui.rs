@@ -14,7 +14,7 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, AUTOSAVE, DatePurpose, Draft, Hit, ListsMode, Mode, NoteTarget, NotesMode, NotesView, Setting, Status};
+use crate::app::{App, AUTOSAVE, DatePurpose, Draft, Hit, ListsMode, Mode, NoteTarget, NotesMode, NotesView, Setting, Status, SyncState};
 use crate::lists::MAX_LISTS;
 use crate::clock::{self, Date};
 use crate::field::LineInput;
@@ -137,7 +137,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Vec<Link> {
         Mode::Edit { .. } => draw_edit(frame, app, &mut hits),
         Mode::Date { .. } => draw_date(frame, app, &mut hits),
         Mode::ConfirmDelete => draw_confirm(frame, app, &mut hits),
-        &Mode::Settings(selected) => draw_settings(frame, app, selected, &mut hits),
+        Mode::Settings { row, input } => draw_settings(frame, app, *row, input.as_ref(), &mut hits),
         &Mode::MoveTo(selected) => {
             let items: Vec<String> = app.move_targets().iter().map(|&c| app.list_title(c).to_string()).collect();
             draw_pick(frame, "Перенести в список", &items, selected, &mut hits);
@@ -223,7 +223,14 @@ fn short_date(date: Date, page: Date) -> String {
 /// справа. Стрелки листают дни, тап по дате — сегодня. На узком экране — только дата и время.
 fn draw_header(frame: &mut Frame, app: &App, area: Rect, narrow: bool, hits: &mut Hits) {
     let now = if narrow { clock::hm() } else { clock::now() };
-    let right = Line::from(format!("{now} ").fg(SUB));
+    // Синхронизация WebDAV: когда была последняя удачная или что она не удалась.
+    let sync = match &app.sync {
+        SyncState::Off => Span::raw(""),
+        SyncState::Ok(_) if narrow => Span::raw("⇅ ").fg(MUTED),
+        SyncState::Ok(time) => Span::raw(format!("⇅ {time}  ")).fg(MUTED),
+        SyncState::Error(_) => Span::raw("⇅ ✗  ").fg(Color::Red),
+    };
+    let right = Line::from(vec![sync, format!("{now} ").fg(SUB)]);
     let relative = match app.today.days_until(app.date) {
         0 => " · сегодня",
         -1 => " · вчера",
@@ -514,8 +521,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
             DatePurpose::Postpone(_) => enter_esc("перенести", "отмена"),
         },
         Mode::ConfirmDelete => yes_other("удалить", "отмена"),
-        Mode::Settings(_) => vec![
-            Hint::new("␣", "переключить", KeyCode::Char(' ')),
+        Mode::Settings { input: Some(_), .. } => enter_esc("сохранить", "отмена"),
+        Mode::Settings { .. } => vec![
+            Hint::new("Enter", "изменить", KeyCode::Enter),
             Hint::new("j/k", "выбор", KeyCode::Down),
             Hint::new("Esc", "закрыть", KeyCode::Esc),
         ],
@@ -891,9 +899,9 @@ fn draw_lists(frame: &mut Frame, app: &App, hits: &mut Hits) {
 }
 
 /// Окно настроек этого устройства: переключатели, пробел или тап — переключить.
-fn draw_settings(frame: &mut Frame, app: &App, selected: usize, hits: &mut Hits) {
+fn draw_settings(frame: &mut Frame, app: &App, selected: usize, input: Option<&LineInput>, hits: &mut Hits) {
     let rows = Setting::ALL.len() as u16 * 2;
-    let r = popup_area(frame.area(), 60, rows + 4);
+    let r = popup_area(frame.area(), 72, rows + 4);
     hits.push((r, Hit::Block));
     let mut block = panel("Настройки").padding(Padding::uniform(1));
     if let Some(path) = app.config.path() {
@@ -902,8 +910,23 @@ fn draw_settings(frame: &mut Frame, app: &App, selected: usize, hits: &mut Hits)
     let inner = block.inner(r);
     let mut lines = Vec::new();
     for (i, setting) in Setting::ALL.into_iter().enumerate() {
-        let mark = if setting.is_on(&app.config) { "[x] " } else { "[ ] " };
-        let mut line = Line::from(vec![Span::raw(mark), Span::raw(setting.title())]);
+        // Переключатель — [x]; текстовый пункт — значение после названия; действие — ›.
+        let mut line = match (setting, setting.value(&app.config)) {
+            (_, Some(value)) => {
+                let room = usize::from(inner.width).saturating_sub(setting.title().width() + 6);
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::raw(setting.title()),
+                    Span::raw(": "),
+                    Span::raw(truncate_start(&value, room)).fg(SUB),
+                ])
+            }
+            (Setting::SyncNow, None) => Line::from(vec![Span::raw(" ›  "), Span::raw(setting.title())]),
+            (_, None) => {
+                let mark = if setting.is_on(&app.config) { "[x] " } else { "[ ] " };
+                Line::from(vec![Span::raw(mark), Span::raw(setting.title())])
+            }
+        };
         if i == selected {
             line = line.reversed();
         }
@@ -916,6 +939,9 @@ fn draw_settings(frame: &mut Frame, app: &App, selected: usize, hits: &mut Hits)
     }
     frame.render_widget(Clear, r);
     frame.render_widget(Paragraph::new(lines).block(block), r);
+    if let Some(input) = input {
+        draw_field(frame, panel(Setting::ALL[selected].title()), input, hits);
+    }
 }
 
 /// Многострочное поле: высота по тексту (от 3 до 12 строк), прокрутка за курсором.

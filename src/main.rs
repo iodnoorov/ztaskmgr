@@ -13,6 +13,7 @@ mod notes;
 mod storage;
 mod sync;
 mod ui;
+mod webdav;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,12 +35,16 @@ use crate::input::Input;
 const USAGE: &str = "\
 Использование: ztaskmgr [КАТАЛОГ]
               ztaskmgr mcp [КАТАЛОГ]
+              ztaskmgr sync [КАТАЛОГ]
 
 Записная книжка дел: страница на каждую дату, на странице списки дел — сначала
 Работа, Дом, Личное, Прочее, их можно менять и добавлять свои (L).
 КАТАЛОГ — где лежат страницы (ГГГГ-ММ-ДД.md), по умолчанию $ZTASKMGR_DIR,
-иначе ~/.local/share/ztaskmgr. Синхронизация — Syncthing: копии, оставшиеся после
-правок на двух устройствах сразу, сливаются сами.
+иначе ~/.local/share/ztaskmgr. Синхронизация — Syncthing (копии, оставшиеся после
+правок на двух устройствах сразу, сливаются сами) или свой WebDAV-сервер: адрес и вход —
+в настройках (S), ~/.config/ztaskmgr/config.
+
+sync — синхронизировать с WebDAV-сервером и выйти (например, из cron).
 
 mcp — MCP-сервер для ИИ-агентов (stdio): книжка как инструменты, без скрытого от ИИ.
   claude mcp add ztaskmgr -- ztaskmgr mcp";
@@ -53,13 +58,19 @@ fn main() -> Result<()> {
         println!("{USAGE}");
         return Ok(());
     };
-    let (Run::Tui(dir) | Run::Mcp(dir)) = &run_as;
+    let (Run::Tui(dir) | Run::Mcp(dir) | Run::Sync(dir)) = &run_as;
     if dir.is_file() {
         bail!("{} — файл, а нужен каталог книжки\n\n{USAGE}", dir.display());
     }
     let book = Book::new(dir.clone());
-    if let Run::Mcp(_) = run_as {
-        return mcp::serve(&agent::Agent::new(book));
+    let config = match Config::default_path() {
+        Some(path) => Config::load(path)?,
+        None => Config::default(),
+    };
+    match run_as {
+        Run::Mcp(_) => return mcp::serve(&agent::Agent::new(book), config.webdav()),
+        Run::Sync(_) => return sync_once(&book, &config),
+        Run::Tui(_) => {}
     }
     let today = Date::today();
     // Синхронизация, автоперенос и страница на сегодня — до перехода в TUI, чтобы ошибки
@@ -69,10 +80,7 @@ fn main() -> Result<()> {
     let merge = book.merge_conflicts()?;
     let carried = book.carry_over(today)?;
     book.load(today)?;
-    let config = match Config::default_path() {
-        Some(path) => Config::load(path)?,
-        None => Config::default(),
-    };
+    let worker = webdav::Worker::start(dir, config.webdav());
     let mut app = App::new(book, config, today);
     if let Some((from, count)) = carried {
         app.status = Some(Status::Info(app::carried_message(from, count)));
@@ -88,17 +96,44 @@ fn main() -> Result<()> {
     // Вставленный текст приходит одним событием, а не потоком горячих клавиш.
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let mut kitty = false;
-    let result = run(&mut terminal, &mut app, &mut kitty);
+    let result = run(&mut terminal, &mut app, &mut kitty, &worker);
     if kitty {
         input::kitty_off();
     }
     input::mouse_off();
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
+    // Последние правки — на сервер, но не дольше нескольких секунд, если сети нет.
+    if app.config.webdav().is_some() {
+        println!("WebDAV: синхронизация перед выходом…");
+    }
+    worker.stop(Duration::from_secs(10));
     result
 }
 
-fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool) -> Result<()> {
+/// `ztaskmgr sync`: одна синхронизация с WebDAV и итог в терминал.
+fn sync_once(book: &Book, config: &Config) -> Result<()> {
+    let settings = config.webdav().context("WebDAV не настроен: адрес — в настройках (S) или webdav_url в ~/.config/ztaskmgr/config")?;
+    book.ensure_stignore()?;
+    book.merge_conflicts()?;
+    match webdav::sync(book, &settings)? {
+        Some(s) => println!(
+            "Отправлено: {}, получено: {}, слито: {}, удалено: {}{}",
+            s.uploaded,
+            s.downloaded,
+            s.merged,
+            s.deleted,
+            if s.postponed > 0 { format!(", отложено до следующего раза: {}", s.postponed) } else { String::new() }
+        ),
+        None => println!("Сейчас синхронизирует другой процесс ztaskmgr"),
+    }
+    Ok(())
+}
+
+/// Через сколько после правки синхронизироваться: правки подряд уходят одной.
+const SYNC_DELAY: Duration = Duration::from_secs(3);
+
+fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool, worker: &webdav::Worker) -> Result<()> {
     // Клавиши читаем сами, а не через crossterm: он теряет физическую клавишу (см. `input`).
     let mut reader = input::Reader::new();
     let mut size = terminal::size()?;
@@ -107,6 +142,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool) -> Resul
     // Мышь — это касания в Termux: тапы и свайпы. Пока открыто поле ввода, она выключена,
     // чтобы тап вызывал клавиатуру (см. `App::wants_text`).
     let mut mouse = false;
+    let mut edited_at: Option<Instant> = None;
     while !app.quit {
         if mouse == app.wants_text() {
             mouse = !mouse;
@@ -140,6 +176,24 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool) -> Resul
         }
         // Правки снаружи: агент через MCP, синхронизация, редактор.
         if app.check_external() {
+            dirty = true;
+        }
+        // WebDAV: правки — на сервер через пару секунд, новые настройки и «сейчас» — сразу.
+        if std::mem::take(&mut app.edited) {
+            edited_at = Some(Instant::now());
+        }
+        if edited_at.is_some_and(|t| t.elapsed() >= SYNC_DELAY) {
+            edited_at = None;
+            worker.now();
+        }
+        if std::mem::take(&mut app.webdav_changed) {
+            worker.configure(app.config.webdav());
+        }
+        if std::mem::take(&mut app.sync_requested) {
+            worker.now();
+        }
+        for outcome in worker.outcomes() {
+            app.on_sync(outcome);
             dirty = true;
         }
         if let Some(path) = app.editor_request.take() {
@@ -205,6 +259,8 @@ enum Run {
     Tui(PathBuf),
     /// MCP-сервер для ИИ-агентов.
     Mcp(PathBuf),
+    /// Одна синхронизация с WebDAV.
+    Sync(PathBuf),
 }
 
 fn parse_args() -> Result<Option<Run>> {
@@ -212,8 +268,8 @@ fn parse_args() -> Result<Option<Run>> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         return Ok(None);
     }
-    let mcp = args.first().is_some_and(|a| a == "mcp");
-    if mcp {
+    let command = args.first().and_then(|a| a.to_str()).filter(|a| ["mcp", "sync"].contains(a)).map(str::to_string);
+    if command.is_some() {
         args.remove(0);
     }
     let dir = match &args[..] {
@@ -221,7 +277,11 @@ fn parse_args() -> Result<Option<Run>> {
         [dir] => PathBuf::from(dir),
         _ => bail!("слишком много аргументов\n\n{USAGE}"),
     };
-    Ok(Some(if mcp { Run::Mcp(dir) } else { Run::Tui(dir) }))
+    Ok(Some(match command.as_deref() {
+        Some("mcp") => Run::Mcp(dir),
+        Some("sync") => Run::Sync(dir),
+        _ => Run::Tui(dir),
+    }))
 }
 
 /// Каталог книжки по умолчанию: `$ZTASKMGR_DIR` (удобно в Termux — книжка в папке
