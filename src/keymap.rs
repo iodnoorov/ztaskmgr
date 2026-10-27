@@ -19,6 +19,8 @@ pub enum Action {
     Add,
     Edit,
     Toggle,
+    /// Отменена / снова открыта.
+    Cancel,
     MoveUp,
     MoveDown,
     /// Перенос в другой список: дальше ждём цифру.
@@ -134,6 +136,7 @@ pub const ROWS: &[Row] = &[
         "выполнено / не выполнено",
         &[(c(' '), A::Toggle), (c('x'), A::Toggle)],
     ),
+    row(Section::Tasks, "отменить / вернуть", &[(c('c'), A::Cancel)]),
     labeled(
         Section::Tasks,
         "Shift+↑ ↓",

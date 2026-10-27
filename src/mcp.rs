@@ -7,7 +7,7 @@ use std::io::{self, BufRead, Write};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use crate::agent::{Agent, parse_date, parse_list};
+use crate::agent::{Agent, parse_date, parse_list, parse_status};
 use crate::clock::Date;
 use crate::model::Category;
 
@@ -19,7 +19,8 @@ lists: Работа (work), Дом (home), Личное (personal), Прочее
 its list is its priority. Unfinished tasks move to the next day automatically; on the old page \
 they stay marked [>] with the date they moved to. A task can have notes: dated notes (possibly \
 multi-line) and subtasks. A task is done only when the user (or you, if asked) marks it — \
-subtasks do not complete it.\n\
+subtasks do not complete it. A cancelled task [-] is one the user decided not to do; it does \
+not move to the next day.\n\
 Tasks are referenced by `ref` from the tool output: a short id, or DATE/LIST/N for tasks that \
 have none yet. Prefer ids. Deleted notes are kept in the archive, so nothing is lost.\n\
 Some lists and tasks are hidden from you by the user's choice: do not ask about them or try to \
@@ -66,11 +67,11 @@ fn tools() -> Value {
         },
         {
             "name": "update_task",
-            "description": "Change a task: text, done/open, move to another list, or position in its list (1 = top priority).",
+            "description": "Change a task: text, status (open, done, or cancelled — not needed anymore), move to another list, or position in its list (1 = top priority).",
             "inputSchema": {"type": "object", "properties": {
                 "task": task,
                 "text": {"type": "string"},
-                "done": {"type": "boolean"},
+                "status": {"type": "string", "enum": ["open", "done", "cancelled"]},
                 "list": list,
                 "position": {"type": "integer", "minimum": 1}
             }, "required": ["task"]}
@@ -170,7 +171,7 @@ fn call(agent: &Agent, name: &str, args: &Value) -> Result<String> {
         "update_task" => agent.update_task(
             required(args, "task")?,
             str_arg(args, "text"),
-            args.get("done").and_then(Value::as_bool),
+            str_arg(args, "status").map(parse_status).transpose()?,
             str_arg(args, "list").map(parse_list).transpose()?,
             number_arg(args, "position")?,
         ),

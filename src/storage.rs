@@ -85,6 +85,7 @@ fn parse_task(line: &str) -> Option<Task> {
     let (state, text) = match mark {
         " " => (State::Open, text),
         "x" | "X" => (State::Done, text),
+        "-" => (State::Cancelled, text),
         ">" => {
             let (text, date) = text.rsplit_once(MIGRATED_SEP)?;
             (State::Migrated(Date::parse_iso(date)?), text)
@@ -115,6 +116,7 @@ pub fn serialize(board: &Board) -> String {
             out.push_str(match task.state {
                 State::Open => "- [ ] ",
                 State::Done => "- [x] ",
+                State::Cancelled => "- [-] ",
                 State::Migrated(_) => "- [>] ",
             });
             out.push_str(&task.text);
@@ -183,6 +185,7 @@ mod tests {
 - [ ] Просто скрытая <!-- private -->
 
 ## Личное
+- [-] Передумал <!-- id:c3 -->
 
 ## Прочее
 - [X] Что-то ещё
@@ -206,7 +209,7 @@ mod tests {
         assert_eq!(home[2].id.as_deref(), Some("q1"));
         assert_eq!(home[0].id, None);
         assert_eq!(home[1].state, State::Migrated(Date::new(2026, 10, 27).unwrap()));
-        assert!(board.list(Category::Personal).is_empty());
+        assert_eq!(board.list(Category::Personal)[0].state, State::Cancelled);
         assert_eq!(board.list(Category::Other)[0].state, State::Done);
     }
 

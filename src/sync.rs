@@ -28,12 +28,14 @@ pub fn conflict_base(name: &str) -> Option<String> {
     Some(format!("{base}.{ext}"))
 }
 
-/// Насколько задача «продвинулась»: при слиянии побеждает дальнейшее.
+/// Насколько задача «продвинулась»: при слиянии побеждает дальнейшее. Отменённая сильнее
+/// выполненной (решение пользователя).
 fn rank(state: State) -> u8 {
     match state {
         State::Open => 0,
         State::Migrated(_) => 1,
         State::Done => 2,
+        State::Cancelled => 3,
     }
 }
 
@@ -212,6 +214,7 @@ mod tests {
         board.list(c).iter().map(|t| format!("{}{}", t.text, match t.state {
             State::Open => "",
             State::Done => " ✓",
+            State::Cancelled => " ✗",
             State::Migrated(_) => " >",
         })).collect()
     }
@@ -258,6 +261,20 @@ mod tests {
         let mut two = Board::default();
         two.push(Category::Other, task("руками", "y2"));
         assert_eq!(texts(&merge_boards(&one, &two), Category::Other), ["руками"]);
+    }
+
+    #[test]
+    fn cancelled_wins() {
+        // Выполнили на одном устройстве, отменили на другом — отменена, в любом порядке.
+        let mut done = Board::default();
+        let mut t = task("a", "1");
+        t.state = State::Done;
+        done.push(Category::Work, t.clone());
+        let mut cancelled = Board::default();
+        t.state = State::Cancelled;
+        cancelled.push(Category::Work, t);
+        assert_eq!(texts(&merge_boards(&done, &cancelled), Category::Work), ["a ✗"]);
+        assert_eq!(texts(&merge_boards(&cancelled, &done), Category::Work), ["a ✗"]);
     }
 
     #[test]

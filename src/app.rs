@@ -756,6 +756,7 @@ impl App {
             Action::Add
                 | Action::Edit
                 | Action::Toggle
+                | Action::Cancel
                 | Action::MoveUp
                 | Action::MoveDown
                 | Action::MoveTo
@@ -810,6 +811,7 @@ impl App {
                 }
             }
             Action::Toggle => self.toggle_done(),
+            Action::Cancel => self.toggle_cancelled(),
             Action::MoveUp => self.move_task(Board::move_up),
             Action::MoveDown => self.move_task(Board::move_down),
             Action::Postpone => self.start_postpone(),
@@ -983,21 +985,42 @@ impl App {
         let Some(task) = self.board.list(self.active).get(index) else {
             return;
         };
-        let done = match task.state {
-            State::Open => true,
-            State::Done => false,
-            State::Migrated(to) => {
-                let when = to.format(c"%-d %B");
-                self.status = Some(Status::Info(format!(
-                    "Задача перенесена на {when} — отметьте её там"
-                )));
-                return;
-            }
+        // Отменённую всё-таки сделали — выполнена.
+        let state = match task.state {
+            State::Open | State::Cancelled => State::Done,
+            State::Done => State::Open,
+            State::Migrated(to) => return self.migrated_notice(to),
         };
-        // Выполненная уезжает вниз, а выделение остаётся на месте — на следующей задаче:
-        // так удобно отмечать подряд. Снятая отметка — выделение едет за задачей.
-        let moved = self.board.set_done(self.active, index, done);
-        if !done {
+        self.set_state(index, state);
+    }
+
+    fn toggle_cancelled(&mut self) {
+        let Some(index) = self.selected() else {
+            return;
+        };
+        let Some(task) = self.board.list(self.active).get(index) else {
+            return;
+        };
+        let state = match task.state {
+            State::Open | State::Done => State::Cancelled,
+            State::Cancelled => State::Open,
+            State::Migrated(to) => return self.migrated_notice(to),
+        };
+        self.set_state(index, state);
+    }
+
+    fn migrated_notice(&mut self, to: Date) {
+        let when = to.format(c"%-d %B");
+        self.status = Some(Status::Info(format!(
+            "Задача перенесена на {when} — отметьте её там"
+        )));
+    }
+
+    /// Закрытая задача уезжает вниз, а выделение остаётся на месте — на следующей задаче:
+    /// так удобно отмечать подряд. Снятая отметка — выделение едет за задачей.
+    fn set_state(&mut self, index: usize, state: State) {
+        let moved = self.board.set_state(self.active, index, state);
+        if state == State::Open {
             self.select(self.active, moved);
         }
         self.save();
@@ -1479,6 +1502,37 @@ mod tests {
     }
 
     #[test]
+    fn cancel() {
+        let mut app = test_app("cancel");
+        for text in ["раз", "два"] {
+            press(&mut app, KeyCode::Char('a'));
+            type_text(&mut app, text);
+            press(&mut app, KeyCode::Enter);
+        }
+        press(&mut app, KeyCode::Char('g'));
+        // Отменённая — вниз, выделение на следующей.
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(texts(&app, Category::Work), ["два", "раз"]);
+        assert_eq!(app.board.list(Category::Work)[1].state, State::Cancelled);
+        assert_eq!(app.selected(), Some(0));
+        assert_eq!(app.book.load(d(26)).unwrap(), app.board);
+        // Повторно — снова открыта, выделение за ней; «с» в русской раскладке — та же клавиша.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('с'));
+        assert!(app.board.list(Category::Work)[1].is_open());
+        assert_eq!(app.selected(), Some(1));
+        // Отменённую всё-таки сделали.
+        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.board.list(Category::Work)[1].state, State::Done);
+        // Отменённая не переносится.
+        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Char('>'));
+        assert!(matches!(app.mode, Mode::Normal));
+        cleanup(app);
+    }
+
+    #[test]
     fn russian_layout() {
         let mut app = test_app("ru");
         // «ф» — физическая a: новая задача; в поле ввода — сама «ф».
@@ -1644,7 +1698,9 @@ mod tests {
         let notes = app.book.load_notes(&id).unwrap().serialize();
         let lines: Vec<&str> = notes.lines().collect();
         assert_eq!(lines[0], "- [x] купить прокладку");
-        assert!(lines[1].starts_with("- 26.10.") && lines[1].ends_with(" мастер сказал"), "{notes}");
+        // Метка заметки — по настоящим часам, а не по открытой странице.
+        let stamp = format!("- {}", Date::today().format(c"%d.%m.%Y"));
+        assert!(lines[1].starts_with(&stamp) && lines[1].ends_with(" мастер сказал"), "{notes}");
         assert_eq!(app.summaries[&id].subtasks_done, 1);
         // id сохранён на странице.
         assert_eq!(app.book.load(d(26)).unwrap(), app.board);

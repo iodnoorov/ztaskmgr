@@ -56,10 +56,10 @@ fn key_hit(rows: &[Row], action: A) -> Option<Hit> {
     keymap::first_key(rows, action).map(Hit::Key)
 }
 
-/// Перенесённые — уже не дела этой страницы, в счётчике их нет.
+/// Перенесённые — уже не дела этой страницы, отменённые — вовсе не дела, в счётчике их нет.
 fn counts(tasks: &[Task]) -> (usize, usize) {
     let done = tasks.iter().filter(|t| t.state == State::Done).count();
-    let total = tasks.iter().filter(|t| !matches!(t.state, State::Migrated(_))).count();
+    let total = tasks.iter().filter(|t| matches!(t.state, State::Open | State::Done)).count();
     (done, total)
 }
 
@@ -287,6 +287,11 @@ fn draw_list(frame: &mut Frame, app: &mut App, category: Category, area: Rect, h
                 State::Done => Line::from(vec![
                     Span::raw("[x] ").fg(MUTED),
                     Span::raw(task.text.as_str()).fg(MUTED).crossed_out(),
+                ]),
+                State::Cancelled => Line::from(vec![
+                    Span::raw("[-] ").fg(MUTED),
+                    Span::raw(task.text.as_str()).fg(MUTED).crossed_out().italic(),
+                    Span::raw(" ✗").fg(MUTED),
                 ]),
                 State::Migrated(to) => Line::from(vec![
                     Span::raw("[>] ").fg(MUTED),

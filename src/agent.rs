@@ -43,6 +43,16 @@ pub fn parse_list(name: &str) -> Result<Category> {
         .with_context(|| format!("unknown list «{name}»: use Работа/work, Дом/home, Личное/personal, Прочее/other"))
 }
 
+/// Состояние задачи для `update_task`: перенести так нельзя — для этого `postpone_task`.
+pub fn parse_status(name: &str) -> Result<State> {
+    match name.trim().to_lowercase().as_str() {
+        "open" => Ok(State::Open),
+        "done" => Ok(State::Done),
+        "cancelled" | "canceled" => Ok(State::Cancelled),
+        other => bail!("unknown status «{other}»: use open, done or cancelled"),
+    }
+}
+
 /// Дата: `today` / `tomorrow` / `yesterday` (и по-русски), `2026-10-27`, `27.10.2026`, `27.10`,
 /// `+1` / `-3` — от сегодня.
 pub fn parse_date(text: &str, today: Date) -> Result<Date> {
@@ -61,6 +71,7 @@ fn state_mark(state: State) -> String {
     match state {
         State::Open => "[ ]".into(),
         State::Done => "[x]".into(),
+        State::Cancelled => "[-] (cancelled)".into(),
         State::Migrated(to) => format!("[>] (moved to {to})"),
     }
 }
@@ -172,7 +183,7 @@ impl Agent {
                     match board.list(category)[i].state {
                         State::Open => open += 1,
                         State::Done => done += 1,
-                        State::Migrated(_) => {}
+                        State::Cancelled | State::Migrated(_) => {}
                     }
                 }
             }
@@ -383,7 +394,7 @@ impl Agent {
         &self,
         reference: &str,
         text: Option<&str>,
-        done: Option<bool>,
+        status: Option<State>,
         list: Option<Category>,
         position: Option<usize>,
     ) -> Result<String> {
@@ -396,12 +407,12 @@ impl Agent {
             }
             found.task_mut().text = text.to_string();
         }
-        if let Some(done) = done {
+        if let Some(status) = status {
             if let State::Migrated(to) = found.task().state {
                 bail!("task was moved to {to}; change it there");
             }
-            // Как в программе: выполненная — в конец списка, снятая — в конец открытых.
-            found.index = found.board.set_done(found.category, found.index, done).unwrap();
+            // Как в программе: закрытая — в конец списка, снятая отметка — в конец открытых.
+            found.index = found.board.set_state(found.category, found.index, status).unwrap();
         }
         if let Some(to) = list
             && to != found.category
@@ -619,7 +630,9 @@ mod tests {
         let task = agent.get_task(&id).unwrap();
         assert!(task.contains("Page: 2026-10-27 · State: [ ]"), "{task}");
         assert!(task.contains("2026-10-26 Работа [>] (moved to 2026-10-27)"), "{task}");
-        agent.update_task(&id, None, Some(true), None, None).unwrap();
+        agent.update_task(&id, None, Some(State::Cancelled), None, None).unwrap();
+        assert!(agent.get_task(&id).unwrap().contains("State: [-] (cancelled)"));
+        agent.update_task(&id, None, Some(State::Done), None, None).unwrap();
         assert!(agent.search("цифры", None, None).unwrap().contains("note: собрать цифры"));
 
         // Удаление пункта и задачи — в архив.
