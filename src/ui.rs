@@ -14,14 +14,14 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, AUTOSAVE, DatePurpose, Draft, Hit, Mode, NoteTarget, NotesMode, NotesView, Status};
+use crate::app::{App, AUTOSAVE, DatePurpose, Draft, Hit, Mode, NoteTarget, NotesMode, NotesView, Setting, Status};
 use crate::clock::{self, Date};
 use crate::field::LineInput;
 use crate::keymap::{self, Action as A, Key, Row, Section};
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use crate::model::{Category, State, Task};
 use crate::field::TextArea;
-use crate::notes::Kind;
+use crate::notes::{Item, Kind};
 
 const ACCENT: Color = Color::Cyan;
 const SUB: Color = Color::Gray;
@@ -31,6 +31,9 @@ pub const REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
 
 /// Уже этой ширины — телефон (Termux): вкладки и один список на экран вместо сетки 2×2.
 pub const NARROW: u16 = 80;
+
+/// С какой ширины экрана помещается панель превью рядом с сеткой.
+pub const PREVIEW_MIN: u16 = 120;
 
 /// Карта попаданий кадра: где что лежит, чтобы тап попал куда надо (`App::on_mouse`).
 type Hits = Vec<(Rect, Hit)>;
@@ -74,6 +77,7 @@ pub struct Link {
 /// Рисует кадр; возвращает ссылки, которые надо дописать поверх него (`write_links`).
 pub fn draw(frame: &mut Frame, app: &mut App) -> Vec<Link> {
     let mut hits = Hits::new();
+    app.width = frame.area().width;
     let narrow = frame.area().width < NARROW;
     // На узком экране подсказки — в две строки: ими удобно пользоваться как кнопками.
     let [header_area, board_area, status_area] = Layout::vertical([
@@ -89,8 +93,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Vec<Link> {
         draw_tabs(frame, app, tabs, &mut hits);
         draw_list(frame, app, app.active, list, &mut hits);
     } else {
+        let grid = if app.config.preview() && frame.area().width >= PREVIEW_MIN {
+            let width = (board_area.width * 2 / 5).clamp(40, 70);
+            let [grid, preview] =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(width)]).areas(board_area);
+            draw_preview(frame, app, preview, &mut hits);
+            grid
+        } else {
+            board_area
+        };
         // Раскладка 2×2: Работа | Дом / Личное | Прочее.
-        let rows: [Rect; 2] = Layout::vertical([Constraint::Ratio(1, 2); 2]).areas(board_area);
+        let rows: [Rect; 2] = Layout::vertical([Constraint::Ratio(1, 2); 2]).areas(grid);
         for category in Category::ALL {
             let i = category.index();
             let cols: [Rect; 2] = Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(rows[i / 2]);
@@ -104,6 +117,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Vec<Link> {
         Mode::Edit { .. } => draw_edit(frame, app, &mut hits),
         Mode::Date { .. } => draw_date(frame, app, &mut hits),
         Mode::ConfirmDelete => draw_confirm(frame, app, &mut hits),
+        &Mode::Settings(selected) => draw_settings(frame, app, selected, &mut hits),
         Mode::Normal | Mode::MoveTo => {}
     }
     if app.notes.is_some() {
@@ -432,6 +446,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
             DatePurpose::Postpone(_) => enter_esc("перенести", "отмена"),
         },
         Mode::ConfirmDelete => yes_other("удалить", "отмена"),
+        Mode::Settings(_) => vec![
+            Hint::new("␣", "переключить", KeyCode::Char(' ')),
+            Hint::new("j/k", "выбор", KeyCode::Down),
+            Hint::new("Esc", "закрыть", KeyCode::Esc),
+        ],
         Mode::MoveTo => {
             // Куда перенести — цифры списков, их удобно нажимать и пальцем.
             let mut hints = vec![Hint { key: String::new(), desc: "перенести в:", press: None }];
@@ -524,33 +543,7 @@ fn draw_notes(frame: &mut Frame, app: &mut App, board: Rect, hits: &mut Hits) {
         .map(|&i| {
             let item = view.notes.item(i);
             let subtask = matches!(item.kind, Kind::Subtask { .. });
-            let (prefix, style): (Vec<Span>, Style) = match item.kind {
-                Kind::Subtask { done: false } => (vec![Span::raw("[ ] ")], Style::new()),
-                Kind::Subtask { done: true } => (
-                    vec![Span::raw("[x] ").fg(MUTED)],
-                    Style::new().fg(MUTED).crossed_out(),
-                ),
-                Kind::Note { stamp } => (vec![Span::raw(format!("{stamp}  ")).fg(MUTED)], Style::new()),
-                Kind::Text => (vec![], Style::new()),
-            };
-            // Строки пункта и длинные строки (по словам) — с отступом под префикс.
-            let indent: usize = prefix.iter().map(Span::width).sum();
-            let wrap_width = text_width.saturating_sub(indent).max(5);
-            let chunks = std::iter::once(item.head)
-                .chain(item.body.iter().copied())
-                .flat_map(|line| wrap(line, wrap_width));
-            let lines: Vec<Line> = chunks
-                .enumerate()
-                .map(|(n, chunk)| {
-                    let mut spans = if n == 0 {
-                        prefix.clone()
-                    } else {
-                        vec![Span::raw(" ".repeat(indent))]
-                    };
-                    spans.push(Span::styled(chunk, style));
-                    Line::from(spans)
-                })
-                .collect();
+            let lines = entry_lines(&item, text_width);
             shapes.push((lines.len(), subtask));
             ListItem::new(lines)
         })
@@ -621,6 +614,154 @@ fn draw_notes(frame: &mut Frame, app: &mut App, board: Rect, hits: &mut Hits) {
             draw_question(frame, "Удаление", &format!("Удалить «{first}»?"), None, hits);
         }
     }
+}
+
+/// Строки пункта записей: префикс (`[ ]` или метка времени), текст по словам не шире `width`,
+/// продолжение — с отступом под префикс.
+fn entry_lines(item: &Item, width: usize) -> Vec<Line<'static>> {
+    let (prefix, style): (Vec<Span>, Style) = match item.kind {
+        Kind::Subtask { done: false } => (vec![Span::raw("[ ] ")], Style::new()),
+        Kind::Subtask { done: true } => (
+            vec![Span::raw("[x] ").fg(MUTED)],
+            Style::new().fg(MUTED).crossed_out(),
+        ),
+        Kind::Note { stamp } => (vec![Span::raw(format!("{stamp}  ")).fg(MUTED)], Style::new()),
+        Kind::Text => (vec![], Style::new()),
+    };
+    let indent: usize = prefix.iter().map(Span::width).sum();
+    let wrap_width = width.saturating_sub(indent).max(5);
+    std::iter::once(item.head)
+        .chain(item.body.iter().copied())
+        .flat_map(|line| wrap(line, wrap_width))
+        .enumerate()
+        .map(|(n, chunk)| {
+            let mut spans = if n == 0 {
+                prefix.clone()
+            } else {
+                vec![Span::raw(" ".repeat(indent))]
+            };
+            spans.push(Span::styled(chunk, style));
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn state_mark(state: State) -> &'static str {
+    match state {
+        State::Open => "[ ]",
+        State::Done => "[x]",
+        State::Cancelled => "[-]",
+        State::Migrated(_) => "[>]",
+    }
+}
+
+/// Панель превью справа: выделенная задача целиком — текст, состояние, история по страницам,
+/// записи. Только просмотр; тап — окно записей, свайп и J/K — прокрутка.
+fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut Hits) {
+    hits.push((area, Hit::Preview));
+    let active = app.notes.is_none() && matches!(app.mode, Mode::Normal);
+    let block = panel("Превью")
+        .border_style(Style::new().fg(if active { SUB } else { MUTED }))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    let width = usize::from(inner.width).max(10);
+    let (date, category) = (app.date, app.active);
+    let Some(task) = app.selected_task().cloned() else {
+        let empty = Paragraph::new("нет задачи".fg(MUTED)).centered().block(block);
+        frame.render_widget(empty, area);
+        return;
+    };
+
+    let mut lines: Vec<Line> = wrap(&task.text, width)
+        .into_iter()
+        .map(|l| Line::from(Span::raw(l).bold()))
+        .collect();
+    let state = match task.state {
+        State::Open => "открыта".to_string(),
+        State::Done => "выполнена".to_string(),
+        State::Cancelled => "отменена".to_string(),
+        State::Migrated(to) => format!("перенесена на {}", short_date(to, date)),
+    };
+    let mut meta = vec![Span::raw(state).fg(SUB), Span::raw(format!(" · {}", category.title())).fg(MUTED)];
+    if task.private {
+        meta.push(Span::raw(" · 🔒 скрыта от ИИ").fg(MUTED));
+    }
+    lines.push(Line::from(meta));
+
+    if let Some(preview) = app.preview() {
+        // История — если задача побывала больше чем на одной странице.
+        if preview.history.len() > 1 {
+            lines.push(Line::default());
+            lines.push(Line::from("История".fg(ACCENT)));
+            for &(day, list, state) in &preview.history {
+                let mut spans = vec![
+                    Span::raw(format!("{} ", state_mark(state))).fg(MUTED),
+                    Span::raw(short_date(day, date)),
+                ];
+                if list != category {
+                    spans.push(Span::raw(format!(" · {}", list.title())).fg(MUTED));
+                }
+                if day == date {
+                    spans.push(Span::raw(" ← эта страница").fg(MUTED));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+        let visible = preview.notes.visible();
+        if !visible.is_empty() {
+            lines.push(Line::default());
+            let summary = preview.notes.summary();
+            let mut title = vec![Span::raw("Записи").fg(ACCENT)];
+            if summary.subtasks > 0 {
+                title.push(Span::raw(format!(" · подзадачи {}/{}", summary.subtasks_done, summary.subtasks)).fg(MUTED));
+            }
+            lines.push(Line::from(title));
+            for i in visible {
+                lines.extend(entry_lines(&preview.notes.item(i), width));
+            }
+        }
+    }
+
+    let max_scroll = lines.len().saturating_sub(usize::from(inner.height)) as u16;
+    app.preview_scroll = app.preview_scroll.min(max_scroll);
+    let mut block = block;
+    if max_scroll > 0 {
+        let more = match (app.preview_scroll > 0, app.preview_scroll < max_scroll) {
+            (true, true) => " J ↓ · K ↑ ",
+            (false, _) => " J ↓ ",
+            (true, false) => " K ↑ ",
+        };
+        block = block.title_bottom(Line::from(more.fg(MUTED)).right_aligned());
+    }
+    frame.render_widget(Paragraph::new(lines).block(block).scroll((app.preview_scroll, 0)), area);
+}
+
+/// Окно настроек этого устройства: переключатели, пробел или тап — переключить.
+fn draw_settings(frame: &mut Frame, app: &App, selected: usize, hits: &mut Hits) {
+    let rows = Setting::ALL.len() as u16 * 2;
+    let r = popup_area(frame.area(), 60, rows + 4);
+    hits.push((r, Hit::Block));
+    let mut block = panel("Настройки").padding(Padding::uniform(1));
+    if let Some(path) = app.config.path() {
+        block = block.title_bottom(Line::from(format!(" {} ", display_path(path)).fg(MUTED)).right_aligned());
+    }
+    let inner = block.inner(r);
+    let mut lines = Vec::new();
+    for (i, setting) in Setting::ALL.into_iter().enumerate() {
+        let mark = if setting.is_on(&app.config) { "[x] " } else { "[ ] " };
+        let mut line = Line::from(vec![Span::raw(mark), Span::raw(setting.title())]);
+        if i == selected {
+            line = line.reversed();
+        }
+        lines.push(line);
+        lines.push(Line::from(format!("    {}", setting.help()).fg(MUTED)));
+        let y = inner.y + 2 * i as u16;
+        if y < inner.bottom() {
+            hits.push((Rect::new(inner.x, y, inner.width, 2.min(inner.bottom() - y)), Hit::Setting(i)));
+        }
+    }
+    frame.render_widget(Clear, r);
+    frame.render_widget(Paragraph::new(lines).block(block), r);
 }
 
 /// Многострочное поле: высота по тексту (от 3 до 12 строк), прокрутка за курсором.
@@ -985,12 +1126,68 @@ mod tests {
     fn phone_app(name: &str) -> App {
         let dir = std::env::temp_dir().join(format!("ztaskmgr-ui-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut app = App::new(Book::new(dir), Date::today());
+        let mut app = App::new(Book::new(dir), crate::config::Config::default(), Date::today());
         for text in ["раз", "два"] {
             app.board.push(Category::Work, Task::new(text));
         }
         app.lists[0].select(Some(0));
         app
+    }
+
+    #[test]
+    fn preview_and_settings() {
+        use ratatui::crossterm::event::KeyEvent;
+        let dir = std::env::temp_dir().join(format!("ztaskmgr-ui-{}-preview", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let book = Book::new(dir);
+        let today = Date::today();
+        // Задача переехала со вчерашней страницы, у неё подзадача и заметка в две строки.
+        let mut task = Task::new("починить кран");
+        task.id = Some("pv1".into());
+        let mut yesterday = crate::model::Board::default();
+        let mut moved = task.clone();
+        moved.state = State::Migrated(today);
+        yesterday.push(Category::Work, moved);
+        book.save(today.add_days(-1), &yesterday).unwrap();
+        let mut page = crate::model::Board::default();
+        page.push(Category::Work, task);
+        book.save(today, &page).unwrap();
+        let mut notes = crate::notes::Notes::default();
+        notes.add_subtask("купить прокладку");
+        notes.add_note("27.10.2026 19:40", "мастер сказал:\nменять смеситель");
+        book.save_notes("pv1", &notes).unwrap();
+
+        let mut app = App::new(book, crate::config::Config::default(), today);
+        let has = |screen: &[String], text: &str| screen.iter().any(|l| l.contains(text));
+        let mut wide = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        let screen = render(&mut wide, &mut app);
+        for text in ["Превью", "открыта", "История", "← эта страница", "подзадачи 0/1", "[ ] купить прокладку", "менять смеситель"] {
+            assert!(has(&screen, text), "{text}: {screen:#?}");
+        }
+        // Тап по превью — окно записей.
+        tap(&mut app, Hit::Preview);
+        assert!(app.notes.is_some());
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+
+        // На экране уже 120 колонок превью нет.
+        let mut medium = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        assert!(!has(&render(&mut medium, &mut app), "╭ Превью"));
+
+        // v — выключить, в настройках (S) — включить обратно, тапом по пункту.
+        app.on_key(KeyEvent::from(KeyCode::Char('v')));
+        assert!(!app.config.preview());
+        let screen = render(&mut wide, &mut app);
+        assert!(!has(&screen, "╭ Превью") && has(&screen, "Превью выключено"), "{screen:#?}");
+        app.on_key(KeyEvent::from(KeyCode::Char('S')));
+        let screen = render(&mut wide, &mut app);
+        assert!(has(&screen, "[ ] Превью задачи справа"), "{screen:#?}");
+        tap(&mut app, Hit::Setting(0));
+        assert!(app.config.preview());
+        app.on_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(!app.config.preview());
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Normal));
+        let _ = std::fs::remove_dir_all(app.book.dir());
     }
 
     #[test]

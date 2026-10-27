@@ -155,6 +155,20 @@ impl Book {
         Ok(false)
     }
 
+    /// История задачи: все страницы, где она есть (перенос сохраняет id), по датам.
+    pub fn history(&self, id: &str) -> Result<Vec<(Date, Category, State)>> {
+        let mut history = Vec::new();
+        for date in self.dates()? {
+            let board = self.load(date)?;
+            for category in Category::ALL {
+                for t in board.list(category).iter().filter(|t| t.id.as_deref() == Some(id)) {
+                    history.push((date, category, t.state));
+                }
+            }
+        }
+        Ok(history)
+    }
+
     /// Удалена задача с записями: если её копий больше нет ни на одной странице, записи
     /// дописываются в `DELETED_NOTES.md`, а их файл удаляется. Возвращает, перенесены ли.
     pub fn archive_notes(&self, task: &Task, page: Date, stamp: &str) -> Result<bool> {

@@ -44,6 +44,13 @@ pub enum Action {
     TogglePrivate,
     /// Список скрыт от ИИ / открыт.
     ToggleHidden,
+    /// Окно настроек.
+    Settings,
+    /// Панель превью задачи включена / выключена.
+    Preview,
+    /// Прокрутка превью.
+    PreviewDown,
+    PreviewUp,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -213,6 +220,14 @@ pub const ROWS: &[Row] = &[
             (k(KeyCode::End), A::Bottom),
         ],
     ),
+    row(Section::Navigation, "превью задачи справа", &[(c('v'), A::Preview)]),
+    labeled(
+        Section::Navigation,
+        "J  K",
+        "прокрутка превью",
+        &[(c('J'), A::PreviewDown), (c('K'), A::PreviewUp)],
+    ),
+    row(Section::Navigation, "настройки", &[(c('S'), A::Settings)]),
     row(Section::Navigation, "о программе", &[(c('o'), A::About)]),
     row(Section::Navigation, "выход", &[(c('q'), A::Quit)]),
     // Справка сама говорит, как её открыть.
@@ -393,8 +408,8 @@ mod tests {
         assert_eq!(action(k(KeyCode::F(1))), Some(A::Help));
         assert_eq!(action((KeyCode::Up, SHIFT)), Some(A::MoveUp));
         assert_eq!(action(k(KeyCode::Up)), Some(A::Up));
-        assert_eq!(action(c('J')), None);
-        assert_eq!(action(c('K')), None);
+        assert_eq!(action(c('J')), Some(A::PreviewDown));
+        assert_eq!(action(c('S')), Some(A::Settings));
         assert_eq!(row_keys(&ROWS[2]), "Space  x");
         assert_eq!(hint_keys(&[A::Toggle]), "␣");
         assert_eq!(hint_keys(&[A::MoveUp, A::MoveDown]), "⇧↑↓");

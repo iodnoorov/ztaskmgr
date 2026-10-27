@@ -8,6 +8,7 @@ use ratatui::widgets::ListState;
 
 use crate::book::{Book, Stamp, DELETED_NOTES};
 use crate::clock::{self, Date};
+use crate::config::Config;
 use crate::field::{LineInput, TextArea};
 use crate::input::{Mouse, MouseKind, Press};
 use crate::keymap::{self, Action};
@@ -24,6 +25,44 @@ pub enum Mode {
     ConfirmDelete,
     /// Ожидание цифры категории после `m`.
     MoveTo,
+    /// Окно настроек; выделен пункт с этим номером (`Setting::ALL`).
+    Settings(usize),
+}
+
+/// Пункт окна настроек.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Setting {
+    Preview,
+}
+
+impl Setting {
+    pub const ALL: [Setting; 1] = [Setting::Preview];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Setting::Preview => "Превью задачи справа",
+        }
+    }
+
+    pub fn help(self) -> &'static str {
+        match self {
+            Setting::Preview => "на экране от 120 колонок · v — переключить",
+        }
+    }
+
+    pub fn is_on(self, config: &Config) -> bool {
+        match self {
+            Setting::Preview => config.preview(),
+        }
+    }
+}
+
+/// Что показывает превью: история задачи по страницам и её записи. Собирается заново, когда
+/// меняется задача или файлы её страницы и записей (`key`).
+pub struct Preview {
+    key: (Option<String>, Option<Stamp>, Option<Stamp>),
+    pub history: Vec<(Date, Category, State)>,
+    pub notes: Notes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,6 +224,10 @@ pub enum Hit {
     Task(Category, usize),
     /// `[ ]` у задачи — отметить.
     Check(Category, usize),
+    /// Панель превью: тап — записи задачи, свайп — прокрутка.
+    Preview,
+    /// Пункт окна настроек — переключить.
+    Setting(usize),
     /// Пункт записей (номер среди видимых) и `[ ]` у подзадачи.
     Entry(usize),
     EntryCheck(usize),
@@ -225,6 +268,13 @@ pub struct App {
     pub editor_request: Option<PathBuf>,
     /// Списки, скрытые от ИИ (`AI_HIDDEN.md`).
     pub hidden: [bool; 4],
+    /// Настройки этого устройства.
+    pub config: Config,
+    /// Превью выделенной задачи (`preview`) и его прокрутка; прокрутка сбрасывается, когда
+    /// выделяют другую задачу.
+    preview: Option<Preview>,
+    pub preview_scroll: u16,
+    preview_target: Option<(Date, Category, usize)>,
     /// Время изменения файлов страницы и скрытых списков, когда мы их читали или писали.
     page_stamp: Option<Stamp>,
     hidden_stamp: Option<Stamp>,
@@ -233,6 +283,8 @@ pub struct App {
     merge_failed: HashSet<String>,
     /// Карта попаданий последнего кадра; позже нарисованное — выше.
     pub hits: Vec<(Rect, Hit)>,
+    /// Ширина экрана в последнем кадре.
+    pub width: u16,
     pub quit: bool,
 }
 
@@ -268,7 +320,7 @@ fn edit_line(input: &mut LineInput, press: &Press) -> Option<KeyCode> {
 }
 
 impl App {
-    pub fn new(book: Book, today: Date) -> Self {
+    pub fn new(book: Book, config: Config, today: Date) -> Self {
         let mut app = Self {
             book,
             date: today,
@@ -285,11 +337,16 @@ impl App {
             summaries: HashMap::new(),
             editor_request: None,
             hidden: [false; 4],
+            config,
+            preview: None,
+            preview_scroll: 0,
+            preview_target: None,
             page_stamp: None,
             hidden_stamp: None,
             last_merge: Instant::now(),
             merge_failed: HashSet::new(),
             hits: Vec::new(),
+            width: 0,
             quit: false,
         };
         app.load_hidden();
@@ -626,6 +683,7 @@ impl App {
             Mode::Date { .. } => self.on_key_date(press),
             Mode::ConfirmDelete => self.on_key_confirm(press),
             Mode::MoveTo => self.on_key_move_to(press),
+            Mode::Settings(_) => self.on_key_settings(press),
         }
     }
 
@@ -669,6 +727,9 @@ impl App {
         match &self.notes {
             Some(NotesView { mode: NotesMode::List, .. }) => self.act_notes(scroll),
             Some(_) => {}
+            None if matches!(self.mode, Mode::Normal) && hit == Some(Hit::Preview) => {
+                self.act(if scroll == Action::Up { Action::PreviewUp } else { Action::PreviewDown });
+            }
             None if matches!(self.mode, Mode::Normal) => {
                 if let Some(Hit::List(c) | Hit::Task(c, _) | Hit::Check(c, _)) = hit {
                     self.active = c;
@@ -704,11 +765,17 @@ impl App {
             }
             return;
         }
+        if let (Mode::Settings(selected), Hit::Setting(i)) = (&mut self.mode, hit) {
+            *selected = i;
+            self.toggle_setting(Setting::ALL[i]);
+            return;
+        }
         if !matches!(self.mode, Mode::Normal) {
             return;
         }
         match hit {
             Hit::List(c) => self.active = c,
+            Hit::Preview => self.act(Action::Notes),
             // Тап по выделенной задаче — её записи, по другой — выделить.
             Hit::Task(c, i) if self.active == c && self.selected() == Some(i) => self.act(Action::Notes),
             Hit::Task(c, i) => {
@@ -820,6 +887,10 @@ impl App {
             Action::Notes => self.open_notes(),
             Action::TogglePrivate => self.toggle_private(),
             Action::ToggleHidden => self.toggle_hidden(),
+            Action::Settings => self.mode = Mode::Settings(0),
+            Action::Preview => self.toggle_preview(),
+            Action::PreviewDown => self.preview_scroll = self.preview_scroll.saturating_add(1),
+            Action::PreviewUp => self.preview_scroll = self.preview_scroll.saturating_sub(1),
             Action::MoveTo | Action::Delete => {}
             // Только в окне записей.
             Action::AddSubtask | Action::OpenEditor | Action::Close => {}
@@ -899,6 +970,71 @@ impl App {
             Err(e) => self.status = Some(Status::Error(format!("Записи задачи: {e:#}"))),
         }
         self.summaries = self.book.summaries(&self.board);
+    }
+
+    fn on_key_settings(&mut self, press: Press) {
+        let Mode::Settings(selected) = &mut self.mode else {
+            return;
+        };
+        let last = Setting::ALL.len() - 1;
+        match press.hotkey.code {
+            KeyCode::Char('j') | KeyCode::Down => *selected = (*selected + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Char(' ' | 'x') | KeyCode::Enter => {
+                let setting = Setting::ALL[*selected];
+                self.toggle_setting(setting);
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'S') => self.mode = Mode::Normal,
+            _ => {}
+        }
+    }
+
+    fn toggle_setting(&mut self, setting: Setting) {
+        let on = !setting.is_on(&self.config);
+        let saved = match setting {
+            Setting::Preview => self.config.set_preview(on),
+        };
+        if let Err(e) = saved {
+            self.status = Some(Status::Error(format!("Настройки не сохранены: {e:#}")));
+        }
+    }
+
+    /// `v`: превью видно только на широком экране — на узком говорим об этом.
+    fn toggle_preview(&mut self) {
+        self.toggle_setting(Setting::Preview);
+        if self.status.is_none() {
+            let what = if self.config.preview() { "включено" } else { "выключено" };
+            let note = if self.config.preview() && self.width < crate::ui::PREVIEW_MIN {
+                format!(" (видно на экране от {} колонок)", crate::ui::PREVIEW_MIN)
+            } else {
+                String::new()
+            };
+            self.status = Some(Status::Info(format!("Превью {what}{note}")));
+        }
+    }
+
+    /// Данные превью для выделенной задачи; собираются заново, только если что-то поменялось.
+    pub fn preview(&mut self) -> Option<&Preview> {
+        let index = self.selected()?;
+        let target = (self.date, self.active, index);
+        if self.preview_target != Some(target) {
+            self.preview_target = Some(target);
+            self.preview_scroll = 0;
+        }
+        let id = self.selected_task()?.id.clone();
+        let notes_stamp = id.as_deref().and_then(|id| self.book.notes_stamp(id));
+        let key = (id, self.page_stamp, notes_stamp);
+        if self.preview.as_ref().is_none_or(|p| p.key != key) {
+            let (history, notes) = match &key.0 {
+                Some(id) => (
+                    self.book.history(id).unwrap_or_default(),
+                    self.book.load_notes(id).unwrap_or_default(),
+                ),
+                None => (Vec::new(), Notes::default()),
+            };
+            self.preview = Some(Preview { key, history, notes });
+        }
+        self.preview.as_ref()
     }
 
     fn on_key_move_to(&mut self, press: Press) {
@@ -1439,7 +1575,7 @@ mod tests {
     fn test_app(name: &str) -> App {
         let dir = std::env::temp_dir().join(format!("ztaskmgr-app-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        App::new(Book::new(dir), d(26))
+        App::new(Book::new(dir), Config::default(), d(26))
     }
 
     fn cleanup(app: App) {

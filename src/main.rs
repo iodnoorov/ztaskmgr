@@ -2,6 +2,7 @@ mod agent;
 mod app;
 mod book;
 mod clock;
+mod config;
 mod field;
 mod input;
 mod keymap;
@@ -26,6 +27,7 @@ use ratatui::crossterm::{cursor, execute, terminal};
 use crate::app::{App, Status};
 use crate::book::Book;
 use crate::clock::Date;
+use crate::config::Config;
 use crate::input::Input;
 
 const USAGE: &str = "\
@@ -66,7 +68,11 @@ fn main() -> Result<()> {
     let merge = book.merge_conflicts()?;
     let carried = book.carry_over(today)?;
     book.load(today)?;
-    let mut app = App::new(book, today);
+    let config = match Config::default_path() {
+        Some(path) => Config::load(path)?,
+        None => Config::default(),
+    };
+    let mut app = App::new(book, config, today);
     if let Some((from, count)) = carried {
         app.status = Some(Status::Info(app::carried_message(from, count)));
     }

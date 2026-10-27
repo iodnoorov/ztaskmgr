@@ -295,20 +295,11 @@ impl Agent {
             return Ok(out);
         };
         out.push_str(&format!("Ref: {id}\n"));
-        // История: все страницы, где была эта задача (перенос сохраняет id).
-        let mut history = Vec::new();
-        for date in self.book.dates()? {
-            let board = self.book.load(date)?;
-            for category in Category::ALL {
-                for t in board.list(category).iter().filter(|t| t.id.as_deref() == Some(id)) {
-                    history.push(format!("{date} {} {}", category.title(), state_mark(t.state)));
-                }
-            }
-        }
+        let history = self.book.history(id)?;
         if history.len() > 1 {
             out.push_str("History:\n");
-            for line in history {
-                out.push_str(&format!("  {line}\n"));
+            for (date, category, state) in history {
+                out.push_str(&format!("  {date} {} {}\n", category.title(), state_mark(state)));
             }
         }
         let notes = self.render_notes(id)?;
