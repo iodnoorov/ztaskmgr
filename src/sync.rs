@@ -10,8 +10,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::book::{AI_HIDDEN, Book, DELETED_NOTES, parse_hidden};
+use crate::lists::{LISTS_FILE, Lists};
 use crate::clock::Date;
-use crate::model::{Board, Category, State, Task};
+use crate::model::{Board, ListId, State, Task};
 use crate::notes::Notes;
 use crate::storage;
 
@@ -42,9 +43,9 @@ fn rank(state: State) -> u8 {
 /// Где в `board` та же задача, что `task`: по id где угодно; иначе по тексту в том же списке —
 /// среди задач без id или с id, которого нет у другой версии (одну и ту же написанную руками
 /// задачу два устройства могли снабдить разными id).
-fn find_same(board: &Board, task: &Task, category: Category, other_ids: &HashSet<&str>) -> Option<(Category, usize)> {
+fn find_same(board: &Board, task: &Task, category: ListId, other_ids: &HashSet<&str>) -> Option<(ListId, usize)> {
     if let Some(id) = &task.id {
-        for c in Category::ALL {
+        for c in board.ids() {
             if let Some(i) = board.list(c).iter().position(|t| t.id.as_ref() == Some(id)) {
                 return Some((c, i));
             }
@@ -63,7 +64,12 @@ fn find_same(board: &Board, task: &Task, category: Category, other_ids: &HashSet
 pub fn merge_boards(current: &Board, other: &Board) -> Board {
     let mut result = current.clone();
     let other_ids: HashSet<&str> = other.tasks().filter_map(|t| t.id.as_deref()).collect();
-    for category in Category::ALL {
+    for category in other.ids() {
+        if result.title(category).is_none()
+            && let Some(title) = other.title(category)
+        {
+            result.set_title(category, title);
+        }
         let mut after: Option<usize> = None;
         for task in other.list(category) {
             match find_same(&result, task, category, &other_ids) {
@@ -168,16 +174,24 @@ impl Book {
             return Ok(true);
         }
         if let Some(date) = stem.and_then(Date::parse_iso) {
-            let other = storage::parse(&text)?;
+            let other = storage::parse(&text, &self.lists()?)?;
             let current = self.load(date)?;
             self.save(date, &merge_boards(&current, &other))?;
             return Ok(true);
         }
+        if base == LISTS_FILE {
+            let mut current = self.lists()?;
+            current.merge(&Lists::parse(&text)?);
+            self.save_lists(&current)?;
+            return Ok(true);
+        }
         if base == AI_HIDDEN {
-            // Скрыт хоть на одном устройстве — скрыт.
-            let current = self.hidden()?;
-            let other = parse_hidden(&text)?;
-            self.set_hidden(std::array::from_fn(|i| current[i] || other[i]))?;
+            // Копия файла прежних версий: скрыт хоть на одном устройстве — скрыт.
+            let mut current = self.lists()?;
+            for id in parse_hidden(&text, &current)? {
+                current.set_hidden(id, true)?;
+            }
+            self.save_lists(&current)?;
             return Ok(true);
         }
         if base == DELETED_NOTES {
@@ -210,7 +224,7 @@ mod tests {
         t
     }
 
-    fn texts(board: &Board, c: Category) -> Vec<String> {
+    fn texts(board: &Board, c: ListId) -> Vec<String> {
         board.list(c).iter().map(|t| format!("{}{}", t.text, match t.state {
             State::Open => "",
             State::Done => " ✓",
@@ -234,33 +248,50 @@ mod tests {
         let mut pc = Board::default();
         let mut a = task("a", "1");
         a.state = State::Done;
-        pc.push(Category::Work, a);
-        pc.push(Category::Work, task("d", "4"));
-        pc.push(Category::Work, task("c", "3"));
+        pc.push(ListId::WORK, a);
+        pc.push(ListId::WORK, task("d", "4"));
+        pc.push(ListId::WORK, task("c", "3"));
         let mut phone = Board::default();
-        phone.push(Category::Work, task("a", "1"));
-        phone.push(Category::Work, task("b", "2"));
+        phone.push(ListId::WORK, task("a", "1"));
+        phone.push(ListId::WORK, task("b", "2"));
         let mut d4 = task("d", "4");
         d4.state = State::Done;
         d4.private = true;
-        phone.push(Category::Work, d4);
+        phone.push(ListId::WORK, d4);
         let merged = merge_boards(&pc, &phone);
-        assert_eq!(texts(&merged, Category::Work), ["a ✓", "b", "d ✓", "c"]);
-        assert!(merged.list(Category::Work)[2].private);
+        assert_eq!(texts(&merged, ListId::WORK), ["a ✓", "b", "d ✓", "c"]);
+        assert!(merged.list(ListId::WORK)[2].private);
 
         // Задачу перенесли в другой список на одном устройстве — не дублируется.
         let mut moved = Board::default();
-        moved.push(Category::Home, task("a", "1"));
+        moved.push(ListId::HOME, task("a", "1"));
         let merged = merge_boards(&moved, &phone);
-        assert_eq!(texts(&merged, Category::Home), ["a"]);
-        assert_eq!(texts(&merged, Category::Work), ["b", "d ✓"]);
+        assert_eq!(texts(&merged, ListId::HOME), ["a"]);
+        assert_eq!(texts(&merged, ListId::WORK), ["b", "d ✓"]);
 
         // Написанная руками задача получила разные id на двух устройствах — одна задача.
         let mut one = Board::default();
-        one.push(Category::Other, task("руками", "x1"));
+        one.push(ListId::OTHER, task("руками", "x1"));
         let mut two = Board::default();
-        two.push(Category::Other, task("руками", "y2"));
-        assert_eq!(texts(&merge_boards(&one, &two), Category::Other), ["руками"]);
+        two.push(ListId::OTHER, task("руками", "y2"));
+        assert_eq!(texts(&merge_boards(&one, &two), ListId::OTHER), ["руками"]);
+    }
+
+    #[test]
+    fn merges_lists_file() {
+        let dir = std::env::temp_dir().join(format!("ztaskmgr-sync-lists-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let book = Book::new(dir.clone());
+        let mut pc = Lists::default();
+        pc.add(crate::model::ListId::new("pc1"), "С компьютера").unwrap();
+        book.save_lists(&pc).unwrap();
+        let mut phone = Lists::default();
+        phone.add(crate::model::ListId::new("ph1"), "С телефона").unwrap();
+        fs::write(dir.join("LISTS.sync-conflict-20261026-091500-PHONE.md"), phone.serialize()).unwrap();
+        assert_eq!(book.merge_conflicts().unwrap().merged, ["LISTS.md"]);
+        let titles: Vec<String> = book.lists().unwrap().all().iter().map(|d| d.title.clone()).collect();
+        assert_eq!(titles, ["Работа", "Дом", "Личное", "Прочее", "С телефона", "С компьютера"]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -269,12 +300,12 @@ mod tests {
         let mut done = Board::default();
         let mut t = task("a", "1");
         t.state = State::Done;
-        done.push(Category::Work, t.clone());
+        done.push(ListId::WORK, t.clone());
         let mut cancelled = Board::default();
         t.state = State::Cancelled;
-        cancelled.push(Category::Work, t);
-        assert_eq!(texts(&merge_boards(&done, &cancelled), Category::Work), ["a ✗"]);
-        assert_eq!(texts(&merge_boards(&cancelled, &done), Category::Work), ["a ✗"]);
+        cancelled.push(ListId::WORK, t);
+        assert_eq!(texts(&merge_boards(&done, &cancelled), ListId::WORK), ["a ✗"]);
+        assert_eq!(texts(&merge_boards(&cancelled, &done), ListId::WORK), ["a ✗"]);
     }
 
     #[test]
@@ -287,11 +318,11 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join(".stignore")).unwrap(), STIGNORE);
 
         let mut pc = Board::default();
-        pc.push(Category::Work, task("с компьютера", "aa"));
+        pc.push(ListId::WORK, task("с компьютера", "aa"));
         book.save(d(26), &pc).unwrap();
         let mut phone = Board::default();
-        phone.push(Category::Work, task("с телефона", "bb"));
-        fs::write(dir.join("2026-10-26.sync-conflict-20261026-091500-PHONE.md"), storage::serialize(&phone)).unwrap();
+        phone.push(ListId::WORK, task("с телефона", "bb"));
+        fs::write(dir.join("2026-10-26.sync-conflict-20261026-091500-PHONE.md"), storage::serialize(&phone, &Lists::default())).unwrap();
 
         let mut notes = Notes::default();
         notes.add_subtask("купить");
@@ -308,7 +339,7 @@ mod tests {
         let report = book.merge_conflicts().unwrap();
         assert_eq!(report.merged, ["2026-10-26.md", "aa.md"]);
         assert_eq!(report.failed, ["2026-10-27.sync-conflict-20261026-091500-PHONE.md"]);
-        assert_eq!(texts(&book.load(d(26)).unwrap(), Category::Work), ["с компьютера", "с телефона"]);
+        assert_eq!(texts(&book.load(d(26)).unwrap(), ListId::WORK), ["с компьютера", "с телефона"]);
         assert_eq!(book.load_notes("aa").unwrap().serialize(), "- [x] купить\n- 26.10.2026 09:00 с телефона\n");
         assert!(!dir.join("2026-10-26.sync-conflict-20261026-091500-PHONE.md").exists());
         // Чужие файлы не тронуты, испорченная копия осталась.

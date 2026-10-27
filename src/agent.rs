@@ -8,7 +8,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::book::Book;
 use crate::clock::{self, Date};
-use crate::model::{Board, Category, State, Task};
+use crate::lists::Lists;
+use crate::model::{Board, ListId, State, Task};
 use crate::notes::{Kind, Notes};
 
 pub struct Agent {
@@ -18,7 +19,7 @@ pub struct Agent {
 /// Найденная по ссылке задача: страница (уже прочитанная) и место на ней.
 struct Found {
     date: Date,
-    category: Category,
+    category: ListId,
     index: usize,
     board: Board,
 }
@@ -33,14 +34,24 @@ impl Found {
     }
 }
 
-/// Список по названию: русскому или английскому, без учёта регистра.
-pub fn parse_list(name: &str) -> Result<Category> {
-    let name = name.trim().to_lowercase();
-    let english = ["work", "home", "personal", "other"];
-    Category::ALL
+/// Список по названию (без учёта регистра) или id: у исходных списков это work, home,
+/// personal, other. Скрытые от ИИ — как незнакомые.
+pub fn parse_list(name: &str, registry: &Lists) -> Result<ListId> {
+    registry
+        .find(name)
+        .filter(|&id| !registry.is_hidden(id))
+        .with_context(|| format!("unknown list «{}»: use {}", name.trim(), list_names(registry)))
+}
+
+/// Списки, доступные агенту, для подсказок: `Работа (work), Ремонт (k3x9ab)`.
+pub fn list_names(registry: &Lists) -> String {
+    registry
+        .active()
         .into_iter()
-        .find(|c| c.title().to_lowercase() == name || english[c.index()] == name)
-        .with_context(|| format!("unknown list «{name}»: use Работа/work, Дом/home, Личное/personal, Прочее/other"))
+        .filter(|&id| !registry.is_hidden(id))
+        .map(|id| format!("{} ({})", registry.label(id), id.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Состояние задачи для `update_task`: перенести так нельзя — для этого `postpone_task`.
@@ -85,42 +96,42 @@ impl Agent {
         &self.book
     }
 
-    fn hidden(&self) -> Result<[bool; 4]> {
-        self.book.hidden()
+    fn registry(&self) -> Result<Lists> {
+        self.book.lists()
     }
 
-    fn visible(task: &Task, category: Category, hidden: &[bool; 4]) -> bool {
-        !hidden[category.index()] && !task.private
+    fn visible(task: &Task, category: ListId, registry: &Lists) -> bool {
+        !registry.is_hidden(category) && !task.private
     }
 
     /// Видимые задачи списка: (номер среди видимых с 1, индекс в списке).
-    fn visible_indices(board: &Board, category: Category, hidden: &[bool; 4]) -> Vec<usize> {
+    fn visible_indices(board: &Board, category: ListId, registry: &Lists) -> Vec<usize> {
         let list = board.list(category);
         (0..list.len())
-            .filter(|&i| Self::visible(&list[i], category, hidden))
+            .filter(|&i| Self::visible(&list[i], category, registry))
             .collect()
     }
 
     /// Ссылка на задачу в выдаче: id, если есть, иначе `дата/список/номер`.
-    fn task_ref(date: Date, category: Category, number: usize, task: &Task) -> String {
+    fn task_ref(date: Date, category: ListId, number: usize, task: &Task, registry: &Lists) -> String {
         match &task.id {
             Some(id) => id.clone(),
-            None => format!("{date}/{}/{number}", category.title()),
+            None => format!("{date}/{}/{number}", registry.label(category)),
         }
     }
 
     /// Задача по ссылке: id (берётся живая копия — не `[>]`, с самой поздней страницы) или
     /// `дата/список/номер` (номер — среди видимых, с 1). Скрытая — «не найдена».
     fn resolve(&self, reference: &str) -> Result<Found> {
-        let hidden = self.hidden()?;
+        let registry = self.registry()?;
         let reference = reference.trim();
         let parts: Vec<&str> = reference.split('/').collect();
         if let [date, list, number] = parts[..] {
             let date = Date::parse_iso(date).with_context(|| format!("bad date in task ref «{reference}»"))?;
-            let category = parse_list(list)?;
+            let category = parse_list(list, &registry)?;
             let number: usize = number.parse().with_context(|| format!("bad number in task ref «{reference}»"))?;
             let board = self.book.load(date)?;
-            let visible = Self::visible_indices(&board, category, &hidden);
+            let visible = Self::visible_indices(&board, category, &registry);
             let index = number
                 .checked_sub(1)
                 .and_then(|n| visible.get(n).copied())
@@ -130,9 +141,9 @@ impl Agent {
         let mut fallback = None;
         for date in self.book.dates()?.into_iter().rev() {
             let board = self.book.load(date)?;
-            for category in Category::ALL {
+            for category in registry.order(board.ids()) {
                 let found = board.list(category).iter().position(|t| {
-                    t.id.as_deref() == Some(reference) && Self::visible(t, category, &hidden)
+                    t.id.as_deref() == Some(reference) && Self::visible(t, category, &registry)
                 });
                 let Some(index) = found else { continue };
                 let live = !matches!(board.list(category)[index].state, State::Migrated(_));
@@ -158,10 +169,11 @@ impl Agent {
         Ok(id)
     }
 
-    fn check_writable(&self, category: Category) -> Result<()> {
-        if self.hidden()?[category.index()] {
+    fn check_writable(&self, category: ListId) -> Result<()> {
+        let registry = self.registry()?;
+        if registry.is_hidden(category) || !registry.is_active(category) {
             // Не раскрываем, что в списке; просто нельзя.
-            bail!("list «{}» is not available", category.title());
+            bail!("list «{}» is not available", registry.label(category));
         }
         Ok(())
     }
@@ -170,7 +182,7 @@ impl Agent {
 
     /// Страницы с видимыми делами за период: дата и сколько открыто / сделано.
     pub fn list_pages(&self, from: Option<Date>, to: Option<Date>) -> Result<String> {
-        let hidden = self.hidden()?;
+        let registry = self.registry()?;
         let mut out = String::new();
         for date in self.book.dates()? {
             if from.is_some_and(|f| date < f) || to.is_some_and(|t| date > t) {
@@ -178,8 +190,8 @@ impl Agent {
             }
             let board = self.book.load(date)?;
             let (mut open, mut done) = (0, 0);
-            for category in Category::ALL {
-                for i in Self::visible_indices(&board, category, &hidden) {
+            for category in registry.order(board.ids()) {
+                for i in Self::visible_indices(&board, category, &registry) {
                     match board.list(category)[i].state {
                         State::Open => open += 1,
                         State::Done => done += 1,
@@ -199,14 +211,14 @@ impl Agent {
 
     /// Страницы за период целиком (только видимое), по желанию — только некоторые списки и
     /// с записями задач.
-    pub fn get_pages(&self, from: Date, to: Date, lists: Option<&[Category]>, with_notes: bool) -> Result<String> {
+    pub fn get_pages(&self, from: Date, to: Date, lists: Option<&[ListId]>, with_notes: bool) -> Result<String> {
         if to < from {
             bail!("`to` is before `from`");
         }
         if from.days_until(to) > 366 {
             bail!("period is too long (max 366 days)");
         }
-        let hidden = self.hidden()?;
+        let registry = self.registry()?;
         let today = Date::today();
         let mut out = String::new();
         let mut date = from;
@@ -215,12 +227,12 @@ impl Agent {
             let summaries = self.book.summaries(&board);
             let mut page = String::new();
             let mut any = false;
-            for category in Category::ALL {
-                if hidden[category.index()] || lists.is_some_and(|l| !l.contains(&category)) {
+            for category in registry.order(board.ids()) {
+                if registry.is_hidden(category) || lists.is_some_and(|l| !l.contains(&category)) {
                     continue;
                 }
-                page.push_str(&format!("### {}\n", category.title()));
-                let visible = Self::visible_indices(&board, category, &hidden);
+                page.push_str(&format!("### {}\n", registry.label(category)));
+                let visible = Self::visible_indices(&board, category, &registry);
                 if visible.is_empty() {
                     page.push_str("(empty)\n");
                 }
@@ -244,7 +256,7 @@ impl Agent {
                         n + 1,
                         state_mark(task.state),
                         task.text,
-                        Self::task_ref(date, category, n + 1, task)
+                        Self::task_ref(date, category, n + 1, task, &registry)
                     ));
                     if with_notes && let Some(id) = &task.id {
                         page.push_str(&indent(&self.render_notes(id)?, "   "));
@@ -282,11 +294,12 @@ impl Agent {
     /// Задача целиком: где лежит, история по страницам, записи.
     pub fn get_task(&self, reference: &str) -> Result<String> {
         let found = self.resolve(reference)?;
+        let registry = self.registry()?;
         let task = found.task();
         let mut out = format!("Task: {}\n", task.text);
         out.push_str(&format!(
             "List: {} · Page: {} · State: {}\n",
-            found.category.title(),
+            registry.label(found.category),
             found.date,
             state_mark(task.state)
         ));
@@ -299,7 +312,7 @@ impl Agent {
         if history.len() > 1 {
             out.push_str("History:\n");
             for (date, category, state) in history {
-                out.push_str(&format!("  {date} {} {}\n", category.title(), state_mark(state)));
+                out.push_str(&format!("  {date} {} {}\n", registry.label(category), state_mark(state)));
             }
         }
         let notes = self.render_notes(id)?;
@@ -318,7 +331,7 @@ impl Agent {
         if query.is_empty() {
             bail!("empty query");
         }
-        let hidden = self.hidden()?;
+        let registry = self.registry()?;
         let mut out = String::new();
         let mut seen_notes = std::collections::HashSet::new();
         for date in self.book.dates()? {
@@ -326,8 +339,8 @@ impl Agent {
                 continue;
             }
             let board = self.book.load(date)?;
-            for category in Category::ALL {
-                for (n, &i) in Self::visible_indices(&board, category, &hidden).iter().enumerate() {
+            for category in registry.order(board.ids()) {
+                for (n, &i) in Self::visible_indices(&board, category, &registry).iter().enumerate() {
                     let task = &board.list(category)[i];
                     let mut hits = Vec::new();
                     // Записи одни на все копии задачи — ищем в них один раз.
@@ -345,10 +358,10 @@ impl Agent {
                     if task.text.to_lowercase().contains(&query) || !hits.is_empty() {
                         out.push_str(&format!(
                             "{date} · {} · {} {} — ref: {}\n",
-                            category.title(),
+                            registry.label(category),
                             state_mark(task.state),
                             task.text,
-                            Self::task_ref(date, category, n + 1, task)
+                            Self::task_ref(date, category, n + 1, task, &registry)
                         ));
                         for hit in hits {
                             out.push_str(&format!("    note: {hit}\n"));
@@ -365,8 +378,9 @@ impl Agent {
 
     // ------------------------------------------------------------------ правка задач
 
-    pub fn add_task(&self, date: Date, category: Category, text: &str) -> Result<String> {
+    pub fn add_task(&self, date: Date, category: ListId, text: &str) -> Result<String> {
         self.check_writable(category)?;
+        let registry = self.registry()?;
         let text = text.trim();
         if text.is_empty() || text.contains('\n') {
             bail!("task text must be one non-empty line");
@@ -377,7 +391,7 @@ impl Agent {
         task.id = Some(id.clone());
         board.push(category, task);
         self.book.save(date, &board)?;
-        Ok(format!("Added to {} on {date} — ref: {id}\n", category.title()))
+        Ok(format!("Added to {} on {date} — ref: {id}\n", registry.label(category)))
     }
 
     /// Правка задачи: текст, отметка, другой список, место в списке (с 1, среди видимых).
@@ -386,7 +400,7 @@ impl Agent {
         reference: &str,
         text: Option<&str>,
         status: Option<State>,
-        list: Option<Category>,
+        list: Option<ListId>,
         position: Option<usize>,
     ) -> Result<String> {
         let mut found = self.resolve(reference)?;
@@ -414,11 +428,11 @@ impl Agent {
             found.index = index;
         }
         if let Some(position) = position {
-            let hidden = self.hidden()?;
+            let registry = self.registry()?;
             let target = position.max(1) - 1;
             // Сдвигаем по соседям, пока не встанет на нужное место среди видимых.
             loop {
-                let visible = Self::visible_indices(&found.board, found.category, &hidden);
+                let visible = Self::visible_indices(&found.board, found.category, &registry);
                 let now = visible.iter().position(|&i| i == found.index).unwrap();
                 let target = target.min(visible.len() - 1);
                 let step = if now > target {
@@ -565,16 +579,18 @@ mod tests {
     /// Страница: работа — открытая, скрытая, сделанная; личное — скрытым списком.
     fn sample(agent: &Agent) {
         let mut board = Board::default();
-        board.push(Category::Work, Task::new("отчёт"));
+        board.push(ListId::WORK, Task::new("отчёт"));
         let mut secret = Task::new("секрет");
         secret.private = true;
-        board.push(Category::Work, secret);
+        board.push(ListId::WORK, secret);
         let mut done = Task::new("созвон");
         done.state = State::Done;
-        board.push(Category::Work, done);
-        board.push(Category::Personal, Task::new("личное дело"));
+        board.push(ListId::WORK, done);
+        board.push(ListId::PERSONAL, Task::new("личное дело"));
         agent.book().save(d(26), &board).unwrap();
-        agent.book().set_hidden([false, false, true, false]).unwrap();
+        let mut lists = agent.book().lists().unwrap();
+        lists.set_hidden(ListId::PERSONAL, true).unwrap();
+        agent.book().save_lists(&lists).unwrap();
     }
 
     #[test]
@@ -588,8 +604,8 @@ mod tests {
         assert!(!page.contains("секрет") && !page.contains("Личное") && !page.contains("личное дело"), "{page}");
         assert_eq!(agent.search("секрет", None, None).unwrap(), "Nothing found.\n");
         assert_eq!(agent.search("личное", None, None).unwrap(), "Nothing found.\n");
-        assert!(agent.add_task(d(26), Category::Personal, "x").is_err());
-        assert!(agent.update_task("2026-10-26/Работа/1", None, None, Some(Category::Personal), None).is_err());
+        assert!(agent.add_task(d(26), ListId::PERSONAL, "x").is_err());
+        assert!(agent.update_task("2026-10-26/Работа/1", None, None, Some(ListId::PERSONAL), None).is_err());
         assert!(agent.get_task("2026-10-26/Работа/3").is_err());
         assert!(agent.list_pages(None, None).unwrap().contains("2026-10-26 (Monday): 1 open, 1 done"));
         cleanup(agent);
@@ -613,7 +629,7 @@ mod tests {
         // Скрытая задача не сдвинулась: «отчёт» на второе место среди видимых.
         agent.update_task(&id, Some("отчёт за квартал"), None, None, Some(2)).unwrap();
         let board = agent.book().load(d(26)).unwrap();
-        let work: Vec<&str> = board.list(Category::Work).iter().map(|t| t.text.as_str()).collect();
+        let work: Vec<&str> = board.list(ListId::WORK).iter().map(|t| t.text.as_str()).collect();
         assert_eq!(work, ["секрет", "созвон", "отчёт за квартал"]);
 
         // Перенос: ссылка по id ведёт на живую копию.
@@ -633,8 +649,8 @@ mod tests {
         agent.delete_task(&format!("{}/Работа/1", d(27))).unwrap();
         // Копия-запись на 26-м ещё есть — записи живы.
         assert!(agent.get_task(&id).unwrap().contains("собрать цифры"));
-        assert!(agent.add_task(d(28), Category::Home, "две\nстроки").is_err());
-        let out = agent.add_task(d(28), Category::Home, "новая").unwrap();
+        assert!(agent.add_task(d(28), ListId::HOME, "две\nстроки").is_err());
+        let out = agent.add_task(d(28), ListId::HOME, "новая").unwrap();
         assert!(out.starts_with("Added to Дом on 2026-10-28 — ref: "), "{out}");
         cleanup(agent);
     }
@@ -647,8 +663,13 @@ mod tests {
         assert_eq!(parse_date("+3", today).unwrap(), d(29));
         assert_eq!(parse_date("2026-10-01", today).unwrap(), d(1));
         assert!(parse_date("потом", today).is_err());
-        assert_eq!(parse_list("WORK").unwrap(), Category::Work);
-        assert_eq!(parse_list("личное").unwrap(), Category::Personal);
-        assert!(parse_list("отпуск").is_err());
+        let mut lists = Lists::default();
+        assert_eq!(parse_list("WORK", &lists).unwrap(), ListId::WORK);
+        assert_eq!(parse_list("личное", &lists).unwrap(), ListId::PERSONAL);
+        assert!(parse_list("отпуск", &lists).is_err());
+        // Скрытый от ИИ — как незнакомый.
+        lists.set_hidden(ListId::PERSONAL, true).unwrap();
+        assert!(parse_list("личное", &lists).is_err());
+        assert_eq!(list_names(&lists), "Работа (work), Дом (home), Прочее (other)");
     }
 }

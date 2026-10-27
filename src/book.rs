@@ -1,5 +1,6 @@
 //! Книжка: каталог со страницами по датам, `2026-10-26.md` — четыре списка на этот день.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::hash::{BuildHasher, RandomState};
@@ -11,24 +12,23 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 
 use crate::clock::Date;
-use crate::model::{Board, Category, State, Task};
+use crate::lists::{LISTS_FILE, Lists};
+use crate::model::{Board, ListId, State, Task};
 use crate::notes::{Notes, Summary};
 use crate::storage;
 
 /// Куда уходят удалённые записи, чтобы не терять их.
 pub const DELETED_NOTES: &str = "DELETED_NOTES.md";
-/// Какие списки скрыты от ИИ: `- Личное` по строке на список.
+/// Скрытые от ИИ списки в прежних версиях: `- Личное` по строке на список. Теперь это
+/// пометка в `LISTS.md`; найденный файл переносится туда и удаляется.
 pub const AI_HIDDEN: &str = "AI_HIDDEN.md";
 
-/// Скрытые списки из текста `AI_HIDDEN.md`: `- Личное` по строке на список.
-pub fn parse_hidden(text: &str) -> Result<[bool; 4]> {
-    let mut hidden = [false; 4];
-    for line in text.lines().filter_map(|l| l.trim().strip_prefix("- ")) {
-        let category = Category::from_title(line.trim())
-            .with_context(|| format!("неизвестный список «{line}»"))?;
-        hidden[category.index()] = true;
-    }
-    Ok(hidden)
+/// Списки из текста `AI_HIDDEN.md`.
+pub fn parse_hidden(text: &str, lists: &Lists) -> Result<Vec<ListId>> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("- "))
+        .map(|line| lists.resolve_heading(line).with_context(|| format!("неизвестный список «{line}»")))
+        .collect()
 }
 
 /// Отпечаток файла: время изменения, размер и inode. По нему видно правки снаружи (агент,
@@ -44,11 +44,14 @@ fn stamp(path: &Path) -> Option<Stamp> {
 
 pub struct Book {
     dir: PathBuf,
+    /// Прочитанный реестр списков и отпечаток его файла: страниц читается много, а реестр
+    /// меняется редко.
+    lists: RefCell<Option<(Option<Stamp>, Lists)>>,
 }
 
 impl Book {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self { dir, lists: RefCell::new(None) }
     }
 
     pub fn dir(&self) -> &Path {
@@ -61,7 +64,7 @@ impl Book {
 
     /// Страница на дату; несуществующая — пустая.
     pub fn load(&self, date: Date) -> Result<Board> {
-        storage::load(&self.page_path(date))
+        storage::load(&self.page_path(date), &self.lists()?)
     }
 
     /// Сохраняет страницу. Пустая страница — это отсутствие файла: если все задачи удалены,
@@ -69,7 +72,7 @@ impl Book {
     pub fn save(&self, date: Date, board: &Board) -> Result<()> {
         let path = self.page_path(date);
         if !board.is_empty() {
-            return storage::save(&path, board);
+            return storage::save(&path, board, &self.lists()?);
         }
         match fs::remove_file(&path) {
             Err(e) if e.kind() != ErrorKind::NotFound => {
@@ -77,6 +80,84 @@ impl Book {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Реестр списков; нет файла — списки новой книжки. Скрытые списки прежних версий
+    /// (`AI_HIDDEN.md`) переносятся в него.
+    pub fn lists(&self) -> Result<Lists> {
+        let path = self.dir.join(LISTS_FILE);
+        let current = stamp(&path);
+        if let Some((cached, lists)) = &*self.lists.borrow()
+            && *cached == current
+            && !self.dir.join(AI_HIDDEN).exists()
+        {
+            return Ok(lists.clone());
+        }
+        let mut lists = match fs::read_to_string(&path) {
+            Ok(text) => Lists::parse(&text).with_context(|| format!("разбор {}", path.display()))?,
+            Err(e) if e.kind() == ErrorKind::NotFound => Lists::default(),
+            Err(e) => return Err(e).with_context(|| format!("чтение {}", path.display())),
+        };
+        let hidden_path = self.dir.join(AI_HIDDEN);
+        if let Ok(text) = fs::read_to_string(&hidden_path) {
+            for id in parse_hidden(&text, &lists).with_context(|| hidden_path.display().to_string())? {
+                lists.set_hidden(id, true)?;
+            }
+            self.save_lists(&lists)?;
+            fs::remove_file(&hidden_path).with_context(|| format!("удаление {}", hidden_path.display()))?;
+            return Ok(lists);
+        }
+        *self.lists.borrow_mut() = Some((current, lists.clone()));
+        Ok(lists)
+    }
+
+    pub fn save_lists(&self, lists: &Lists) -> Result<()> {
+        let path = self.dir.join(LISTS_FILE);
+        storage::write_atomic(&path, &lists.serialize())?;
+        *self.lists.borrow_mut() = Some((stamp(&path), lists.clone()));
+        Ok(())
+    }
+
+    pub fn lists_stamp(&self) -> Option<Stamp> {
+        stamp(&self.dir.join(LISTS_FILE))
+    }
+
+    /// Были ли в списке задачи хоть на одной странице.
+    pub fn list_used(&self, list: ListId) -> Result<bool> {
+        for date in self.dates()? {
+            if !self.load(date)?.list(list).is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Сколько задач в списке на страницах с `since` и дальше.
+    pub fn tasks_since(&self, list: ListId, since: Date) -> Result<usize> {
+        let mut count = 0;
+        for date in self.dates()?.into_iter().filter(|&d| d >= since) {
+            count += self.load(date)?.list(list).len();
+        }
+        Ok(count)
+    }
+
+    /// Удаление списка: все его задачи на страницах с `since` и дальше — в конец списка `to`.
+    /// Прошлые страницы — история, их не трогаем. Возвращает, сколько перенесено.
+    pub fn move_list_tasks(&self, from: ListId, to: ListId, since: Date) -> Result<usize> {
+        let mut count = 0;
+        for date in self.dates()?.into_iter().filter(|&d| d >= since) {
+            let mut board = self.load(date)?;
+            let tasks = board.list(from).len();
+            if tasks == 0 {
+                continue;
+            }
+            for _ in 0..tasks {
+                board.move_to(from, 0, to);
+            }
+            self.save(date, &board)?;
+            count += tasks;
+        }
+        Ok(count)
     }
 
     fn notes_path(&self, id: &str) -> PathBuf {
@@ -156,11 +237,11 @@ impl Book {
     }
 
     /// История задачи: все страницы, где она есть (перенос сохраняет id), по датам.
-    pub fn history(&self, id: &str) -> Result<Vec<(Date, Category, State)>> {
+    pub fn history(&self, id: &str) -> Result<Vec<(Date, ListId, State)>> {
         let mut history = Vec::new();
         for date in self.dates()? {
             let board = self.load(date)?;
-            for category in Category::ALL {
+            for category in board.ids() {
                 for t in board.list(category).iter().filter(|t| t.id.as_deref() == Some(id)) {
                     history.push((date, category, t.state));
                 }
@@ -199,29 +280,6 @@ impl Book {
         write!(file, "## {title}\n<!-- id:{id}, страница {page} -->\n\n{body}\n")?;
         file.sync_all()?;
         Ok(())
-    }
-
-    /// Списки, скрытые от ИИ; нет файла — скрытых нет.
-    pub fn hidden(&self) -> Result<[bool; 4]> {
-        let path = self.dir.join(AI_HIDDEN);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok([false; 4]),
-            Err(e) => return Err(e).with_context(|| format!("чтение {}", path.display())),
-        };
-        parse_hidden(&text).with_context(|| path.display().to_string())
-    }
-
-    pub fn set_hidden(&self, hidden: [bool; 4]) -> Result<()> {
-        let mut text = String::from("# Списки, скрытые от ИИ\n\n");
-        for category in Category::ALL.into_iter().filter(|c| hidden[c.index()]) {
-            text.push_str(&format!("- {}\n", category.title()));
-        }
-        storage::write_atomic(&self.dir.join(AI_HIDDEN), &text)
-    }
-
-    pub fn hidden_stamp(&self) -> Option<Stamp> {
-        stamp(&self.dir.join(AI_HIDDEN))
     }
 
     pub fn page_stamp(&self, date: Date) -> Option<Stamp> {
@@ -267,7 +325,10 @@ impl Book {
         }
         let count = moved.len();
         let mut target = self.load(today)?;
+        // Список удалили, а задачи в нём остались на старой странице — в первый список.
+        let lists = self.lists()?;
         for (category, task) in moved {
+            let category = if lists.get(category).is_some_and(|d| d.archived) { lists.active()[0] } else { category };
             target.push(category, task);
         }
         // Сначала новая страница: при сбое между записями задача окажется в двух местах,
@@ -283,7 +344,7 @@ impl Book {
         &self,
         board: &mut Board,
         from: Date,
-        category: Category,
+        category: ListId,
         index: usize,
         to: Date,
     ) -> Result<bool> {
@@ -315,7 +376,7 @@ mod tests {
         Book::new(dir)
     }
 
-    fn texts(board: &Board, category: Category) -> Vec<(String, State)> {
+    fn texts(board: &Board, category: ListId) -> Vec<(String, State)> {
         board
             .list(category)
             .iter()
@@ -330,13 +391,13 @@ mod tests {
         book.save(d(26), &board).unwrap();
         assert!(!book.page_path(d(26)).exists());
 
-        board.push(Category::Work, Task::new("a"));
+        board.push(ListId::WORK, Task::new("a"));
         book.save(d(26), &board).unwrap();
         assert!(book.page_path(d(26)).exists());
         fs::write(book.dir().join("notes.txt"), "").unwrap();
         assert_eq!(book.dates().unwrap(), [d(26)]);
 
-        board.remove(Category::Work, 0);
+        board.remove(ListId::WORK, 0);
         book.save(d(26), &board).unwrap();
         assert!(!book.page_path(d(26)).exists());
         assert!(book.dates().unwrap().is_empty());
@@ -349,31 +410,31 @@ mod tests {
         assert_eq!(book.carry_over(d(26)).unwrap(), None);
 
         let mut older = Board::default();
-        older.push(Category::Home, Task::new("старая"));
+        older.push(ListId::HOME, Task::new("старая"));
         book.save(d(20), &older).unwrap();
 
         let mut last = Board::default();
-        last.push(Category::Work, Task::new("доделать"));
-        last.push(Category::Work, Task::new("готово"));
-        last.get_mut(Category::Work, 1).unwrap().state = State::Done;
-        last.push(Category::Personal, Task::new("позвонить"));
+        last.push(ListId::WORK, Task::new("доделать"));
+        last.push(ListId::WORK, Task::new("готово"));
+        last.get_mut(ListId::WORK, 1).unwrap().state = State::Done;
+        last.push(ListId::PERSONAL, Task::new("позвонить"));
         book.save(d(23), &last).unwrap();
 
         // Страница на сегодня уже заполнена заранее: перенесённое — в конец.
         let mut today = Board::default();
-        today.push(Category::Work, Task::new("план"));
+        today.push(ListId::WORK, Task::new("план"));
         book.save(d(26), &today).unwrap();
 
         assert_eq!(book.carry_over(d(26)).unwrap(), Some((d(23), 2)));
         let today = book.load(d(26)).unwrap();
         assert_eq!(
-            texts(&today, Category::Work),
+            texts(&today, ListId::WORK),
             [("план".into(), State::Open), ("доделать".into(), State::Open)]
         );
-        assert_eq!(texts(&today, Category::Personal), [("позвонить".into(), State::Open)]);
+        assert_eq!(texts(&today, ListId::PERSONAL), [("позвонить".into(), State::Open)]);
         let last = book.load(d(23)).unwrap();
         assert_eq!(
-            texts(&last, Category::Work),
+            texts(&last, ListId::WORK),
             [
                 ("доделать".into(), State::Migrated(d(26))),
                 ("готово".into(), State::Done)
@@ -398,14 +459,14 @@ mod tests {
         let mut task = Task::new("кран");
         task.id = Some(id.clone());
         let mut page = Board::default();
-        page.push(Category::Home, task.clone());
+        page.push(ListId::HOME, task.clone());
         book.save(d(25), &page).unwrap();
         assert_eq!(book.summaries(&page)[&id].subtasks, 1);
 
         // Перенос: копия с тем же id.
         assert_eq!(book.carry_over(d(26)).unwrap(), Some((d(25), 1)));
         let today = book.load(d(26)).unwrap();
-        assert_eq!(today.list(Category::Home)[0].id.as_deref(), Some(id.as_str()));
+        assert_eq!(today.list(ListId::HOME)[0].id.as_deref(), Some(id.as_str()));
 
         // Удалили копию на 26-м — запись на 25-м осталась, записи живы.
         book.save(d(26), &Board::default()).unwrap();
@@ -427,15 +488,62 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_list() {
+        let book = temp_book("dellist");
+        let repair = ListId::new("rep1");
+        let mut lists = book.lists().unwrap();
+        lists.add(repair, "Ремонт").unwrap();
+        book.save_lists(&lists).unwrap();
+        for (day, text) in [(25, "замер"), (26, "плитка"), (28, "сантехник")] {
+            let mut board = book.load(d(day)).unwrap();
+            board.push(ListId::WORK, Task::new("работа"));
+            board.push(repair, Task::new(text));
+            book.save(d(day), &board).unwrap();
+        }
+        assert!(book.list_used(repair).unwrap() && !book.list_used(ListId::OTHER).unwrap());
+        assert_eq!(book.tasks_since(repair, d(26)).unwrap(), 2);
+        // С 26-го и дальше задачи уезжают в «Дом», 25-е — история.
+        assert_eq!(book.move_list_tasks(repair, ListId::HOME, d(26)).unwrap(), 2);
+        assert_eq!(texts(&book.load(d(25)).unwrap(), repair), [("замер".into(), State::Open)]);
+        assert!(book.load(d(26)).unwrap().list(repair).is_empty());
+        assert_eq!(texts(&book.load(d(28)).unwrap(), ListId::HOME), [("сантехник".into(), State::Open)]);
+
+        // Автоперенос из архивного списка — в первый список на экране.
+        lists.archive(repair).unwrap();
+        book.save_lists(&lists).unwrap();
+        let mut board = book.load(d(28)).unwrap();
+        board.push(repair, Task::new("забытая"));
+        book.save(d(28), &board).unwrap();
+        let text = fs::read_to_string(book.dir().join("2026-10-28.md")).unwrap();
+        assert!(text.contains("## Ремонт <!-- list:rep1 -->\n- [ ] забытая"), "{text}");
+        book.carry_over(d(29)).unwrap();
+        let today = book.load(d(29)).unwrap();
+        assert!(today.list(repair).is_empty());
+        assert!(today.list(ListId::WORK).iter().any(|t| t.text == "забытая"));
+        fs::remove_dir_all(book.dir()).unwrap();
+    }
+
+    #[test]
     fn hidden_lists_and_entry_archive() {
         let book = temp_book("hidden");
-        assert_eq!(book.hidden().unwrap(), [false; 4]);
-        book.set_hidden([false, false, true, false]).unwrap();
-        assert_eq!(book.hidden().unwrap(), [false, false, true, false]);
-        let text = fs::read_to_string(book.dir().join(AI_HIDDEN)).unwrap();
-        assert!(text.contains("- Личное\n"), "{text}");
+        // Нет реестра — списки новой книжки, файл появляется при первом изменении.
+        assert_eq!(book.lists().unwrap(), Lists::default());
+        assert!(book.lists_stamp().is_none());
+        // Скрытые списки прежних версий переезжают в реестр, старый файл удаляется.
+        fs::create_dir_all(book.dir()).unwrap();
+        fs::write(book.dir().join(AI_HIDDEN), "# Списки, скрытые от ИИ\n\n- Личное\n").unwrap();
+        assert!(book.lists().unwrap().is_hidden(ListId::PERSONAL));
+        assert!(!book.dir().join(AI_HIDDEN).exists());
+        let text = fs::read_to_string(book.dir().join(LISTS_FILE)).unwrap();
+        assert!(text.contains("- Личное <!-- list:personal hidden -->\n"), "{text}");
         fs::write(book.dir().join(AI_HIDDEN), "- Отпуск\n").unwrap();
-        assert!(book.hidden().is_err());
+        assert!(book.lists().is_err());
+        fs::remove_file(book.dir().join(AI_HIDDEN)).unwrap();
+        // Реестр поменяли снаружи — читается заново.
+        let mut lists = book.lists().unwrap();
+        lists.rename(ListId::HOME, "Квартира").unwrap();
+        fs::write(book.dir().join(LISTS_FILE), lists.serialize()).unwrap();
+        assert_eq!(book.lists().unwrap().title(ListId::HOME), Some("Квартира"));
 
         book.archive_entry("кран", "abc", d(26), "26.10.2026 21:00", "- [ ] купить\n").unwrap();
         let deleted = fs::read_to_string(book.dir().join(DELETED_NOTES)).unwrap();
@@ -444,7 +552,7 @@ mod tests {
 
         assert_eq!(book.page_stamp(d(26)), None);
         let mut board = Board::default();
-        board.push(Category::Work, Task::new("a"));
+        board.push(ListId::WORK, Task::new("a"));
         book.save(d(26), &board).unwrap();
         assert!(book.page_stamp(d(26)).is_some());
         fs::remove_dir_all(book.dir()).unwrap();
@@ -454,23 +562,23 @@ mod tests {
     fn postpone_to_date() {
         let book = temp_book("postpone");
         let mut board = Board::default();
-        board.push(Category::Other, Task::new("в пятницу"));
-        board.push(Category::Other, Task::new("сделано"));
-        board.get_mut(Category::Other, 1).unwrap().state = State::Done;
+        board.push(ListId::OTHER, Task::new("в пятницу"));
+        board.push(ListId::OTHER, Task::new("сделано"));
+        board.get_mut(ListId::OTHER, 1).unwrap().state = State::Done;
 
-        assert!(book.postpone(&mut board, d(26), Category::Other, 0, d(30)).unwrap());
-        assert_eq!(board.list(Category::Other)[0].state, State::Migrated(d(30)));
+        assert!(book.postpone(&mut board, d(26), ListId::OTHER, 0, d(30)).unwrap());
+        assert_eq!(board.list(ListId::OTHER)[0].state, State::Migrated(d(30)));
         assert_eq!(book.load(d(26)).unwrap(), board);
         assert_eq!(
-            texts(&book.load(d(30)).unwrap(), Category::Other),
+            texts(&book.load(d(30)).unwrap(), ListId::OTHER),
             [("в пятницу".into(), State::Open)]
         );
         // Выполненную, уже перенесённую и на ту же дату — нельзя.
-        assert!(!book.postpone(&mut board, d(26), Category::Other, 1, d(30)).unwrap());
-        assert!(!book.postpone(&mut board, d(26), Category::Other, 0, d(31)).unwrap());
+        assert!(!book.postpone(&mut board, d(26), ListId::OTHER, 1, d(30)).unwrap());
+        assert!(!book.postpone(&mut board, d(26), ListId::OTHER, 0, d(31)).unwrap());
         let mut fresh = Board::default();
-        fresh.push(Category::Work, Task::new("x"));
-        assert!(!book.postpone(&mut fresh, d(26), Category::Work, 0, d(26)).unwrap());
+        fresh.push(ListId::WORK, Task::new("x"));
+        assert!(!book.postpone(&mut fresh, d(26), ListId::WORK, 0, d(26)).unwrap());
         fs::remove_dir_all(book.dir()).unwrap();
     }
 }

@@ -9,9 +9,17 @@ pub enum Action {
     Quit,
     Help,
     About,
+    /// Список по номеру на экране (с 0).
     List(usize),
     NextList,
     PrevList,
+    /// Соседний список в сетке.
+    ListLeft,
+    ListRight,
+    ListUp,
+    ListDown,
+    /// Окно списков: добавить, переименовать, удалить, порядок.
+    Lists,
     Down,
     Up,
     Top,
@@ -23,7 +31,7 @@ pub enum Action {
     Cancel,
     MoveUp,
     MoveDown,
-    /// Перенос в другой список: дальше ждём цифру.
+    /// Перенос в другой список: окно выбора.
     MoveTo,
     /// Перенос на другую дату: спрашиваем дату.
     Postpone,
@@ -99,6 +107,7 @@ use Action as A;
 
 const NONE: KeyModifiers = KeyModifiers::NONE;
 const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
+const CTRL: KeyModifiers = KeyModifiers::CONTROL;
 
 const fn c(c: char) -> Key {
     (KeyCode::Char(c), NONE)
@@ -155,7 +164,7 @@ pub const ROWS: &[Row] = &[
     ),
     labeled(
         Section::Tasks,
-        "m 1-4",
+        "m",
         "перенести в другой список",
         &[(c('m'), A::MoveTo)],
     ),
@@ -187,17 +196,36 @@ pub const ROWS: &[Row] = &[
     row(Section::Pages, "перейти к дате", &[(c('D'), A::GoToDate)]),
     labeled(
         Section::Navigation,
-        "1-4  Tab",
+        "1-9  Tab",
         "списки",
         &[
             (c('1'), A::List(0)),
             (c('2'), A::List(1)),
             (c('3'), A::List(2)),
             (c('4'), A::List(3)),
+            (c('5'), A::List(4)),
+            (c('6'), A::List(5)),
+            (c('7'), A::List(6)),
+            (c('8'), A::List(7)),
+            (c('9'), A::List(8)),
             (k(KeyCode::Tab), A::NextList),
             (k(KeyCode::BackTab), A::PrevList),
         ],
     ),
+    labeled(
+        Section::Navigation,
+        "h l  Ctrl+↑ ↓",
+        "список рядом в сетке",
+        &[
+            (c('h'), A::ListLeft),
+            (c('l'), A::ListRight),
+            (k(KeyCode::Left), A::ListLeft),
+            (k(KeyCode::Right), A::ListRight),
+            ((KeyCode::Up, CTRL), A::ListUp),
+            ((KeyCode::Down, CTRL), A::ListDown),
+        ],
+    ),
+    row(Section::Navigation, "окно списков", &[(c('L'), A::Lists)]),
     labeled(
         Section::Navigation,
         "j k  ↑ ↓",

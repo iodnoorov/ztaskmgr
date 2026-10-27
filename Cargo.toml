@@ -2,7 +2,7 @@
 name = "ztaskmgr"
 version = "0.1.0"
 edition = "2024"
-description = "Четыре списка задач в терминале"
+description = "Списки задач в терминале"
 repository = "https://github.com/iodnoorov/ztaskmgr"
 
 [dependencies]

@@ -7,15 +7,17 @@ use std::io::{self, BufRead, Write};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use crate::agent::{Agent, parse_date, parse_list, parse_status};
+use crate::agent::{Agent, list_names, parse_date, parse_list, parse_status};
 use crate::clock::Date;
-use crate::model::Category;
+use crate::model::ListId;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-const INSTRUCTIONS: &str = "\
-ztaskmgr is the user's personal notebook of tasks. Every date is a page; every page has four \
-lists: Работа (work), Дом (home), Личное (personal), Прочее (other). The position of a task in \
+/// Описание книжки для агента; `lists` — доступные ему списки (`list_names`).
+fn instructions(lists: &str) -> String {
+    format!("\
+ztaskmgr is the user's personal notebook of tasks. Every date is a page; every page has the \
+same lists: {lists}. A list is named by its title or by the id in parentheses. The position of a task in \
 its list is its priority. Unfinished tasks move to the next day automatically; on the old page \
 they stay marked [>] with the date they moved to. A task can have notes: dated notes (possibly \
 multi-line) and subtasks. A task is done only when the user (or you, if asked) marks it — \
@@ -24,12 +26,13 @@ not move to the next day.\n\
 Tasks are referenced by `ref` from the tool output: a short id, or DATE/LIST/N for tasks that \
 have none yet. Prefer ids. Deleted notes are kept in the archive, so nothing is lost.\n\
 Some lists and tasks are hidden from you by the user's choice: do not ask about them or try to \
-guess them. The user writes in Russian: answer and write notes in the user's language.";
+guess them. The user writes in Russian: answer and write notes in the user's language.")
+}
 
-fn tools() -> Value {
+fn tools(lists: &str) -> Value {
     let date = json!({"type": "string", "description": "YYYY-MM-DD, DD.MM, +N/-N (days from today), today, tomorrow, yesterday"});
     let task = json!({"type": "string", "description": "Task ref from tool output: an id like k3x9ab, or DATE/LIST/N"});
-    let list = json!({"type": "string", "description": "Работа|Дом|Личное|Прочее (or work|home|personal|other)"});
+    let list = json!({"type": "string", "description": format!("List title or id: {lists}")});
     json!([
         {
             "name": "list_pages",
@@ -140,6 +143,7 @@ fn number_arg(args: &Value, name: &str) -> Result<Option<usize>> {
 /// Вызов инструмента: текст ответа или ошибка (она уходит агенту как `isError`).
 fn call(agent: &Agent, name: &str, args: &Value) -> Result<String> {
     let today = Date::today();
+    let registry = agent.book().lists()?;
     match name {
         "list_pages" => agent.list_pages(date_arg(args, "from", today)?, date_arg(args, "to", today)?),
         "get_pages" => {
@@ -149,8 +153,8 @@ fn call(agent: &Agent, name: &str, args: &Value) -> Result<String> {
                 Some(names) => Some(
                     names
                         .iter()
-                        .map(|n| parse_list(n.as_str().unwrap_or("")))
-                        .collect::<Result<Vec<Category>>>()?,
+                        .map(|n| parse_list(n.as_str().unwrap_or(""), &registry))
+                        .collect::<Result<Vec<ListId>>>()?,
                 ),
                 None => None,
             };
@@ -165,14 +169,14 @@ fn call(agent: &Agent, name: &str, args: &Value) -> Result<String> {
         "get_task" => agent.get_task(required(args, "task")?),
         "add_task" => agent.add_task(
             parse_date(required(args, "date")?, today)?,
-            parse_list(required(args, "list")?)?,
+            parse_list(required(args, "list")?, &registry)?,
             required(args, "text")?,
         ),
         "update_task" => agent.update_task(
             required(args, "task")?,
             str_arg(args, "text"),
             str_arg(args, "status").map(parse_status).transpose()?,
-            str_arg(args, "list").map(parse_list).transpose()?,
+            str_arg(args, "list").map(|l| parse_list(l, &registry)).transpose()?,
             number_arg(args, "position")?,
         ),
         "postpone_task" => agent.postpone_task(required(args, "task")?, parse_date(required(args, "date")?, today)?),
@@ -204,6 +208,7 @@ pub fn handle(agent: &Agent, message: &Value) -> Option<Value> {
     let id = message.get("id")?.clone();
     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
     let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let lists = agent.book().lists().map(|l| list_names(&l)).unwrap_or_default();
     let result = match method {
         "initialize" => {
             let version = params
@@ -214,11 +219,11 @@ pub fn handle(agent: &Agent, message: &Value) -> Option<Value> {
                 "protocolVersion": version,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "ztaskmgr", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": INSTRUCTIONS
+                "instructions": instructions(&lists)
             })
         }
         "ping" => json!({}),
-        "tools/list" => json!({"tools": tools()}),
+        "tools/list" => json!({"tools": tools(&lists)}),
         "tools/call" => {
             // Сначала — то, что пришло с других устройств, чтобы агент видел всё.
             let _ = agent.book().merge_conflicts();

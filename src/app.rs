@@ -9,10 +9,11 @@ use ratatui::widgets::ListState;
 use crate::book::{Book, Stamp, DELETED_NOTES};
 use crate::clock::{self, Date};
 use crate::config::Config;
+use crate::lists::{Lists, MAX_LISTS};
 use crate::field::{LineInput, TextArea};
 use crate::input::{Mouse, MouseKind, Press};
 use crate::keymap::{self, Action};
-use crate::model::{Board, Category, State, Task};
+use crate::model::{Board, ListId, State, Task};
 use crate::notes::{Notes, Summary};
 
 #[derive(Debug)]
@@ -23,10 +24,24 @@ pub enum Mode {
     /// Ввод даты: перейти к странице или перенести задачу.
     Date { input: LineInput, purpose: DatePurpose },
     ConfirmDelete,
-    /// Ожидание цифры категории после `m`.
-    MoveTo,
+    /// Перенос задачи в другой список: выделен вариант с этим номером (`move_targets`).
+    MoveTo(usize),
+    /// Окно списков: выделена строка `row` (`list_rows`).
+    Lists { row: usize, sub: ListsMode },
     /// Окно настроек; выделен пункт с этим номером (`Setting::ALL`).
     Settings(usize),
+}
+
+/// Что делается в окне списков.
+#[derive(Debug)]
+pub enum ListsMode {
+    Browse,
+    /// Название нового списка.
+    Add(LineInput),
+    Rename(LineInput),
+    /// Удаление выделенного списка. С задачами на сегодня и дальше (`count`) — выбор, куда
+    /// их перенести (`target` — номер в `delete_targets`); без них — просто подтверждение.
+    Delete { count: usize, target: usize },
 }
 
 /// Пункт окна настроек.
@@ -61,7 +76,7 @@ impl Setting {
 /// меняется задача или файлы её страницы и записей (`key`).
 pub struct Preview {
     key: (Option<String>, Option<Stamp>, Option<Stamp>),
-    pub history: Vec<(Date, Category, State)>,
+    pub history: Vec<(Date, ListId, State)>,
     pub notes: Notes,
 }
 
@@ -74,7 +89,7 @@ pub enum DatePurpose {
 
 /// Окно доп. записей задачи, поверх страницы.
 pub struct NotesView {
-    pub category: Category,
+    pub category: ListId,
     /// Индекс задачи в списке; пока окно открыто, страница не меняется.
     pub index: usize,
     /// id записей; у задачи без записей — новый, задаче он достаётся с первой записью.
@@ -220,14 +235,16 @@ pub enum Hit {
     /// Как нажать клавишу: подсказка внизу, стрелки дней в шапке.
     Key(keymap::Key),
     /// Список: его рамка, вкладка, пустое место.
-    List(Category),
-    Task(Category, usize),
+    List(ListId),
+    Task(ListId, usize),
     /// `[ ]` у задачи — отметить.
-    Check(Category, usize),
+    Check(ListId, usize),
     /// Панель превью: тап — записи задачи, свайп — прокрутка.
     Preview,
     /// Пункт окна настроек — переключить.
     Setting(usize),
+    /// Вариант в окне выбора (перенос в список, строка окна списков).
+    Pick(usize),
     /// Пункт записей (номер среди видимых) и `[ ]` у подзадачи.
     Entry(usize),
     EntryCheck(usize),
@@ -252,9 +269,12 @@ pub struct App {
     /// Страница не прочиталась: показываем пустой лист, но не даём его править и сохранять,
     /// иначе файл с ошибкой перезапишется.
     pub page_error: Option<String>,
-    pub active: Category,
+    pub active: ListId,
+    /// Списки на экране для открытой страницы: из реестра и архивные, в которых на ней
+    /// есть задачи (`refresh_shown`), не больше `MAX_LISTS`.
+    pub shown: Vec<ListId>,
     /// Выделение и прокрутка — свои у каждого списка.
-    pub lists: [ListState; 4],
+    pub lists: HashMap<ListId, ListState>,
     pub mode: Mode,
     pub show_help: bool,
     pub show_about: bool,
@@ -266,18 +286,18 @@ pub struct App {
     /// Файл, который надо открыть во внешнем редакторе: это делает главный цикл,
     /// ему принадлежит терминал. Потом — `after_editor`.
     pub editor_request: Option<PathBuf>,
-    /// Списки, скрытые от ИИ (`AI_HIDDEN.md`).
-    pub hidden: [bool; 4],
+    /// Реестр списков книжки (`LISTS.md`): названия, порядок, скрытые от ИИ.
+    pub registry: Lists,
     /// Настройки этого устройства.
     pub config: Config,
     /// Превью выделенной задачи (`preview`) и его прокрутка; прокрутка сбрасывается, когда
     /// выделяют другую задачу.
     preview: Option<Preview>,
     pub preview_scroll: u16,
-    preview_target: Option<(Date, Category, usize)>,
+    preview_target: Option<(Date, ListId, usize)>,
     /// Время изменения файлов страницы и скрытых списков, когда мы их читали или писали.
     page_stamp: Option<Stamp>,
-    hidden_stamp: Option<Stamp>,
+    lists_stamp: Option<Stamp>,
     last_merge: Instant,
     /// Копии, которые не удалось слить, — о них уже сказано.
     merge_failed: HashSet<String>,
@@ -327,8 +347,9 @@ impl App {
             today,
             board: Board::default(),
             page_error: None,
-            active: Category::Work,
-            lists: Default::default(),
+            active: ListId::WORK,
+            shown: Vec::new(),
+            lists: HashMap::new(),
             mode: Mode::Normal,
             show_help: false,
             show_about: false,
@@ -336,41 +357,64 @@ impl App {
             notes: None,
             summaries: HashMap::new(),
             editor_request: None,
-            hidden: [false; 4],
+            registry: Lists::default(),
             config,
             preview: None,
             preview_scroll: 0,
             preview_target: None,
             page_stamp: None,
-            hidden_stamp: None,
+            lists_stamp: None,
             last_merge: Instant::now(),
             merge_failed: HashSet::new(),
             hits: Vec::new(),
             width: 0,
             quit: false,
         };
-        app.load_hidden();
+        app.load_registry();
         app.open_page(today);
         app
     }
 
     pub fn selected(&self) -> Option<usize> {
-        self.lists[self.active.index()].selected()
+        self.lists.get(&self.active)?.selected()
+    }
+
+    /// Выделение и прокрутка списка.
+    pub fn list_state(&mut self, category: ListId) -> &mut ListState {
+        self.lists.entry(category).or_default()
+    }
+
+    /// Название списка: из реестра, для незнакомого — из заголовка страницы.
+    pub fn list_title(&self, category: ListId) -> &str {
+        self.registry.title(category).or(self.board.title(category)).unwrap_or(category.as_str())
+    }
+
+    /// Какие списки на экране; активный — один из них.
+    fn refresh_shown(&mut self) {
+        let mut shown = self.registry.order(self.board.ids());
+        shown.truncate(MAX_LISTS);
+        self.shown = shown;
+        if !self.shown.contains(&self.active) {
+            self.active = self.shown[0];
+        }
+        for category in self.shown.clone() {
+            self.clamp_selection(category);
+        }
     }
 
     pub fn selected_task(&self) -> Option<&Task> {
         self.board.list(self.active).get(self.selected()?)
     }
 
-    fn select(&mut self, category: Category, index: Option<usize>) {
-        self.lists[category.index()].select(index);
+    fn select(&mut self, category: ListId, index: Option<usize>) {
+        self.list_state(category).select(index);
         self.clamp_selection(category);
     }
 
     /// Держит выделение в границах списка; у непустого списка что-то выделено всегда.
-    fn clamp_selection(&mut self, category: Category) {
+    fn clamp_selection(&mut self, category: ListId) {
         let len = self.board.list(category).len();
-        let state = &mut self.lists[category.index()];
+        let state = self.list_state(category);
         state.select(match (len, state.selected()) {
             (0, _) => None,
             (_, None) => Some(0),
@@ -398,10 +442,8 @@ impl App {
                 self.page_error = Some(e);
             }
         }
-        self.lists = Default::default();
-        for category in Category::ALL {
-            self.clamp_selection(category);
-        }
+        self.lists.clear();
+        self.refresh_shown();
         self.page_stamp = self.book.page_stamp(date);
         // Окно записей привязано к задаче прежней страницы.
         self.notes = None;
@@ -441,31 +483,50 @@ impl App {
         self.page_stamp = self.book.page_stamp(self.date);
     }
 
-    fn load_hidden(&mut self) {
-        match self.book.hidden() {
-            Ok(hidden) => self.hidden = hidden,
-            Err(e) => self.status = Some(Status::Error(format!("Скрытые от ИИ списки: {e:#}"))),
+    fn load_registry(&mut self) {
+        match self.book.lists() {
+            Ok(lists) => self.registry = lists,
+            Err(e) => self.status = Some(Status::Error(format!("Списки: {e:#}"))),
         }
-        self.hidden_stamp = self.book.hidden_stamp();
+        self.lists_stamp = self.book.lists_stamp();
+        if !self.shown.is_empty() {
+            self.refresh_shown();
+        }
+    }
+
+    /// Меняет реестр списков и сохраняет его; ошибка — в строку состояния.
+    fn edit_registry(&mut self, edit: impl FnOnce(&mut Lists) -> anyhow::Result<()>) -> bool {
+        let mut lists = self.registry.clone();
+        let result = edit(&mut lists).and_then(|()| self.book.save_lists(&lists));
+        self.lists_stamp = self.book.lists_stamp();
+        match result {
+            Ok(()) => {
+                self.registry = lists;
+                self.refresh_shown();
+                true
+            }
+            Err(e) => {
+                self.status = Some(Status::Error(format!("{e:#}")));
+                false
+            }
+        }
     }
 
     /// Скрыт ли список от ИИ.
-    pub fn is_hidden(&self, category: Category) -> bool {
-        self.hidden[category.index()]
+    pub fn is_hidden(&self, category: ListId) -> bool {
+        self.registry.is_hidden(category)
+    }
+
+    fn toggle_hidden_of(&mut self, category: ListId) {
+        let hidden = !self.is_hidden(category);
+        if self.edit_registry(|lists| lists.set_hidden(category, hidden)) {
+            let what = if hidden { "скрыт от ИИ" } else { "открыт для ИИ" };
+            self.status = Some(Status::Info(format!("Список «{}» {what}", self.list_title(category))));
+        }
     }
 
     fn toggle_hidden(&mut self) {
-        let mut hidden = self.hidden;
-        hidden[self.active.index()] ^= true;
-        match self.book.set_hidden(hidden) {
-            Ok(()) => {
-                self.hidden = hidden;
-                let what = if hidden[self.active.index()] { "скрыт от ИИ" } else { "открыт для ИИ" };
-                self.status = Some(Status::Info(format!("Список «{}» {what}", self.active.title())));
-            }
-            Err(e) => self.status = Some(Status::Error(format!("Скрытые от ИИ списки: {e:#}"))),
-        }
-        self.hidden_stamp = self.book.hidden_stamp();
+        self.toggle_hidden_of(self.active);
     }
 
     fn toggle_private(&mut self) {
@@ -483,7 +544,7 @@ impl App {
 
     /// Задача, как её найти снова после перечитывания страницы: по id, иначе по тексту —
     /// сначала среди задач без id, потом среди всех (снаружи ей могли дать id).
-    fn find_task(&self, category: Category, task: &Task) -> Option<usize> {
+    fn find_task(&self, category: ListId, task: &Task) -> Option<usize> {
         let list = self.board.list(category);
         match &task.id {
             Some(id) => list.iter().position(|t| t.id.as_ref() == Some(id)),
@@ -499,11 +560,13 @@ impl App {
     /// Возвращает, было ли что перечитывать.
     pub fn check_external(&mut self) -> bool {
         let mut changed = false;
-        if self.book.hidden_stamp() != self.hidden_stamp {
-            self.load_hidden();
+        let lists_changed = self.book.lists_stamp() != self.lists_stamp;
+        if lists_changed {
+            self.load_registry();
             changed = true;
         }
-        if self.book.page_stamp(self.date) != self.page_stamp {
+        // Страница зависит от реестра (названия, архивные списки) — перечитываем и её.
+        if lists_changed || self.book.page_stamp(self.date) != self.page_stamp {
             self.reload_page();
             changed = true;
         }
@@ -521,9 +584,10 @@ impl App {
 
     fn reload_page(&mut self) {
         // Что было выделено и что правится — чтобы найти те же задачи на перечитанной странице.
-        let selected: Vec<Option<Task>> = Category::ALL
+        let selected: HashMap<ListId, Task> = self
+            .lists
             .iter()
-            .map(|&c| self.lists[c.index()].selected().and_then(|i| self.board.list(c).get(i).cloned()))
+            .filter_map(|(&c, state)| Some((c, self.board.list(c).get(state.selected()?)?.clone())))
             .collect();
         let editing = match &self.mode {
             Mode::Edit { index: Some(i), .. } | Mode::Date { purpose: DatePurpose::Postpone(i), .. } => {
@@ -547,14 +611,14 @@ impl App {
         }
         self.page_stamp = self.book.page_stamp(self.date);
 
-        for category in Category::ALL {
-            let index = selected[category.index()].as_ref().and_then(|t| self.find_task(category, t));
-            self.lists[category.index()].select(index);
-            self.clamp_selection(category);
+        for (&category, task) in &selected {
+            let index = self.find_task(category, task);
+            self.lists.entry(category).or_default().select(index);
         }
+        self.refresh_shown();
         let editing = editing.map(|t| self.find_task(self.active, &t));
-        let selected_gone = selected[self.active.index()]
-            .as_ref()
+        let selected_gone = selected
+            .get(&self.active)
             .is_some_and(|t| self.find_task(self.active, t).is_none());
         match &mut self.mode {
             Mode::Edit { index: Some(i), .. } | Mode::Date { purpose: DatePurpose::Postpone(i), .. } => {
@@ -566,7 +630,7 @@ impl App {
                     }
                 }
             }
-            Mode::ConfirmDelete | Mode::MoveTo if selected_gone => self.mode = Mode::Normal,
+            Mode::ConfirmDelete | Mode::MoveTo(_) if selected_gone => self.mode = Mode::Normal,
             _ => {}
         }
         if let (Some(task), Some(view)) = (notes_task, &self.notes) {
@@ -682,7 +746,8 @@ impl App {
             Mode::Edit { .. } => self.on_key_edit(press),
             Mode::Date { .. } => self.on_key_date(press),
             Mode::ConfirmDelete => self.on_key_confirm(press),
-            Mode::MoveTo => self.on_key_move_to(press),
+            Mode::MoveTo(_) => self.on_key_move_to(press),
+            Mode::Lists { .. } => self.on_key_lists(press),
             Mode::Settings(_) => self.on_key_settings(press),
         }
     }
@@ -694,7 +759,8 @@ impl App {
             .notes
             .as_ref()
             .is_some_and(|v| matches!(v.mode, NotesMode::Edit { .. } | NotesMode::Text(Draft { confirm_close: false, .. })));
-        notes_field || (self.notes.is_none() && matches!(self.mode, Mode::Edit { .. } | Mode::Date { .. }))
+        let lists_field = matches!(self.mode, Mode::Lists { sub: ListsMode::Add(_) | ListsMode::Rename(_), .. });
+        notes_field || (self.notes.is_none() && (lists_field || matches!(self.mode, Mode::Edit { .. } | Mode::Date { .. })))
     }
 
     /// Тап (щелчок) и свайп (прокрутка): что под пальцем — по карте попаданий кадра.
@@ -770,6 +836,25 @@ impl App {
             self.toggle_setting(Setting::ALL[i]);
             return;
         }
+        // Тап по варианту в окне выбора: перенести туда задачу, выделить строку списков,
+        // перенести туда задачи удаляемого списка.
+        if let Hit::Pick(i) = hit {
+            match &mut self.mode {
+                Mode::MoveTo(_) => {
+                    self.mode = Mode::Normal;
+                    if let Some(&to) = self.move_targets().get(i) {
+                        self.move_task_to(to);
+                    }
+                }
+                Mode::Lists { row, sub: ListsMode::Browse } => *row = i,
+                Mode::Lists { sub: ListsMode::Delete { target, count }, .. } if *count > 0 => {
+                    *target = i;
+                    self.on_key_lists(Press::from(KeyEvent::from(KeyCode::Enter)));
+                }
+                _ => {}
+            }
+            return;
+        }
         if !matches!(self.mode, Mode::Normal) {
             return;
         }
@@ -835,21 +920,29 @@ impl App {
         if edits && !self.editable() {
             return;
         }
-        let list = &mut self.lists[self.active.index()];
         match action {
             Action::Quit => self.quit = true,
             Action::Help => self.show_help = true,
             Action::About => self.show_about = true,
-            Action::List(i) => self.active = Category::from_index(i).unwrap_or(self.active),
-            Action::NextList => self.active = self.active.next(),
-            Action::PrevList => self.active = self.active.prev(),
+            Action::List(i) => {
+                if let Some(&c) = self.shown.get(i) {
+                    self.active = c;
+                }
+            }
+            Action::NextList => self.cycle_list(true),
+            Action::PrevList => self.cycle_list(false),
+            Action::ListLeft | Action::ListRight | Action::ListUp | Action::ListDown => self.grid_move(action),
+            Action::Lists => {
+                let row = self.list_rows().iter().position(|&c| c == self.active).unwrap_or(0);
+                self.mode = Mode::Lists { row, sub: ListsMode::Browse };
+            }
             // select_previous/next у пустого списка выставляют индекс за границей — поправляем.
             Action::Up => {
-                list.select_previous();
+                self.list_state(self.active).select_previous();
                 self.clamp_selection(self.active);
             }
             Action::Down => {
-                list.select_next();
+                self.list_state(self.active).select_next();
                 self.clamp_selection(self.active);
             }
             Action::Top => self.select(self.active, Some(0)),
@@ -882,7 +975,13 @@ impl App {
             Action::MoveUp => self.move_task(Board::move_up),
             Action::MoveDown => self.move_task(Board::move_down),
             Action::Postpone => self.start_postpone(),
-            Action::MoveTo if self.selected_task().is_some() => self.mode = Mode::MoveTo,
+            Action::MoveTo if self.selected_task().is_some() => {
+                if self.move_targets().is_empty() {
+                    self.status = Some(Status::Info("Других списков нет".into()));
+                } else {
+                    self.mode = Mode::MoveTo(0);
+                }
+            }
             Action::Delete if self.selected_task().is_some() => self.mode = Mode::ConfirmDelete,
             Action::Notes => self.open_notes(),
             Action::TogglePrivate => self.toggle_private(),
@@ -1037,12 +1136,66 @@ impl App {
         self.preview.as_ref()
     }
 
-    fn on_key_move_to(&mut self, press: Press) {
-        self.mode = Mode::Normal;
-        let KeyCode::Char(c @ '1'..='4') = press.hotkey.code else {
+    /// Следующий / предыдущий список на экране, по кругу.
+    fn cycle_list(&mut self, forward: bool) {
+        let n = self.shown.len();
+        let i = self.shown.iter().position(|&c| c == self.active).unwrap_or(0);
+        self.active = self.shown[if forward { (i + 1) % n } else { (i + n - 1) % n }];
+    }
+
+    /// Соседний список в сетке; на узком экране, где списки — вкладки, — соседняя вкладка.
+    fn grid_move(&mut self, action: Action) {
+        let n = self.shown.len();
+        let Some(i) = self.shown.iter().position(|&c| c == self.active) else {
             return;
         };
-        let to = Category::from_index(c as usize - '1' as usize).unwrap();
+        if self.width > 0 && self.width < crate::ui::NARROW {
+            return self.cycle_list(matches!(action, Action::ListRight | Action::ListDown));
+        }
+        let (cols, rows) = crate::ui::grid(n);
+        let j = match action {
+            Action::ListLeft => (i % cols > 0).then(|| i - 1),
+            Action::ListRight => (i % cols + 1 < cols && i + 1 < n).then_some(i + 1),
+            Action::ListUp => i.checked_sub(cols),
+            // В неполный последний ряд — на его последний список.
+            Action::ListDown => (i + cols < n).then_some(i + cols).or((i / cols + 1 < rows).then_some(n - 1)),
+            _ => None,
+        };
+        if let Some(j) = j {
+            self.active = self.shown[j];
+        }
+    }
+
+    /// Куда можно перенести задачу: списки на экране из реестра, кроме текущего.
+    pub fn move_targets(&self) -> Vec<ListId> {
+        self.registry.active().into_iter().filter(|&c| c != self.active).collect()
+    }
+
+    fn on_key_move_to(&mut self, press: Press) {
+        let targets = self.move_targets();
+        let Mode::MoveTo(selected) = &mut self.mode else {
+            return;
+        };
+        let to = match press.hotkey.code {
+            KeyCode::Char(c @ '1'..='9') => targets.get(c as usize - '1' as usize).copied(),
+            KeyCode::Enter => targets.get(*selected).copied(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                *selected = (*selected + 1).min(targets.len().saturating_sub(1));
+                return;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                *selected = selected.saturating_sub(1);
+                return;
+            }
+            _ => None,
+        };
+        self.mode = Mode::Normal;
+        if let Some(to) = to {
+            self.move_task_to(to);
+        }
+    }
+
+    fn move_task_to(&mut self, to: ListId) {
         let Some(index) = self.selected() else {
             return;
         };
@@ -1057,7 +1210,178 @@ impl App {
             self.clamp_selection(from);
             self.select(to, Some(new_index));
             self.save();
+            self.refresh_shown();
         }
+    }
+
+    /// Строки окна списков: те, что на экране, по порядку, затем архивные.
+    pub fn list_rows(&self) -> Vec<ListId> {
+        let mut rows = self.registry.active();
+        rows.extend(self.registry.all().iter().filter(|d| d.archived).map(|d| d.id));
+        rows
+    }
+
+    /// Куда перенести задачи удаляемого списка.
+    pub fn delete_targets(&self, list: ListId) -> Vec<ListId> {
+        self.registry.active().into_iter().filter(|&c| c != list).collect()
+    }
+
+    /// Окно списков. Состояние вынимается из `mode` на время обработки и кладётся обратно,
+    /// если окно не закрыли.
+    fn on_key_lists(&mut self, press: Press) {
+        let Mode::Lists { row, sub } = std::mem::replace(&mut self.mode, Mode::Normal) else {
+            return;
+        };
+        let rows = self.list_rows();
+        let mut row = row.min(rows.len() - 1);
+        let list = rows[row];
+        let archived = !self.registry.is_active(list);
+        let code = press.hotkey.code;
+        let sub = match sub {
+            ListsMode::Browse => match (code, press.hotkey.modifiers.contains(KeyModifiers::SHIFT)) {
+                (KeyCode::Up | KeyCode::Down, true) => {
+                    let up = code == KeyCode::Up;
+                    let mut moved = false;
+                    self.edit_registry(|lists| {
+                        moved = lists.shift(list, up);
+                        Ok(())
+                    });
+                    if moved {
+                        row = if up { row - 1 } else { row + 1 };
+                    }
+                    ListsMode::Browse
+                }
+                (KeyCode::Char('j') | KeyCode::Down, _) => {
+                    row = (row + 1).min(rows.len() - 1);
+                    ListsMode::Browse
+                }
+                (KeyCode::Char('k') | KeyCode::Up, _) => {
+                    row = row.saturating_sub(1);
+                    ListsMode::Browse
+                }
+                (KeyCode::Char('a'), _) => ListsMode::Add(LineInput::default()),
+                (KeyCode::Char('e') | KeyCode::Enter, _) if !archived => {
+                    ListsMode::Rename(LineInput::new(self.list_title(list).to_string()))
+                }
+                (KeyCode::Char('r'), _) if archived => {
+                    if self.edit_registry(|lists| lists.restore(list)) {
+                        row = self.registry.active().len() - 1;
+                        self.status = Some(Status::Info(format!("Список «{}» снова на экране", self.list_title(list))));
+                    }
+                    ListsMode::Browse
+                }
+                (KeyCode::Char('d') | KeyCode::Delete, _) if !archived => self.start_delete(list),
+                (KeyCode::Char('p' | 'P'), _) => {
+                    self.toggle_hidden_of(list);
+                    ListsMode::Browse
+                }
+                (KeyCode::Esc | KeyCode::Char('q' | 'L'), _) => return,
+                _ => ListsMode::Browse,
+            },
+            ListsMode::Add(mut input) => match edit_line(&mut input, &press) {
+                Some(KeyCode::Enter) => {
+                    let id = ListId::new(&self.book.new_id());
+                    let title = input.text().to_string();
+                    if self.edit_registry(|lists| lists.add(id, &title)) {
+                        row = self.registry.active().len() - 1;
+                        self.status = Some(Status::Info(format!("Список «{}» добавлен", self.list_title(id))));
+                        ListsMode::Browse
+                    } else {
+                        ListsMode::Add(input)
+                    }
+                }
+                Some(_) => ListsMode::Browse,
+                None => ListsMode::Add(input),
+            },
+            ListsMode::Rename(mut input) => match edit_line(&mut input, &press) {
+                Some(KeyCode::Enter) => {
+                    let title = input.text().to_string();
+                    if self.edit_registry(|lists| lists.rename(list, &title)) {
+                        ListsMode::Browse
+                    } else {
+                        ListsMode::Rename(input)
+                    }
+                }
+                Some(_) => ListsMode::Browse,
+                None => ListsMode::Rename(input),
+            },
+            ListsMode::Delete { count: 0, .. } => {
+                if matches!(code, KeyCode::Char('y') | KeyCode::Enter) {
+                    self.finish_delete(list, None);
+                    row = row.min(self.list_rows().len() - 1);
+                }
+                ListsMode::Browse
+            }
+            ListsMode::Delete { count, mut target } => {
+                let targets = self.delete_targets(list);
+                let to = match code {
+                    KeyCode::Char(c @ '1'..='9') => targets.get(c as usize - '1' as usize).copied(),
+                    KeyCode::Enter => targets.get(target).copied(),
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        target = (target + 1).min(targets.len() - 1);
+                        None
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        target = target.saturating_sub(1);
+                        None
+                    }
+                    _ => {
+                        self.mode = Mode::Lists { row, sub: ListsMode::Browse };
+                        return;
+                    }
+                };
+                match to {
+                    Some(to) => {
+                        self.finish_delete(list, Some(to));
+                        row = row.min(self.list_rows().len() - 1);
+                        ListsMode::Browse
+                    }
+                    None => ListsMode::Delete { count, target },
+                }
+            }
+        };
+        self.mode = Mode::Lists { row, sub };
+    }
+
+    /// `d` в окне списков: последний не удаляется; есть задачи на сегодня и дальше — сначала
+    /// выбрать, куда их перенести.
+    fn start_delete(&mut self, list: ListId) -> ListsMode {
+        if self.registry.active().len() == 1 {
+            self.status = Some(Status::Error("Последний список удалить нельзя".into()));
+            return ListsMode::Browse;
+        }
+        match self.book.tasks_since(list, self.today) {
+            Ok(count) => ListsMode::Delete { count, target: 0 },
+            Err(e) => {
+                self.status = Some(Status::Error(format!("Удаление списка: {e:#}")));
+                ListsMode::Browse
+            }
+        }
+    }
+
+    /// Удаление списка: задачи с сегодняшней страницы и дальше — в `to`; если задачи в нём
+    /// когда-нибудь были, он уходит в архив (прошлые страницы показывают его как было),
+    /// иначе удаляется совсем.
+    fn finish_delete(&mut self, list: ListId, to: Option<ListId>) {
+        let title = self.list_title(list).to_string();
+        let moved = match to.map(|to| self.book.move_list_tasks(list, to, self.today)) {
+            Some(Err(e)) => {
+                self.status = Some(Status::Error(format!("Удаление списка: {e:#}")));
+                return;
+            }
+            Some(Ok(n)) => n,
+            None => 0,
+        };
+        let used = moved > 0 || self.book.list_used(list).unwrap_or(true);
+        if !self.edit_registry(|lists| if used { lists.archive(list) } else { lists.remove(list) }) {
+            return;
+        }
+        self.reload_page();
+        self.status = Some(Status::Info(match to {
+            Some(to) if moved > 0 => format!("Список «{title}» удалён, задачи ({moved}) — в «{}»", self.list_title(to)),
+            _ if used => format!("Список «{title}» удалён; на прошлых страницах он остался"),
+            _ => format!("Список «{title}» удалён"),
+        }));
     }
 
     /// Окно даты для переноса; по умолчанию — день после открытой страницы, но не раньше
@@ -1163,7 +1487,7 @@ impl App {
     }
 
     /// Сдвиг внутри списка (`Board::move_up` / `move_down`).
-    fn move_task(&mut self, shift: fn(&mut Board, Category, usize) -> Option<usize>) {
+    fn move_task(&mut self, shift: fn(&mut Board, ListId, usize) -> Option<usize>) {
         let Some(index) = self.selected() else {
             return;
         };
@@ -1582,7 +1906,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(app.book.dir());
     }
 
-    fn texts(app: &App, category: Category) -> Vec<String> {
+    fn texts(app: &App, category: ListId) -> Vec<String> {
         app.board.list(category).iter().map(|t| t.text.clone()).collect()
     }
 
@@ -1595,41 +1919,43 @@ mod tests {
             type_text(&mut app, text);
             press(&mut app, KeyCode::Enter);
         }
-        assert_eq!(texts(&app, Category::Work), ["первая", "вторая"]);
+        assert_eq!(texts(&app, ListId::WORK), ["первая", "вторая"]);
         assert_eq!(app.selected(), Some(1));
 
         press_with(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
-        assert_eq!(texts(&app, Category::Work), ["вторая", "первая"]);
+        assert_eq!(texts(&app, ListId::WORK), ["вторая", "первая"]);
         assert_eq!(app.selected(), Some(0));
         // J/K больше не сдвигают.
         press(&mut app, KeyCode::Char('J'));
-        assert_eq!(texts(&app, Category::Work), ["вторая", "первая"]);
+        assert_eq!(texts(&app, ListId::WORK), ["вторая", "первая"]);
 
         // Выполненная — вниз, выделение — на следующей задаче.
         press(&mut app, KeyCode::Char(' '));
-        assert_eq!(texts(&app, Category::Work), ["первая", "вторая"]);
-        assert_eq!(app.board.list(Category::Work)[1].state, State::Done);
+        assert_eq!(texts(&app, ListId::WORK), ["первая", "вторая"]);
+        assert_eq!(app.board.list(ListId::WORK)[1].state, State::Done);
         assert_eq!(app.selected(), Some(0));
         // Снятая отметка — в конец открытых, выделение за ней.
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char(' '));
-        assert_eq!(app.board.list(Category::Work)[1].state, State::Open);
+        assert_eq!(app.board.list(ListId::WORK)[1].state, State::Open);
         assert_eq!(app.selected(), Some(1));
         press(&mut app, KeyCode::Char(' '));
 
         press(&mut app, KeyCode::Char('j'));
+        // m — окно выбора без текущего списка: Дом, Личное, Прочее.
         press(&mut app, KeyCode::Char('m'));
-        press(&mut app, KeyCode::Char('3'));
-        assert_eq!(texts(&app, Category::Work), ["первая"]);
-        assert_eq!(texts(&app, Category::Personal), ["вторая"]);
-        assert_eq!(app.lists[Category::Personal.index()].selected(), Some(0));
+        assert!(matches!(app.mode, Mode::MoveTo(0)));
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(texts(&app, ListId::WORK), ["первая"]);
+        assert_eq!(texts(&app, ListId::PERSONAL), ["вторая"]);
+        assert_eq!(app.lists[&ListId::PERSONAL].selected(), Some(0));
 
         press(&mut app, KeyCode::Char('d'));
         press(&mut app, KeyCode::Char('n'));
-        assert_eq!(texts(&app, Category::Work), ["первая"]);
+        assert_eq!(texts(&app, ListId::WORK), ["первая"]);
         press(&mut app, KeyCode::Char('d'));
         press(&mut app, KeyCode::Char('y'));
-        assert!(app.board.list(Category::Work).is_empty());
+        assert!(app.board.list(ListId::WORK).is_empty());
         assert_eq!(app.selected(), None);
 
         assert_eq!(app.book.load(d(26)).unwrap(), app.board);
@@ -1648,19 +1974,19 @@ mod tests {
         press(&mut app, KeyCode::Char('g'));
         // Отменённая — вниз, выделение на следующей.
         press(&mut app, KeyCode::Char('c'));
-        assert_eq!(texts(&app, Category::Work), ["два", "раз"]);
-        assert_eq!(app.board.list(Category::Work)[1].state, State::Cancelled);
+        assert_eq!(texts(&app, ListId::WORK), ["два", "раз"]);
+        assert_eq!(app.board.list(ListId::WORK)[1].state, State::Cancelled);
         assert_eq!(app.selected(), Some(0));
         assert_eq!(app.book.load(d(26)).unwrap(), app.board);
         // Повторно — снова открыта, выделение за ней; «с» в русской раскладке — та же клавиша.
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('с'));
-        assert!(app.board.list(Category::Work)[1].is_open());
+        assert!(app.board.list(ListId::WORK)[1].is_open());
         assert_eq!(app.selected(), Some(1));
         // Отменённую всё-таки сделали.
         press(&mut app, KeyCode::Char('c'));
         press(&mut app, KeyCode::Char(' '));
-        assert_eq!(app.board.list(Category::Work)[1].state, State::Done);
+        assert_eq!(app.board.list(ListId::WORK)[1].state, State::Done);
         // Отменённая не переносится.
         press(&mut app, KeyCode::Char('c'));
         press(&mut app, KeyCode::Char('>'));
@@ -1675,13 +2001,13 @@ mod tests {
         press(&mut app, KeyCode::Char('ф'));
         type_text(&mut app, "фото");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(texts(&app, Category::Work), ["фото"]);
+        assert_eq!(texts(&app, ListId::WORK), ["фото"]);
         // «ч» — x: выполнено; «в» + «н» — d + y: удалить.
         press(&mut app, KeyCode::Char('ч'));
-        assert_eq!(app.board.list(Category::Work)[0].state, State::Done);
+        assert_eq!(app.board.list(ListId::WORK)[0].state, State::Done);
         press(&mut app, KeyCode::Char('в'));
         press(&mut app, KeyCode::Char('н'));
-        assert!(app.board.list(Category::Work).is_empty());
+        assert!(app.board.list(ListId::WORK).is_empty());
         // Ctrl+W в поле ввода в русской раскладке.
         press(&mut app, KeyCode::Char('ф'));
         type_text(&mut app, "два слова");
@@ -1706,19 +2032,19 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         type_text(&mut app, " течёт");
         press(&mut app, KeyCode::Esc);
-        assert_eq!(texts(&app, Category::Home), ["кран"]);
+        assert_eq!(texts(&app, ListId::HOME), ["кран"]);
 
         press(&mut app, KeyCode::Char('e'));
         press(&mut app, KeyCode::Home);
         app.on_paste("Починить\n ");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(texts(&app, Category::Home), ["Починить кран"]);
+        assert_eq!(texts(&app, ListId::HOME), ["Починить кран"]);
 
         // Пустой ввод не создаёт задачу.
         press(&mut app, KeyCode::Char('a'));
         type_text(&mut app, "   ");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(texts(&app, Category::Home).len(), 1);
+        assert_eq!(texts(&app, ListId::HOME).len(), 1);
         cleanup(app);
     }
 
@@ -1734,18 +2060,18 @@ mod tests {
         let Mode::Date { input, .. } = &app.mode else { panic!() };
         assert_eq!(input.text(), "2026-10-27");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.board.list(Category::Work)[0].state, State::Migrated(d(27)));
+        assert_eq!(app.board.list(ListId::WORK)[0].state, State::Migrated(d(27)));
         assert!(matches!(app.status, Some(Status::Info(_))));
         // Перенесённую не отметить и не перенести второй раз.
         press(&mut app, KeyCode::Char(' '));
-        assert_eq!(app.board.list(Category::Work)[0].state, State::Migrated(d(27)));
+        assert_eq!(app.board.list(ListId::WORK)[0].state, State::Migrated(d(27)));
         press(&mut app, KeyCode::Char('>'));
         assert!(matches!(app.mode, Mode::Normal));
 
         press(&mut app, KeyCode::PageDown);
         assert_eq!(app.date, d(27));
-        assert_eq!(texts(&app, Category::Work), ["позвонить"]);
-        assert!(app.board.list(Category::Work)[0].is_open());
+        assert_eq!(texts(&app, ListId::WORK), ["позвонить"]);
+        assert!(app.board.list(ListId::WORK)[0].is_open());
 
         // Переход к дате: не дата — окно остаётся открытым.
         press(&mut app, KeyCode::Char('D'));
@@ -1793,10 +2119,10 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         app.on_new_day(d(27));
         assert_eq!(app.date, d(27));
-        assert_eq!(texts(&app, Category::Work), ["недоделано"]);
+        assert_eq!(texts(&app, ListId::WORK), ["недоделано"]);
         assert!(matches!(app.status, Some(Status::Info(_))));
         press(&mut app, KeyCode::Char('['));
-        assert_eq!(app.board.list(Category::Work)[0].state, State::Migrated(d(27)));
+        assert_eq!(app.board.list(ListId::WORK)[0].state, State::Migrated(d(27)));
         cleanup(app);
     }
 
@@ -1809,7 +2135,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
 
         // id у задачи с самого начала; открыли и закрыли без записей — файла записей нет.
-        let first_id = app.board.list(Category::Home)[0].id.clone().expect("id при создании");
+        let first_id = app.board.list(ListId::HOME)[0].id.clone().expect("id при создании");
         press(&mut app, KeyCode::Char('n'));
         assert!(app.notes.is_some());
         press(&mut app, KeyCode::Esc);
@@ -1828,9 +2154,9 @@ mod tests {
         press(&mut app, KeyCode::Char('k'));
         press(&mut app, KeyCode::Char('x'));
 
-        let id = app.board.list(Category::Home)[0].id.clone().unwrap();
+        let id = app.board.list(ListId::HOME)[0].id.clone().unwrap();
         assert_eq!(id, first_id);
-        assert_eq!(app.board.list(Category::Home)[0].state, State::Open);
+        assert_eq!(app.board.list(ListId::HOME)[0].state, State::Open);
         let notes = app.book.load_notes(&id).unwrap().serialize();
         let lines: Vec<&str> = notes.lines().collect();
         assert_eq!(lines[0], "- [x] купить прокладку");
@@ -1873,13 +2199,13 @@ mod tests {
         type_text(&mut app, "начал");
         save_note(&mut app);
         press(&mut app, KeyCode::Esc);
-        let id = app.board.list(Category::Work)[0].id.clone().unwrap();
+        let id = app.board.list(ListId::WORK)[0].id.clone().unwrap();
 
         // Перенос — копия с теми же записями.
         press(&mut app, KeyCode::Char('>'));
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char(']'));
-        assert_eq!(app.board.list(Category::Work)[0].id.as_deref(), Some(id.as_str()));
+        assert_eq!(app.board.list(ListId::WORK)[0].id.as_deref(), Some(id.as_str()));
         assert!(app.summaries.contains_key(&id));
 
         // Удалили копию — запись [>] на 26-м осталась, записи на месте.
@@ -1921,7 +2247,7 @@ mod tests {
         let item = view.notes.item(0);
         assert_eq!(item.head, "мастер сказал:");
         assert_eq!(item.body, ["менять целиком", "", "и ещё", "две строки"]);
-        let id = app.board.list(Category::Work)[0].id.clone().unwrap();
+        let id = app.board.list(ListId::WORK)[0].id.clone().unwrap();
         let file = app.book.load_notes(&id).unwrap().serialize();
         assert!(file.ends_with(" мастер сказал:\n  менять целиком\n\n  и ещё\n  две строки\n"), "{file}");
 
@@ -1955,7 +2281,7 @@ mod tests {
 
     /// Текст первой заметки в файле записей задачи из «Работы».
     fn saved_note(app: &App) -> Option<String> {
-        let id = app.board.list(Category::Work)[0].id.clone()?;
+        let id = app.board.list(ListId::WORK)[0].id.clone()?;
         let notes = app.book.load_notes(&id).unwrap();
         notes.visible().first().map(|&i| notes.editable_text(i))
     }
@@ -2055,38 +2381,147 @@ mod tests {
     }
 
     #[test]
+    fn lists_window() {
+        let mut app = test_app("lists");
+        // L, a — новый список в конец; его клавиша — 5.
+        press(&mut app, KeyCode::Char('L'));
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.wants_text());
+        type_text(&mut app, "Ремонт");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.shown.len(), 5);
+        let repair = app.shown[4];
+        assert_eq!(app.list_title(repair), "Ремонт");
+        assert!(matches!(app.mode, Mode::Lists { row: 4, sub: ListsMode::Browse }));
+        // Занятое название — ошибка, поле остаётся открытым.
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "дом");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.status, Some(Status::Error(_))));
+        assert!(matches!(app.mode, Mode::Lists { sub: ListsMode::Add(_), .. }));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+
+        // Задачи в новом списке: сегодня и на прошлой странице.
+        press(&mut app, KeyCode::Char('5'));
+        assert_eq!(app.active, repair);
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "плитка");
+        press(&mut app, KeyCode::Enter);
+        let mut past = Board::default();
+        past.push(repair, Task::new("замер"));
+        app.book.save(d(25), &past).unwrap();
+
+        // Переименовать, сдвинуть выше.
+        press(&mut app, KeyCode::Char('L'));
+        press(&mut app, KeyCode::Char('e'));
+        press_with(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        type_text(&mut app, "Ванная");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.list_title(repair), "Ванная");
+        press_with(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!(app.registry.active()[3], repair);
+        assert!(matches!(app.mode, Mode::Lists { row: 3, .. }));
+
+        // Удалить: задачу с сегодняшней страницы — в выбранный список, сам список — в архив.
+        press(&mut app, KeyCode::Char('d'));
+        assert!(matches!(app.mode, Mode::Lists { sub: ListsMode::Delete { count: 1, .. }, .. }));
+        press(&mut app, KeyCode::Char('1'));
+        assert!(!app.registry.is_active(repair) && app.registry.get(repair).is_some());
+        assert_eq!(texts(&app, ListId::WORK), ["плитка"]);
+        assert!(!app.shown.contains(&repair));
+        // На прошлой странице список виден как был.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('['));
+        assert!(app.shown.contains(&repair));
+        assert_eq!(texts(&app, repair), ["замер"]);
+
+        // Пустой список удаляется совсем, после подтверждения.
+        press(&mut app, KeyCode::Char('L'));
+        press(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "Пустой");
+        press(&mut app, KeyCode::Enter);
+        let empty = *app.registry.active().last().unwrap();
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.registry.get(empty).is_none());
+
+        // Архивный — обратно на экран.
+        let row = app.list_rows().iter().position(|&c| c == repair).unwrap();
+        if let Mode::Lists { row: r, .. } = &mut app.mode {
+            *r = row;
+        }
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.registry.is_active(repair));
+        // Всё сохранено в реестре.
+        assert_eq!(app.book.lists().unwrap(), app.registry);
+        cleanup(app);
+    }
+
+    #[test]
+    fn grid_navigation() {
+        let mut app = test_app("grid");
+        // Шесть списков — сетка 3×2: 1 2 3 / 4 5 6.
+        for title in ["Пятый", "Шестой"] {
+            press(&mut app, KeyCode::Char('L'));
+            press(&mut app, KeyCode::Char('a'));
+            type_text(&mut app, title);
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Esc);
+        }
+        app.width = 100;
+        let at = |app: &App| app.shown.iter().position(|&c| c == app.active).unwrap();
+        press(&mut app, KeyCode::Char('l'));
+        press(&mut app, KeyCode::Right);
+        assert_eq!(at(&app), 2);
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(at(&app), 2);
+        press_with(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+        assert_eq!(at(&app), 5);
+        press(&mut app, KeyCode::Char('h'));
+        press_with(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
+        assert_eq!(at(&app), 1);
+        press(&mut app, KeyCode::Char('6'));
+        assert_eq!(at(&app), 5);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(at(&app), 0);
+        cleanup(app);
+    }
+
+    #[test]
     fn privacy() {
         let mut app = test_app("privacy");
         press(&mut app, KeyCode::Char('3'));
         press(&mut app, KeyCode::Char('a'));
         type_text(&mut app, "личное дело");
         press(&mut app, KeyCode::Enter);
-        // P — список скрыт, настройка в AI_HIDDEN.md.
+        // P — список скрыт, пометка в реестре списков.
         press(&mut app, KeyCode::Char('P'));
-        assert!(app.is_hidden(Category::Personal));
-        assert_eq!(app.book.hidden().unwrap(), [false, false, true, false]);
+        assert!(app.is_hidden(ListId::PERSONAL));
+        assert!(app.book.lists().unwrap().is_hidden(ListId::PERSONAL));
 
         // Из скрытого в открытый — задача уходит скрытой.
         press(&mut app, KeyCode::Char('m'));
         press(&mut app, KeyCode::Char('1'));
-        let task = &app.board.list(Category::Work)[0];
+        let task = &app.board.list(ListId::WORK)[0];
         assert!(task.private);
         // p — открыть; из открытого в скрытый — пометка не нужна, скрыт сам список.
         press(&mut app, KeyCode::Char('1'));
         press(&mut app, KeyCode::Char('p'));
-        assert!(!app.board.list(Category::Work)[0].private);
+        assert!(!app.board.list(ListId::WORK)[0].private);
         press(&mut app, KeyCode::Char('m'));
-        press(&mut app, KeyCode::Char('3'));
-        assert!(!app.board.list(Category::Personal)[0].private);
+        press(&mut app, KeyCode::Char('2'));
+        assert!(!app.board.list(ListId::PERSONAL)[0].private);
         // Пометка сохраняется в файле и едет при переносе на дату.
         press(&mut app, KeyCode::Char('3'));
         press(&mut app, KeyCode::Char('m'));
         press(&mut app, KeyCode::Char('2'));
         press(&mut app, KeyCode::Char('2'));
-        assert!(app.board.list(Category::Home)[0].private);
+        assert!(app.board.list(ListId::HOME)[0].private);
         press(&mut app, KeyCode::Char('>'));
         press(&mut app, KeyCode::Enter);
-        assert!(app.book.load(d(27)).unwrap().list(Category::Home)[0].private);
+        assert!(app.book.load(d(27)).unwrap().list(ListId::HOME)[0].private);
         cleanup(app);
     }
 
@@ -2121,30 +2556,30 @@ mod tests {
 
         // Агент дописал задачу в начало — выделение остаётся на «вторая».
         let mut board = app.book.load(d(26)).unwrap();
-        board.push(Category::Work, Task::new("от агента"));
-        board.move_up(Category::Work, 2);
-        board.move_up(Category::Work, 1);
+        board.push(ListId::WORK, Task::new("от агента"));
+        board.move_up(ListId::WORK, 2);
+        board.move_up(ListId::WORK, 1);
         app.book.save(d(26), &board).unwrap();
         assert!(app.check_external());
-        assert_eq!(texts(&app, Category::Work), ["от агента", "первая", "вторая"]);
+        assert_eq!(texts(&app, ListId::WORK), ["от агента", "первая", "вторая"]);
         assert_eq!(app.selected(), Some(2));
         assert!(matches!(app.status, Some(Status::Info(_))));
 
         // Правка задачи, пока агент переставил задачи: правится та же задача.
         press(&mut app, KeyCode::Char('e'));
         let mut board = app.book.load(d(26)).unwrap();
-        board.move_up(Category::Work, 2);
+        board.move_up(ListId::WORK, 2);
         app.book.save(d(26), &board).unwrap();
         type_text(&mut app, "!");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(texts(&app, Category::Work), ["от агента", "вторая!", "первая"]);
+        assert_eq!(texts(&app, ListId::WORK), ["от агента", "вторая!", "первая"]);
 
         // Записи: агент добавил заметку, пока пишем свою, — обе на месте.
         press(&mut app, KeyCode::Char('n'));
         press(&mut app, KeyCode::Char('a'));
         type_text(&mut app, "моя");
         assert!(app.tick(Instant::now() + AUTOSAVE));
-        let id = app.board.list(Category::Work)[1].id.clone().unwrap();
+        let id = app.board.list(ListId::WORK)[1].id.clone().unwrap();
         let mut notes = app.book.load_notes(&id).unwrap();
         notes.add_note("26.10.2026 09:00", "заметка агента");
         app.book.save_notes(&id, &notes).unwrap();
@@ -2158,13 +2593,13 @@ mod tests {
         // а агент дал ей id и запись — окно на месте, запись видна.
         press(&mut app, KeyCode::Esc);
         let mut board = app.book.load(d(26)).unwrap();
-        board.push(Category::Home, Task::new("снаружи"));
+        board.push(ListId::HOME, Task::new("снаружи"));
         app.book.save(d(26), &board).unwrap();
         press(&mut app, KeyCode::Char('2'));
         press(&mut app, KeyCode::Char('n'));
-        assert!(app.board.list(Category::Home)[0].id.is_none());
+        assert!(app.board.list(ListId::HOME)[0].id.is_none());
         let mut board = app.book.load(d(26)).unwrap();
-        board.get_mut(Category::Home, 0).unwrap().id = Some("agent1".into());
+        board.get_mut(ListId::HOME, 0).unwrap().id = Some("agent1".into());
         app.book.save(d(26), &board).unwrap();
         let mut notes = crate::notes::Notes::default();
         notes.add_subtask("от агента");
@@ -2181,11 +2616,11 @@ mod tests {
 
         // Задачу удалили снаружи — окно записей закрылось.
         let mut board = app.book.load(d(26)).unwrap();
-        board.remove(Category::Work, 1);
+        board.remove(ListId::WORK, 1);
         app.book.save(d(26), &board).unwrap();
         press(&mut app, KeyCode::Char('j'));
         assert!(app.notes.is_none());
-        assert_eq!(texts(&app, Category::Work), ["от агента", "первая"]);
+        assert_eq!(texts(&app, ListId::WORK), ["от агента", "первая"]);
         cleanup(app);
     }
 
@@ -2201,7 +2636,7 @@ mod tests {
         // «Редактор» записал файл.
         std::fs::write(&path, "Абзац из редактора\n- [ ] пункт\n").unwrap();
         app.after_editor(None);
-        let task = &app.board.list(Category::Work)[0];
+        let task = &app.board.list(ListId::WORK)[0];
         let id = task.id.clone().expect("id после редактора");
         assert!(path.ends_with(format!("{id}.md")));
         assert_eq!(app.summaries[&id].subtasks, 1);
@@ -2254,9 +2689,9 @@ mod tests {
     fn navigation_stays_in_bounds() {
         let mut app = test_app("nav");
         for text in ["a", "b"] {
-            app.board.push(Category::Work, Task::new(text));
+            app.board.push(ListId::WORK, Task::new(text));
         }
-        app.select(Category::Work, Some(0));
+        app.select(ListId::WORK, Some(0));
         press(&mut app, KeyCode::Char('k'));
         assert_eq!(app.selected(), Some(0));
         for _ in 0..5 {
@@ -2268,7 +2703,7 @@ mod tests {
         press(&mut app, KeyCode::Char('G'));
         assert_eq!(app.selected(), Some(1));
         press(&mut app, KeyCode::Tab);
-        assert_eq!(app.active, Category::Home);
+        assert_eq!(app.active, ListId::HOME);
         assert_eq!(app.selected(), None);
         press(&mut app, KeyCode::Up);
         assert_eq!(app.selected(), None);
