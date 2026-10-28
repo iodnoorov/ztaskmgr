@@ -20,6 +20,7 @@ pub const WEBDAV_URL: &str = "webdav_url";
 pub const WEBDAV_USER: &str = "webdav_user";
 pub const WEBDAV_PASSWORD: &str = "webdav_password";
 pub const WEBDAV_PASSWORD_COMMAND: &str = "webdav_password_command";
+const WEBDAV_INSECURE: &str = "webdav_insecure";
 
 #[derive(Debug, Default)]
 pub struct Config {
@@ -131,6 +132,7 @@ impl Config {
             user: get(WEBDAV_USER),
             password: get(WEBDAV_PASSWORD),
             password_command: get(WEBDAV_PASSWORD_COMMAND),
+            insecure: self.get(WEBDAV_INSECURE).and_then(parse_bool).unwrap_or(false),
         })
     }
 }

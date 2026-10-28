@@ -71,12 +71,7 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ALL: [Section; 4] = [
-        Section::Tasks,
-        Section::Pages,
-        Section::Navigation,
-        Section::Field,
-    ];
+    pub const ALL: [Section; 4] = [Section::Tasks, Section::Pages, Section::Navigation, Section::Field];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -118,66 +113,27 @@ const fn k(code: KeyCode) -> Key {
 }
 
 const fn row(section: Section, help: &'static str, keys: &'static [(Key, Action)]) -> Row {
-    Row {
-        section,
-        label: None,
-        help: Some(help),
-        keys,
-    }
+    Row { section, label: None, help: Some(help), keys }
 }
 
-const fn labeled(
-    section: Section,
-    label: &'static str,
-    help: &'static str,
-    keys: &'static [(Key, Action)],
-) -> Row {
-    Row {
-        section,
-        label: Some(label),
-        help: Some(help),
-        keys,
-    }
+const fn labeled(section: Section, label: &'static str, help: &'static str, keys: &'static [(Key, Action)]) -> Row {
+    Row { section, label: Some(label), help: Some(help), keys }
 }
 
 pub const ROWS: &[Row] = &[
     row(Section::Tasks, "добавить в конец списка", &[(c('a'), A::Add)]),
-    row(
-        Section::Tasks,
-        "редактировать",
-        &[(c('e'), A::Edit), (k(KeyCode::Enter), A::Edit)],
-    ),
-    row(
-        Section::Tasks,
-        "выполнено / не выполнено",
-        &[(c(' '), A::Toggle), (c('x'), A::Toggle)],
-    ),
+    row(Section::Tasks, "редактировать", &[(c('e'), A::Edit), (k(KeyCode::Enter), A::Edit)]),
+    row(Section::Tasks, "выполнено / не выполнено", &[(c(' '), A::Toggle), (c('x'), A::Toggle)]),
     row(Section::Tasks, "отменить / вернуть", &[(c('c'), A::Cancel)]),
     labeled(
         Section::Tasks,
         "Shift+↑ ↓",
         "сдвинуть выше / ниже",
-        &[
-            ((KeyCode::Up, SHIFT), A::MoveUp),
-            ((KeyCode::Down, SHIFT), A::MoveDown),
-        ],
+        &[((KeyCode::Up, SHIFT), A::MoveUp), ((KeyCode::Down, SHIFT), A::MoveDown)],
     ),
-    labeled(
-        Section::Tasks,
-        "m",
-        "перенести в другой список",
-        &[(c('m'), A::MoveTo)],
-    ),
-    row(
-        Section::Tasks,
-        "перенести на другую дату",
-        &[(c('>'), A::Postpone)],
-    ),
-    row(
-        Section::Tasks,
-        "удалить",
-        &[(c('d'), A::Delete), (k(KeyCode::Delete), A::Delete)],
-    ),
+    labeled(Section::Tasks, "m", "перенести в другой список", &[(c('m'), A::MoveTo)]),
+    row(Section::Tasks, "перенести на другую дату", &[(c('>'), A::Postpone)]),
+    row(Section::Tasks, "удалить", &[(c('d'), A::Delete), (k(KeyCode::Delete), A::Delete)]),
     row(Section::Tasks, "записи задачи", &[(c('n'), A::Notes)]),
     row(Section::Tasks, "скрыть задачу от ИИ / открыть", &[(c('p'), A::TogglePrivate)]),
     row(Section::Tasks, "скрыть список от ИИ / открыть", &[(c('P'), A::ToggleHidden)]),
@@ -230,31 +186,16 @@ pub const ROWS: &[Row] = &[
         Section::Navigation,
         "j k  ↑ ↓",
         "перемещение",
-        &[
-            (c('j'), A::Down),
-            (c('k'), A::Up),
-            (k(KeyCode::Down), A::Down),
-            (k(KeyCode::Up), A::Up),
-        ],
+        &[(c('j'), A::Down), (c('k'), A::Up), (k(KeyCode::Down), A::Down), (k(KeyCode::Up), A::Up)],
     ),
     labeled(
         Section::Navigation,
         "g  G",
         "в начало / в конец",
-        &[
-            (c('g'), A::Top),
-            (c('G'), A::Bottom),
-            (k(KeyCode::Home), A::Top),
-            (k(KeyCode::End), A::Bottom),
-        ],
+        &[(c('g'), A::Top), (c('G'), A::Bottom), (k(KeyCode::Home), A::Top), (k(KeyCode::End), A::Bottom)],
     ),
     row(Section::Navigation, "превью задачи справа", &[(c('v'), A::Preview)]),
-    labeled(
-        Section::Navigation,
-        "J  K",
-        "прокрутка превью",
-        &[(c('J'), A::PreviewDown), (c('K'), A::PreviewUp)],
-    ),
+    labeled(Section::Navigation, "J  K", "прокрутка превью", &[(c('J'), A::PreviewDown), (c('K'), A::PreviewUp)]),
     row(Section::Navigation, "настройки", &[(c('S'), A::Settings)]),
     row(Section::Navigation, "о программе", &[(c('o'), A::About)]),
     row(Section::Navigation, "выход", &[(c('q'), A::Quit)]),
@@ -278,30 +219,15 @@ pub const ROWS: &[Row] = &[
 pub const NOTES_ROWS: &[Row] = &[
     row(Section::Notes, "заметка (с датой и временем)", &[(c('a'), A::Add)]),
     row(Section::Notes, "подзадача", &[(c('s'), A::AddSubtask)]),
-    row(
-        Section::Notes,
-        "править строку",
-        &[(c('e'), A::Edit), (k(KeyCode::Enter), A::Edit)],
-    ),
-    row(
-        Section::Notes,
-        "подзадача выполнена / нет",
-        &[(c(' '), A::Toggle), (c('x'), A::Toggle)],
-    ),
+    row(Section::Notes, "править строку", &[(c('e'), A::Edit), (k(KeyCode::Enter), A::Edit)]),
+    row(Section::Notes, "подзадача выполнена / нет", &[(c(' '), A::Toggle), (c('x'), A::Toggle)]),
     labeled(
         Section::Notes,
         "Shift+↑ ↓",
         "сдвинуть выше / ниже",
-        &[
-            ((KeyCode::Up, SHIFT), A::MoveUp),
-            ((KeyCode::Down, SHIFT), A::MoveDown),
-        ],
+        &[((KeyCode::Up, SHIFT), A::MoveUp), ((KeyCode::Down, SHIFT), A::MoveDown)],
     ),
-    row(
-        Section::Notes,
-        "удалить строку",
-        &[(c('d'), A::Delete), (k(KeyCode::Delete), A::Delete)],
-    ),
+    row(Section::Notes, "удалить строку", &[(c('d'), A::Delete), (k(KeyCode::Delete), A::Delete)]),
     row(Section::Notes, "открыть в редакторе ($EDITOR)", &[(c('E'), A::OpenEditor)]),
     labeled(
         Section::Notes,
@@ -324,27 +250,16 @@ pub const NOTES_ROWS: &[Row] = &[
         "закрыть",
         &[(k(KeyCode::Esc), A::Close), (c('q'), A::Close), (c('n'), A::Close)],
     ),
-    Row {
-        section: Section::Notes,
-        label: None,
-        help: None,
-        keys: &[(c('?'), A::Help), (k(KeyCode::F(1)), A::Help)],
-    },
+    Row { section: Section::Notes, label: None, help: None, keys: &[(c('?'), A::Help), (k(KeyCode::F(1)), A::Help)] },
 ];
 
 /// Первая клавиша действия — её «нажимает» тап по подсказке.
 pub fn first_key(rows: &[Row], action: Action) -> Option<Key> {
-    rows.iter()
-        .flat_map(|r| r.keys)
-        .find(|(_, a)| *a == action)
-        .map(|&(k, _)| k)
+    rows.iter().flat_map(|r| r.keys).find(|(_, a)| *a == action).map(|&(k, _)| k)
 }
 
 fn find(rows: &[Row], key: Key) -> Option<Action> {
-    rows.iter()
-        .flat_map(|r| r.keys)
-        .find(|(k, _)| *k == key)
-        .map(|&(_, a)| a)
+    rows.iter().flat_map(|r| r.keys).find(|(k, _)| *k == key).map(|&(_, a)| a)
 }
 
 /// Что делает клавиша на главном экране.
@@ -381,12 +296,7 @@ fn key_name((code, mods): Key, short: bool) -> String {
 pub fn row_keys(row: &Row) -> String {
     match row.label {
         Some(label) => label.to_string(),
-        None => row
-            .keys
-            .iter()
-            .map(|&(k, _)| key_name(k, false))
-            .collect::<Vec<_>>()
-            .join("  "),
+        None => row.keys.iter().map(|&(k, _)| key_name(k, false)).collect::<Vec<_>>().join("  "),
     }
 }
 

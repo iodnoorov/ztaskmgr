@@ -8,10 +8,13 @@ mod input;
 mod keymap;
 mod lists;
 mod mcp;
+mod merge;
 mod model;
 mod notes;
+#[cfg(test)]
+mod proptests;
 mod storage;
-mod sync;
+mod store;
 mod ui;
 mod webdav;
 
@@ -40,8 +43,7 @@ const USAGE: &str = "\
 Записная книжка дел: страница на каждую дату, на странице списки дел — сначала
 Работа, Дом, Личное, Прочее, их можно менять и добавлять свои (L).
 КАТАЛОГ — где лежат страницы (ГГГГ-ММ-ДД.md), по умолчанию $ZTASKMGR_DIR,
-иначе ~/.local/share/ztaskmgr. Синхронизация — Syncthing (копии, оставшиеся после
-правок на двух устройствах сразу, сливаются сами) или свой WebDAV-сервер: адрес и вход —
+иначе ~/.local/share/ztaskmgr. Синхронизация — свой WebDAV-сервер: адрес и вход —
 в настройках (S), ~/.config/ztaskmgr/config.
 
 sync — синхронизировать с WebDAV-сервером и выйти (например, из cron).
@@ -63,33 +65,44 @@ fn main() -> Result<()> {
         bail!("{} — файл, а нужен каталог книжки\n\n{USAGE}", dir.display());
     }
     let book = Book::new(dir.clone());
+    // Книжка прежних версий — на нынешний формат, до всякой работы с ней.
+    for done in book.migrate()? {
+        eprintln!("ztaskmgr: книжка обновлена: {done}");
+    }
     let config = match Config::default_path() {
         Some(path) => Config::load(path)?,
         None => Config::default(),
     };
     match run_as {
-        Run::Mcp(_) => return mcp::serve(&agent::Agent::new(book), config.webdav()),
+        Run::Mcp(_) => {
+            // Пароль из команды — один раз при запуске; не получился — без синхронизации.
+            let webdav = config.webdav().map(webdav::Settings::resolve).transpose().unwrap_or_else(|e| {
+                eprintln!("ztaskmgr: WebDAV: {e:#}");
+                None
+            });
+            return mcp::serve(&agent::Agent::new(book), webdav);
+        }
         Run::Sync(_) => return sync_once(&book, &config),
         Run::Tui(_) => {}
     }
     let today = Date::today();
-    // Синхронизация, автоперенос и страница на сегодня — до перехода в TUI, чтобы ошибки
-    // вывелись в обычный терминал. Копии с другого устройства сливаются до автопереноса:
-    // иначе перенос не увидит их задачи.
-    book.ensure_stignore()?;
-    let merge = book.merge_conflicts()?;
+    // Автоперенос и страница на сегодня — до перехода в TUI, чтобы ошибки вывелись в обычный
+    // терминал. Синхронизация с WebDAV — уже в фоне; что она принесёт, перенесётся следом
+    // (`App::on_sync`).
     let carried = book.carry_over(today)?;
     book.load(today)?;
-    let worker = webdav::Worker::start(dir, config.webdav());
+    // Пароль из команды — сейчас, пока терминал ещё обычный.
+    let (webdav, webdav_error) = match config.webdav().map(webdav::Settings::resolve).transpose() {
+        Ok(settings) => (settings, None),
+        Err(e) => (None, Some(format!("WebDAV: {e:#}"))),
+    };
+    let worker = webdav::Worker::start(dir, webdav);
     let mut app = App::new(book, config, today);
+    if let Some(e) = webdav_error {
+        app.status = Some(Status::Error(e));
+    }
     if let Some((from, count)) = carried {
         app.status = Some(Status::Info(app::carried_message(from, count)));
-    }
-    if !merge.failed.is_empty() {
-        app.status = Some(Status::Error(format!(
-            "Не удалось слить копии с другого устройства (исправьте вручную): {}",
-            merge.failed.join(", ")
-        )));
     }
 
     let mut terminal = ratatui::init();
@@ -113,19 +126,30 @@ fn main() -> Result<()> {
 
 /// `ztaskmgr sync`: одна синхронизация с WebDAV и итог в терминал.
 fn sync_once(book: &Book, config: &Config) -> Result<()> {
-    let settings = config.webdav().context("WebDAV не настроен: адрес — в настройках (S) или webdav_url в ~/.config/ztaskmgr/config")?;
-    book.ensure_stignore()?;
-    book.merge_conflicts()?;
-    match webdav::sync(book, &settings)? {
+    let settings = config
+        .webdav()
+        .context("WebDAV не настроен: адрес — в настройках (S) или webdav_url в ~/.config/ztaskmgr/config")?
+        .resolve()?;
+    let summary = webdav::sync(book, &settings)?;
+    match &summary {
         Some(s) => println!(
             "Отправлено: {}, получено: {}, слито: {}, удалено: {}{}",
             s.uploaded,
             s.downloaded,
             s.merged,
             s.deleted,
-            if s.postponed > 0 { format!(", отложено до следующего раза: {}", s.postponed) } else { String::new() }
+            if s.postponed > 0 {
+                format!(", отложено до следующего раза: {}", s.postponed)
+            } else {
+                String::new()
+            }
         ),
         None => println!("Сейчас синхронизирует другой процесс ztaskmgr"),
+    }
+    if let Some(s) = &summary
+        && !s.failed.is_empty()
+    {
+        bail!("не синхронизированы:\n  {}", s.failed.join("\n  "));
     }
     Ok(())
 }
@@ -137,6 +161,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool, worker: 
     // Клавиши читаем сами, а не через crossterm: он теряет физическую клавишу (см. `input`).
     let mut reader = input::Reader::new();
     let mut size = terminal::size()?;
+    app.on_resize(size.0);
     let mut time = clock::now();
     let mut dirty = true;
     // Мышь — это касания в Termux: тапы и свайпы. Пока открыто поле ввода, она выключена,
@@ -153,6 +178,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool, worker: 
             }
         }
         if dirty {
+            app.prepare();
             let mut links = Vec::new();
             terminal.draw(|frame| links = ui::draw(frame, app))?;
             ui::write_links(&links)?;
@@ -171,11 +197,9 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool, worker: 
             }
             dirty = true;
         }
+        // Правки снаружи (агент через MCP, синхронизация, редактор) — до автосохранения,
+        // чтобы оно их не затёрло; `tick` проверяет их и сам.
         if app.tick(Instant::now()) {
-            dirty = true;
-        }
-        // Правки снаружи: агент через MCP, синхронизация, редактор.
-        if app.check_external() {
             dirty = true;
         }
         // WebDAV: правки — на сервер через пару секунд, новые настройки и «сейчас» — сразу.
@@ -187,7 +211,19 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool, worker: 
             worker.now();
         }
         if std::mem::take(&mut app.webdav_changed) {
-            worker.configure(app.config.webdav());
+            // Команде пароля нужен терминал — на это время он ей отдаётся.
+            let settings = match app.config.webdav() {
+                Some(s) if s.needs_command() => released(terminal, *kitty, || s.resolve())?.map(Some),
+                other => Ok(other),
+            };
+            dirty = true;
+            match settings {
+                Ok(settings) => worker.configure(settings),
+                Err(e) => {
+                    app.status = Some(Status::Error(format!("WebDAV: {e:#}")));
+                    worker.configure(None);
+                }
+            }
         }
         if std::mem::take(&mut app.sync_requested) {
             worker.now();
@@ -204,6 +240,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool, worker: 
         let now = terminal::size()?;
         if now != size {
             size = now;
+            app.on_resize(size.0);
             dirty = true;
         }
         let now = clock::now();
@@ -231,13 +268,24 @@ fn run_editor(terminal: &mut DefaultTerminal, path: &Path, kitty: bool) -> Resul
     let mut parts = editor.split_whitespace();
     let program = parts.next().unwrap_or("vi");
 
+    let status = released(terminal, kitty, || Command::new(program).args(parts).arg(path).status())?;
+    Ok(match status {
+        Ok(s) if s.success() => None,
+        Ok(s) => Some(format!("Редактор «{editor}» завершился с ошибкой: {s}")),
+        Err(e) => Some(format!("Редактор «{editor}» не запустился: {e}")),
+    })
+}
+
+/// Отдаёт терминал внешней программе на время `f` (редактор, команда пароля) и забирает
+/// обратно.
+fn released<T>(terminal: &mut DefaultTerminal, kitty: bool, f: impl FnOnce() -> T) -> Result<T> {
     if kitty {
         input::kitty_off();
     }
     input::mouse_off();
     execute!(std::io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, cursor::Show)?;
     terminal::disable_raw_mode()?;
-    let status = Command::new(program).args(parts).arg(path).status();
+    let result = f();
     terminal::enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
     input::mouse_on();
@@ -245,12 +293,7 @@ fn run_editor(terminal: &mut DefaultTerminal, path: &Path, kitty: bool) -> Resul
         input::kitty_on();
     }
     terminal.clear()?;
-
-    Ok(match status {
-        Ok(s) if s.success() => None,
-        Ok(s) => Some(format!("Редактор «{editor}» завершился с ошибкой: {s}")),
-        Err(e) => Some(format!("Редактор «{editor}» не запустился: {e}")),
-    })
+    Ok(result)
 }
 
 /// `None` — запрошена справка.
@@ -284,8 +327,7 @@ fn parse_args() -> Result<Option<Run>> {
     }))
 }
 
-/// Каталог книжки по умолчанию: `$ZTASKMGR_DIR` (удобно в Termux — книжка в папке
-/// Syncthing), иначе `~/.local/share/ztaskmgr`.
+/// Каталог книжки по умолчанию: `$ZTASKMGR_DIR`, иначе `~/.local/share/ztaskmgr`.
 fn default_path() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("ZTASKMGR_DIR").filter(|d| !d.is_empty()) {
         return Ok(PathBuf::from(dir));

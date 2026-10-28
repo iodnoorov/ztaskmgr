@@ -7,7 +7,7 @@
 //! - изменилось только у нас — PUT (с `If-Match`, чтобы не затереть чужую запись), удалили
 //!   у нас — DELETE;
 //! - только на сервере — GET, удалили там — удаляем у себя;
-//! - с обеих сторон — слияние, как у копий Syncthing (`sync.rs`), и PUT результата.
+//! - с обеих сторон — слияние (`merge.rs`) и PUT результата.
 //!
 //! Сервер ответил «412: файл уже другой» — файл пропускается, в следующий раз он сольётся.
 //! Несколько процессов (программа и MCP-сервер) не синхронизируются одновременно —
@@ -15,7 +15,6 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io::ErrorKind;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::Command;
@@ -26,11 +25,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::book::Book;
-use crate::clock::Date;
-use crate::lists::LISTS_FILE;
-use crate::book::DELETED_NOTES;
-use crate::storage;
+use crate::book::{Book, file_kind};
+use crate::store::write_atomic;
 
 const STATE_FILE: &str = ".webdav-state";
 const LOCK_FILE: &str = ".webdav-lock";
@@ -50,23 +46,51 @@ pub struct Settings {
     pub password: String,
     /// Команда, которая печатает пароль (`pass ztaskmgr`); если задана — главнее `password`.
     pub password_command: String,
+    /// Разрешить пароль по `http://` не на этот же компьютер (`webdav_insecure = on`).
+    pub insecure: bool,
+}
+
+/// Адрес на этом же компьютере: туда и по `http://` можно — по сети пароль не идёт.
+fn is_loopback(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let host = rest.split(['/', '?']).next().unwrap_or("");
+    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    };
+    host == "localhost" || host == "::1" || host.starts_with("127.")
 }
 
 impl Settings {
-    fn password(&self) -> Result<String> {
+    /// Пароль из команды — один раз, до синхронизаций: команда (`pass`, `gpg`) может спросить
+    /// пароль у пользователя, а в фоне, поверх интерфейса, это сломало бы экран. Поэтому её
+    /// запускают, когда терминал свободен (при запуске, при смене настроек), а потоку
+    /// синхронизации достаются готовые настройки. Ввод команды — `/dev/null`: у MCP-сервера
+    /// stdin занят протоколом, а pinentry и так работает с `/dev/tty`.
+    pub fn resolve(mut self) -> Result<Self> {
         if self.password_command.trim().is_empty() {
-            return Ok(self.password.clone());
+            return Ok(self);
         }
         let out = Command::new("sh")
             .arg("-c")
             .arg(&self.password_command)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
             .output()
             .with_context(|| format!("запуск «{}»", self.password_command))?;
         if !out.status.success() {
             bail!("команда пароля «{}» завершилась с ошибкой", self.password_command);
         }
         let text = String::from_utf8(out.stdout).context("команда пароля вывела не текст")?;
-        Ok(text.lines().next().unwrap_or("").to_string())
+        self.password = text.lines().next().unwrap_or("").to_string();
+        self.password_command.clear();
+        Ok(self)
+    }
+
+    /// Нужна ли команда, чтобы получить пароль (то есть свободный терминал).
+    pub fn needs_command(&self) -> bool {
+        !self.password_command.trim().is_empty()
     }
 }
 
@@ -110,12 +134,17 @@ impl Remote {
             bail!("адрес WebDAV должен начинаться с http:// или https://");
         }
         let base = if url.ends_with('/') { url.to_string() } else { format!("{url}/") };
+        if settings.needs_command() {
+            bail!("пароль не получен: команда пароля не запускалась");
+        }
+        // Basic-авторизация — это пароль открытым текстом: по сети — только через https.
+        if url.starts_with("http://") && !settings.user.is_empty() && !settings.insecure && !is_loopback(url) {
+            bail!(
+                "по http:// пароль уйдёт по сети открытым текстом — нужен https:// (или webdav_insecure = on в настройках, если сеть ваша)"
+            );
+        }
         let auth = (!settings.user.is_empty())
-            .then(|| -> Result<String> {
-                let password = settings.password()?;
-                Ok(format!("Basic {}", base64(format!("{}:{password}", settings.user).as_bytes())))
-            })
-            .transpose()?;
+            .then(|| format!("Basic {}", base64(format!("{}:{}", settings.user, settings.password).as_bytes())));
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .allow_non_standard_methods(true)
@@ -126,7 +155,13 @@ impl Remote {
     }
 
     /// Запрос к файлу или каталогу `path` (относительно `base`): код ответа, ETag и тело.
-    fn call(&self, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<(u16, Option<String>, Vec<u8>)> {
+    fn call(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<(u16, Option<String>, Vec<u8>)> {
         let mut request = ureq::http::Request::builder().method(method).uri(format!("{}{path}", self.base));
         if let Some(auth) = &self.auth {
             request = request.header("Authorization", auth);
@@ -135,16 +170,9 @@ impl Remote {
             request = request.header(*name, *value);
         }
         let request = request.body(body.to_vec()).context("запрос WebDAV")?;
-        let mut response = self
-            .agent
-            .run(request)
-            .with_context(|| format!("WebDAV: {method} {}{path}", self.base))?;
+        let mut response = self.agent.run(request).with_context(|| format!("WebDAV: {method} {}{path}", self.base))?;
         let status = response.status().as_u16();
-        let etag = response
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+        let etag = response.headers().get("etag").and_then(|v| v.to_str().ok()).map(str::to_string);
         let body = response.body_mut().with_config().limit(64 * 1024 * 1024).read_to_vec()?;
         match status {
             401 | 403 => bail!("WebDAV: доступ запрещён (HTTP {status}) — проверьте логин и пароль"),
@@ -202,7 +230,12 @@ impl Remote {
             Some(etag) => ("If-Match", etag),
             None => ("If-None-Match", "*"),
         };
-        let headers = [condition, ("Content-Type", "text/markdown; charset=utf-8")];
+        self.put_with(path, data, Some(condition))
+    }
+
+    fn put_with(&self, path: &str, data: &[u8], condition: Option<(&str, &str)>) -> Result<Put> {
+        let mut headers = vec![("Content-Type", "text/markdown; charset=utf-8")];
+        headers.extend(condition);
         let (status, etag, _) = self.call("PUT", path, &headers, data)?;
         match status {
             200..=299 => Ok(Put::Done(etag)),
@@ -211,14 +244,43 @@ impl Remote {
         }
     }
 
-    /// Удаление, если на сервере всё ещё `etag`. `false` — файл там уже другой.
-    fn delete(&self, path: &str, etag: &str) -> Result<bool> {
-        let (status, _, _) = self.call("DELETE", path, &[("If-Match", etag)], b"")?;
+    /// Удаление, если на сервере всё ещё `etag` (`None` — без условия). `false` — файл там уже
+    /// другой.
+    fn delete(&self, path: &str, etag: Option<&str>) -> Result<bool> {
+        let headers: Vec<(&str, &str)> = etag.map(|e| ("If-Match", e)).into_iter().collect();
+        let (status, _, _) = self.call("DELETE", path, &headers, b"")?;
         match status {
             200..=299 | 404 => Ok(true),
             412 => Ok(false),
             _ => Self::fail("DELETE", path, status),
         }
+    }
+
+    /// Сервер ответил 412, хотя файл, может быть, и не менялся: слабый ETag (`W/"…"`,
+    /// с ним `If-Match` не совпадает никогда) или ETag, закодированный иначе, чем мы его
+    /// прочитали. Тогда сверяем само содержимое: оно всё ещё то, что мы видели (`known` —
+    /// хеш), — значит, чужой правки не было.
+    fn unchanged_since(&self, path: &str, known: Option<&str>) -> Result<bool> {
+        let Some(known) = known else {
+            return Ok(false);
+        };
+        Ok(self.get(path)?.is_some_and(|(data, _)| hash(&data) == known))
+    }
+
+    /// PUT с `If-Match`, а при 412 — проверка содержимого и запись без условия.
+    fn put_checked(&self, path: &str, data: &[u8], expected: Option<&str>, known: Option<&str>) -> Result<Put> {
+        match self.put(path, data, expected)? {
+            Put::Changed if expected.is_some() && self.unchanged_since(path, known)? => self.put_with(path, data, None),
+            result => Ok(result),
+        }
+    }
+
+    /// DELETE с `If-Match`, а при 412 — так же, как `put_checked`.
+    fn delete_checked(&self, path: &str, etag: &str, known: Option<&str>) -> Result<bool> {
+        if self.delete(path, Some(etag))? {
+            return Ok(true);
+        }
+        Ok(self.unchanged_since(path, known)? && self.delete(path, None)?)
     }
 }
 
@@ -230,12 +292,35 @@ struct Entry {
     collection: bool,
 }
 
+/// XML-сущности: именованные и числовые (`&#34;`, `&#x22;` — так некоторые серверы
+/// кодируют кавычки ETag). `&amp;` — последней, чтобы `&amp;quot;` стало `&quot;`.
 fn unescape(text: &str) -> String {
-    text.replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("&#") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 2..];
+        let decoded = tail.find(';').and_then(|end| {
+            let code = &tail[..end];
+            let n = match code.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => code.parse().ok()?,
+            };
+            Some((char::from_u32(n)?, end))
+        });
+        match decoded {
+            Some((c, end)) => {
+                out.push(c);
+                rest = &tail[end + 1..];
+            }
+            None => {
+                out.push_str("&#");
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.replace("&quot;", "\"").replace("&apos;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 }
 
 /// Разбор `multistatus` без XML-библиотеки: префиксы пространств имён у серверов разные
@@ -306,14 +391,7 @@ fn file_name(href: &str) -> Option<String> {
 
 /// Файлы книжки, которые возит WebDAV: путь относительно каталога книжки.
 fn is_book_file(path: &str) -> bool {
-    match path.strip_prefix("notes/") {
-        Some(name) => name.strip_suffix(".md").is_some_and(storage::is_valid_id),
-        None => {
-            path == LISTS_FILE
-                || path == DELETED_NOTES
-                || path.strip_suffix(".md").and_then(Date::parse_iso).is_some()
-        }
-    }
+    file_kind(path).is_some()
 }
 
 /// Хеш содержимого (FNV-1a): устойчив между версиями Rust, в отличие от `DefaultHasher`.
@@ -347,7 +425,8 @@ fn load_state(dir: &Path, url: &str) -> HashMap<String, Known> {
             files
                 .iter()
                 .filter_map(|(path, v)| {
-                    let known = Known { etag: v["etag"].as_str().map(str::to_string), hash: v["hash"].as_str()?.to_string() };
+                    let known =
+                        Known { etag: v["etag"].as_str().map(str::to_string), hash: v["hash"].as_str()?.to_string() };
                     Some((path.clone(), known))
                 })
                 .collect()
@@ -356,29 +435,18 @@ fn load_state(dir: &Path, url: &str) -> HashMap<String, Known> {
 }
 
 fn save_state(dir: &Path, url: &str, state: &HashMap<String, Known>) -> Result<()> {
-    let files: serde_json::Map<String, Value> = state
-        .iter()
-        .map(|(path, k)| (path.clone(), json!({"etag": k.etag, "hash": k.hash})))
-        .collect();
+    let files: serde_json::Map<String, Value> =
+        state.iter().map(|(path, k)| (path.clone(), json!({"etag": k.etag, "hash": k.hash}))).collect();
     let text = serde_json::to_string_pretty(&json!({"url": url, "files": files}))?;
-    storage::write_atomic(&dir.join(STATE_FILE), &text)
+    write_atomic(&dir.join(STATE_FILE), text.as_bytes())
 }
 
 /// Файлы книжки у нас: путь → содержимое.
-fn local_files(dir: &Path) -> Result<HashMap<String, Vec<u8>>> {
+fn local_files(book: &Book) -> Result<HashMap<String, Vec<u8>>> {
     let mut files = HashMap::new();
-    for (sub, prefix) in [(dir.to_path_buf(), ""), (dir.join("notes"), "notes/")] {
-        let entries = match fs::read_dir(&sub) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).with_context(|| format!("чтение {}", sub.display())),
-        };
-        for entry in entries.filter_map(|e| e.ok()) {
-            let Ok(name) = entry.file_name().into_string() else { continue };
-            let path = format!("{prefix}{name}");
-            if is_book_file(&path) && entry.path().is_file() {
-                files.insert(path, fs::read(entry.path()).with_context(|| format!("чтение {name}"))?);
-            }
+    for path in book.files()? {
+        if let Some(data) = book.read_file(&path)? {
+            files.insert(path, data);
         }
     }
     Ok(files)
@@ -393,6 +461,8 @@ pub struct Summary {
     pub deleted: usize,
     /// Отложены до следующего раза: файл поменялся, пока мы его синхронизировали.
     pub postponed: usize,
+    /// Не синхронизированы из-за ошибки в самом файле: «путь: причина».
+    pub failed: Vec<String>,
 }
 
 /// Блокировка от одновременной синхронизации из двух процессов: держится, пока жив объект.
@@ -439,143 +509,160 @@ pub fn sync(book: &Book, settings: &Settings) -> Result<Option<Summary>> {
             }
         }
     }
-    let local = local_files(dir)?;
+    let local = local_files(book)?;
     let paths: BTreeSet<&String> = local.keys().chain(server.keys()).chain(state.keys()).collect();
     let paths: Vec<String> = paths.into_iter().cloned().collect();
 
-    for path in paths {
-        let mine = local.get(&path);
-        let theirs = server.get(&path);
-        let known = state.get(&path).cloned();
-        let my_hash = mine.map(|d| hash(d));
-        let local_changed = my_hash.as_ref() != known.as_ref().map(|k| &k.hash);
-        let remote_changed = match (theirs, &known) {
-            (None, None) => false,
-            (Some(_), None) | (None, Some(_)) => true,
-            (Some(etag), Some(k)) => etag.is_none() || *etag != k.etag,
-        };
-        let file = dir.join(&path);
-        // Пишем в файл, только если он всё ещё такой, каким мы его прочитали: программа
-        // могла сохранить его, пока мы ходили на сервер.
-        let unchanged_here = || fs::read(&file).ok().map(|d| hash(&d)) == my_hash;
+    // Ошибка одного файла (не текст, не разбирается, не записывается) не останавливает
+    // остальные: файл — в `failed`, дальше. Ошибка сети или сервера прерывает проход, но то,
+    // что уже сделано, остаётся в манифесте.
+    let run = || -> Result<()> {
+        macro_rules! local {
+            ($path:expr, $result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(e) => {
+                        summary.failed.push(format!("{}: {e:#}", $path));
+                        continue;
+                    }
+                }
+            };
+        }
+        for path in paths {
+            let mine = local.get(&path);
+            let theirs = server.get(&path);
+            let known = state.get(&path).cloned();
+            let my_hash = mine.map(|d| hash(d));
+            let local_changed = my_hash.as_ref() != known.as_ref().map(|k| &k.hash);
+            let remote_changed = match (theirs, &known) {
+                (None, None) => false,
+                (Some(_), None) | (None, Some(_)) => true,
+                (Some(etag), Some(k)) => etag.is_none() || *etag != k.etag,
+            };
+            // Пишем в файл, только если он всё ещё такой, каким мы его прочитали: программа
+            // могла сохранить его, пока мы ходили на сервер.
+            let unchanged_here = || book.read_file(&path).ok().flatten().map(|d| hash(&d)) == my_hash;
 
-        match (local_changed, remote_changed, mine, theirs) {
-            (false, false, ..) => {}
-            // Только у нас.
-            (true, false, Some(data), _) => {
-                ensure_dirs(&remote, &path, &mut dirs_ready)?;
-                let expected = theirs.and_then(|_| known.as_ref().and_then(|k| k.etag.as_deref()));
-                match remote.put(&path, data, expected)? {
-                    Put::Done(etag) => {
-                        state.insert(path, Known { etag, hash: my_hash.unwrap() });
-                        summary.uploaded += 1;
-                    }
-                    Put::Changed => summary.postponed += 1,
-                }
-            }
-            (true, false, None, Some(_)) => {
-                let etag = known.as_ref().and_then(|k| k.etag.clone()).unwrap_or_default();
-                if remote.delete(&path, &etag)? {
-                    state.remove(&path);
-                    summary.deleted += 1;
-                } else {
-                    summary.postponed += 1;
-                }
-            }
-            (true, false, None, None) => {
-                state.remove(&path);
-            }
-            // Только на сервере (или с обеих сторон, но у нас файла уже нет — берём серверный:
-            // удаление может «воскреснуть», зато ничего не теряется).
-            (false, true, _, Some(_)) | (true, true, None, Some(_)) => match remote.get(&path)? {
-                Some((data, etag)) => {
-                    let etag = etag.or_else(|| theirs.cloned().flatten());
-                    let new_hash = hash(&data);
-                    if my_hash.as_ref() != Some(&new_hash) {
-                        if !unchanged_here() {
-                            summary.postponed += 1;
-                            continue;
+            match (local_changed, remote_changed, mine, theirs) {
+                (false, false, ..) => {}
+                // Только у нас.
+                (true, false, Some(data), _) => {
+                    ensure_dirs(&remote, &path, &mut dirs_ready)?;
+                    let expected = theirs.and_then(|_| known.as_ref().and_then(|k| k.etag.as_deref()));
+                    match remote.put_checked(&path, data, expected, known.as_ref().map(|k| k.hash.as_str()))? {
+                        Put::Done(etag) => {
+                            state.insert(path, Known { etag, hash: my_hash.unwrap() });
+                            summary.uploaded += 1;
                         }
-                        let text = String::from_utf8(data).with_context(|| format!("{path}: не текст"))?;
-                        storage::write_atomic(&file, &text)?;
-                        summary.downloaded += 1;
+                        Put::Changed => summary.postponed += 1,
                     }
-                    state.insert(path, Known { etag, hash: new_hash });
                 }
-                None => summary.postponed += 1,
-            },
-            (false, true, Some(_), None) => {
-                if unchanged_here() {
-                    fs::remove_file(&file).with_context(|| format!("удаление {path}"))?;
-                    state.remove(&path);
-                    summary.deleted += 1;
-                } else {
-                    summary.postponed += 1;
-                }
-            }
-            (false, true, None, None) => {
-                state.remove(&path);
-            }
-            // На сервере удалили, у нас меняли — наше снова на сервер.
-            (true, true, Some(data), None) => {
-                ensure_dirs(&remote, &path, &mut dirs_ready)?;
-                match remote.put(&path, data, None)? {
-                    Put::Done(etag) => {
-                        state.insert(path, Known { etag, hash: my_hash.unwrap() });
-                        summary.uploaded += 1;
-                    }
-                    Put::Changed => summary.postponed += 1,
-                }
-            }
-            // Меняли с обеих сторон — слияние.
-            (true, true, Some(_), Some(_)) => {
-                let Some((data, etag)) = remote.get(&path)? else {
-                    summary.postponed += 1;
-                    continue;
-                };
-                let their_hash = hash(&data);
-                if my_hash.as_ref() == Some(&their_hash) {
-                    state.insert(path, Known { etag, hash: their_hash });
-                    continue;
-                }
-                if !unchanged_here() {
-                    summary.postponed += 1;
-                    continue;
-                }
-                let text = String::from_utf8(data).with_context(|| format!("{path}: не текст"))?;
-                let (notes, base) = match path.strip_prefix("notes/") {
-                    Some(name) => (true, name),
-                    None => (false, path.as_str()),
-                };
-                book.merge_text(base, notes, &text).with_context(|| format!("слияние {path}"))?;
-                let merged = fs::read(&file).ok();
-                let result = match (&merged, etag.as_deref()) {
-                    (Some(merged), _) => remote.put(&path, merged, etag.as_deref())?,
-                    // Слияние дало пустую страницу — файла нет и на сервере.
-                    (None, Some(etag)) => {
-                        if remote.delete(&path, etag)? { Put::Done(None) } else { Put::Changed }
-                    }
-                    (None, None) => Put::Changed,
-                };
-                match (result, merged) {
-                    (Put::Done(etag), Some(merged)) => {
-                        state.insert(path, Known { etag, hash: hash(&merged) });
-                        summary.merged += 1;
-                    }
-                    (Put::Done(_), None) => {
+                (true, false, None, Some(_)) => {
+                    let etag = known.as_ref().and_then(|k| k.etag.clone()).unwrap_or_default();
+                    if remote.delete_checked(&path, &etag, known.as_ref().map(|k| k.hash.as_str()))? {
                         state.remove(&path);
-                        summary.merged += 1;
+                        summary.deleted += 1;
+                    } else {
+                        summary.postponed += 1;
                     }
-                    (Put::Changed, _) => summary.postponed += 1,
                 }
-            }
-            (true, true, None, None) => {
-                state.remove(&path);
+                (true, false, None, None) => {
+                    state.remove(&path);
+                }
+                // Только на сервере (или с обеих сторон, но у нас файла уже нет — берём серверный:
+                // удаление может «воскреснуть», зато ничего не теряется).
+                (false, true, _, Some(_)) | (true, true, None, Some(_)) => match remote.get(&path)? {
+                    Some((data, etag)) => {
+                        let etag = etag.or_else(|| theirs.cloned().flatten());
+                        let new_hash = hash(&data);
+                        if my_hash.as_ref() != Some(&new_hash) {
+                            if !unchanged_here() {
+                                summary.postponed += 1;
+                                continue;
+                            }
+                            let text = local!(path, String::from_utf8(data).context("не текст"));
+                            local!(path, book.write_file(&path, text.as_bytes()));
+                            summary.downloaded += 1;
+                        }
+                        state.insert(path, Known { etag, hash: new_hash });
+                    }
+                    None => summary.postponed += 1,
+                },
+                (false, true, Some(_), None) => {
+                    if unchanged_here() {
+                        local!(path, book.remove_file(&path).context("удаление"));
+                        state.remove(&path);
+                        summary.deleted += 1;
+                    } else {
+                        summary.postponed += 1;
+                    }
+                }
+                (false, true, None, None) => {
+                    state.remove(&path);
+                }
+                // На сервере удалили, у нас меняли — наше снова на сервер.
+                (true, true, Some(data), None) => {
+                    ensure_dirs(&remote, &path, &mut dirs_ready)?;
+                    match remote.put(&path, data, None)? {
+                        Put::Done(etag) => {
+                            state.insert(path, Known { etag, hash: my_hash.unwrap() });
+                            summary.uploaded += 1;
+                        }
+                        Put::Changed => summary.postponed += 1,
+                    }
+                }
+                // Меняли с обеих сторон — слияние.
+                (true, true, Some(_), Some(_)) => {
+                    let Some((data, etag)) = remote.get(&path)? else {
+                        summary.postponed += 1;
+                        continue;
+                    };
+                    let their_hash = hash(&data);
+                    if my_hash.as_ref() == Some(&their_hash) {
+                        state.insert(path, Known { etag, hash: their_hash });
+                        continue;
+                    }
+                    if !unchanged_here() {
+                        summary.postponed += 1;
+                        continue;
+                    }
+                    let text = local!(path, String::from_utf8(data).context("не текст"));
+                    local!(path, book.merge_text(&path, &text).context("слияние"));
+                    let merged = book.read_file(&path).ok().flatten();
+                    let result = match (&merged, etag.as_deref()) {
+                        (Some(merged), _) => remote.put(&path, merged, etag.as_deref())?,
+                        // Слияние дало пустую страницу — файла нет и на сервере.
+                        (None, Some(etag)) => {
+                            if remote.delete(&path, Some(etag))? {
+                                Put::Done(None)
+                            } else {
+                                Put::Changed
+                            }
+                        }
+                        (None, None) => Put::Changed,
+                    };
+                    match (result, merged) {
+                        (Put::Done(etag), Some(merged)) => {
+                            state.insert(path, Known { etag, hash: hash(&merged) });
+                            summary.merged += 1;
+                        }
+                        (Put::Done(_), None) => {
+                            state.remove(&path);
+                            summary.merged += 1;
+                        }
+                        (Put::Changed, _) => summary.postponed += 1,
+                    }
+                }
+                (true, true, None, None) => {
+                    state.remove(&path);
+                }
             }
         }
-    }
+        Ok(())
+    };
+    let result = run();
     save_state(dir, &remote.base, &state)?;
-    Ok(Some(summary))
+    result.map(|()| Some(summary))
 }
 
 /// Каталоги на сервере — перед первой записью в них.
@@ -609,13 +696,16 @@ pub type Outcome = Result<Summary, String>;
 pub struct Worker {
     tx: Sender<Msg>,
     rx: Receiver<Outcome>,
-    handle: Option<JoinHandle<()>>,
+    /// Поток закончил работу (после `Stop`).
+    done: Receiver<()>,
+    handle: JoinHandle<()>,
 }
 
 impl Worker {
     pub fn start(dir: &Path, settings: Option<Settings>) -> Self {
         let (tx, inbox) = mpsc::channel::<Msg>();
         let (outbox, rx) = mpsc::channel::<Outcome>();
+        let (finished, done) = mpsc::channel::<()>();
         let dir = dir.to_path_buf();
         let handle = std::thread::spawn(move || {
             let book = Book::new(dir);
@@ -645,8 +735,9 @@ impl Worker {
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
+            let _ = finished.send(());
         });
-        Self { tx, rx, handle: Some(handle) }
+        Self { tx, rx, done, handle }
     }
 
     pub fn now(&self) {
@@ -662,14 +753,13 @@ impl Worker {
         self.rx.try_iter().collect()
     }
 
-    /// Последняя синхронизация при выходе; ждём не дольше `wait`.
-    pub fn stop(mut self, wait: Duration) {
+    /// Последняя синхронизация при выходе; ждём не дольше `wait`. Не успел (нет сети) —
+    /// поток не дожидаемся: процесс завершится, а файлы книжки пишутся атомарно, так что
+    /// оборванная синхронизация ничего не испортит — доделается в следующий раз.
+    pub fn stop(self, wait: Duration) {
         let _ = self.tx.send(Msg::Stop);
-        let deadline = std::time::Instant::now() + wait;
-        if let Some(handle) = self.handle.take() {
-            while !handle.is_finished() && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(50));
-            }
+        if self.done.recv_timeout(wait).is_ok() {
+            let _ = self.handle.join();
         }
     }
 }
@@ -681,6 +771,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
+    use crate::clock::Date;
     use crate::model::{Board, ListId, Task};
     use crate::notes::Notes;
 
@@ -689,6 +780,9 @@ mod tests {
         assert_eq!(base64(b"user:pass"), "dXNlcjpwYXNz");
         assert_eq!(base64(b"ab"), "YWI=");
         assert_eq!(base64(b"a"), "YQ==");
+        // Хеш манифеста не должен меняться между версиями: эталоны FNV-1a 64.
+        assert_eq!(hash(b""), "cbf29ce484222325");
+        assert_eq!(hash(b"a"), "af63dc4c8601ec8c");
         assert_eq!(file_name("/dav/files/me/ztaskmgr/2026-10-26.md"), Some("2026-10-26.md".into()));
         assert_eq!(file_name("https://x/a%20b/notes/"), Some("notes".into()));
         assert!(is_book_file("2026-10-26.md") && is_book_file("notes/k3x9ab.md") && is_book_file("LISTS.md"));
@@ -701,7 +795,10 @@ mod tests {
         let entries = parse_multistatus(xml);
         assert_eq!(entries.len(), 2);
         assert!(entries[0].collection && entries[0].etag.as_deref() == Some("\"dir\""));
-        assert_eq!(entries[1], Entry { href: "/dav/book/2026-10-26.md".into(), etag: Some("\"abc\"".into()), collection: false });
+        assert_eq!(
+            entries[1],
+            Entry { href: "/dav/book/2026-10-26.md".into(), etag: Some("\"abc\"".into()), collection: false }
+        );
     }
 
     /// Простейший WebDAV-сервер в памяти: PROPFIND, GET, PUT, DELETE, MKCOL с If-Match.
@@ -710,6 +807,8 @@ mod tests {
         files: HashMap<String, (Vec<u8>, u64)>,
         dirs: BTreeSet<String>,
         version: u64,
+        /// Слабые ETag (`W/"…"`): `If-Match` с ними по RFC не совпадает никогда.
+        weak: bool,
     }
 
     fn serve(store: Arc<Mutex<Store>>) -> String {
@@ -742,10 +841,11 @@ mod tests {
                 reader.read_exact(&mut body).unwrap();
                 let path = path.strip_prefix("/book/").unwrap_or("").to_string();
                 let mut store = store.lock().unwrap();
-                let etag_of = |v: u64| format!("\"v{v}\"");
+                let weak = store.weak;
+                let etag_of = |v: u64| if weak { format!("W/\"v{v}\"") } else { format!("\"v{v}\"") };
                 let current = store.files.get(&path).map(|(_, v)| etag_of(*v));
                 let precondition = match (headers.get("if-match"), headers.get("if-none-match")) {
-                    (Some(m), _) => current.as_ref() == Some(m),
+                    (Some(m), _) => current.as_ref() == Some(m) && !weak,
                     (_, Some(_)) => current.is_none(),
                     _ => true,
                 };
@@ -757,7 +857,9 @@ mod tests {
                             let mut xml = String::from(r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">"#);
                             xml.push_str(&format!("<d:response><d:href>/book/{path}</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat></d:response>"));
                             for (name, (_, v)) in &store.files {
-                                if let Some(rest) = name.strip_prefix(&path) && !rest.contains('/') {
+                                if let Some(rest) = name.strip_prefix(&path)
+                                    && !rest.contains('/')
+                                {
                                     xml.push_str(&format!("<d:response><d:href>/book/{name}</d:href><d:propstat><d:prop><d:getetag>{}</d:getetag><d:resourcetype/></d:prop></d:propstat></d:response>", etag_of(*v)));
                                 }
                             }
@@ -792,7 +894,8 @@ mod tests {
                     }
                     _ => ("405 Method Not Allowed", String::new(), vec![]),
                 };
-                let head = format!("HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", out.len());
+                let head =
+                    format!("HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", out.len());
                 let _ = stream.write_all(head.as_bytes());
                 let _ = stream.write_all(&out);
             }
@@ -814,8 +917,17 @@ mod tests {
     fn two_devices() {
         let store = Arc::new(Mutex::new(Store::default()));
         let url = serve(store.clone());
-        let settings = Settings { url, user: "me".into(), password: String::new(), password_command: "echo секрет".into() };
-        assert_eq!(settings.password().unwrap(), "секрет");
+        let settings = Settings {
+            url,
+            user: "me".into(),
+            password: String::new(),
+            password_command: "echo секрет".into(),
+            insecure: false,
+        };
+        // Без пароля из команды не синхронизируемся; команда — один раз.
+        assert!(sync(&temp_book("nopass"), &settings).is_err());
+        let settings = settings.resolve().unwrap();
+        assert_eq!((settings.password.as_str(), settings.needs_command()), ("секрет", false));
         let d = Date::new(2026, 10, 26).unwrap();
         let pc = temp_book("pc");
         let phone = temp_book("phone");
@@ -881,9 +993,116 @@ mod tests {
     }
 
     #[test]
+    fn weak_etags() {
+        assert_eq!(unescape("&#34;a&#x22;&amp;quot;&#zz;"), "\"a\"&quot;&#zz;");
+        let store = Arc::new(Mutex::new(Store { weak: true, ..Store::default() }));
+        let url = serve(store.clone());
+        let settings = Settings {
+            url,
+            user: String::new(),
+            password: String::new(),
+            password_command: String::new(),
+            insecure: false,
+        };
+        let book = temp_book("weak");
+        let d = Date::new(2026, 10, 26).unwrap();
+        let mut board = Board::default();
+        board.push(ListId::WORK, Task::new("раз"));
+        book.save(d, &board).unwrap();
+        assert_eq!(sync(&book, &settings).unwrap().unwrap().uploaded, 1);
+        // Правка уходит, хотя If-Match со слабым ETag сервер не принимает.
+        board.push(ListId::WORK, Task::new("два"));
+        book.save(d, &board).unwrap();
+        let s = sync(&book, &settings).unwrap().unwrap();
+        assert_eq!((s.uploaded, s.postponed), (1, 0));
+        let body = store.lock().unwrap().files["2026-10-26.md"].0.clone();
+        assert!(String::from_utf8(body).unwrap().contains("два"));
+        let _ = fs::remove_dir_all(book.dir());
+    }
+
+    #[test]
+    fn bad_file_does_not_block_others() {
+        let store = Arc::new(Mutex::new(Store::default()));
+        let url = serve(store.clone());
+        {
+            let mut st = store.lock().unwrap();
+            st.dirs.insert(String::new());
+            st.files.insert("2026-10-25.md".into(), (vec![0xff, 0xfe], 1));
+            st.files.insert("2026-10-26.md".into(), (b"## Work <!-- list:work -->\n- [ ] good\n".to_vec(), 2));
+            st.version = 2;
+        }
+        let settings = Settings {
+            url,
+            user: String::new(),
+            password: String::new(),
+            password_command: String::new(),
+            insecure: false,
+        };
+        let book = temp_book("bad");
+        let s = sync(&book, &settings).unwrap().unwrap();
+        assert_eq!(s.downloaded, 1);
+        assert_eq!(s.failed.len(), 1);
+        assert!(s.failed[0].starts_with("2026-10-25.md: не текст"), "{:?}", s.failed);
+        assert_eq!(texts(&book, Date::new(2026, 10, 26).unwrap()), ["good"]);
+        // Хорошее запомнено: в следующий раз не скачивается заново, плохое — снова в `failed`.
+        let s = sync(&book, &settings).unwrap().unwrap();
+        assert_eq!((s.downloaded, s.failed.len()), (0, 1));
+        let _ = fs::remove_dir_all(book.dir());
+    }
+
+    #[test]
+    fn worker() {
+        let store = Arc::new(Mutex::new(Store::default()));
+        let url = serve(store.clone());
+        let settings = Settings {
+            url,
+            user: String::new(),
+            password: String::new(),
+            password_command: String::new(),
+            insecure: false,
+        };
+        let book = temp_book("worker");
+        let mut board = Board::default();
+        board.push(ListId::WORK, Task::new("из потока"));
+        book.save(Date::new(2026, 10, 26).unwrap(), &board).unwrap();
+        // Сразу при запуске — синхронизация, итог приходит в канал.
+        let worker = Worker::start(book.dir(), Some(settings));
+        let first = (0..100)
+            .find_map(|_| {
+                std::thread::sleep(Duration::from_millis(20));
+                worker.outcomes().pop()
+            })
+            .expect("итог синхронизации");
+        assert_eq!(first.unwrap().uploaded, 1);
+        assert!(store.lock().unwrap().files.contains_key("2026-10-26.md"));
+        // Без настроек — ничего не делает; остановка не зависает.
+        worker.configure(None);
+        let started = std::time::Instant::now();
+        worker.stop(Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = fs::remove_dir_all(book.dir());
+    }
+
+    #[test]
     fn errors() {
         let book = temp_book("err");
-        let bad = Settings { url: "ftp://x".into(), user: String::new(), password: String::new(), password_command: String::new() };
+        let bad = Settings {
+            url: "ftp://x".into(),
+            user: String::new(),
+            password: String::new(),
+            password_command: String::new(),
+            insecure: false,
+        };
+        // Пароль по http:// в сеть — нельзя, на этот же компьютер — можно.
+        let open = Settings { url: "http://dav.example.com/book".into(), user: "me".into(), ..bad.clone() };
+        let err = sync(&book, &open).unwrap_err();
+        assert!(format!("{err:#}").contains("https://"), "{err:#}");
+        assert!(
+            is_loopback("http://127.0.0.1:8080/x")
+                && is_loopback("http://me@localhost/x")
+                && is_loopback("http://[::1]:80/")
+        );
+        assert!(!is_loopback("http://192.168.1.5/x") && !is_loopback("http://localhost.evil.com/"));
         assert!(sync(&book, &bad).is_err());
         // Сервер не отвечает — ошибка, а не зависание.
         let gone = Settings { url: "http://127.0.0.1:9/book".into(), ..bad };

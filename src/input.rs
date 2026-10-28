@@ -92,11 +92,7 @@ fn sgr_mouse(params: &str, last: u8) -> Option<Input> {
         65 => MouseKind::ScrollDown,
         _ => return None,
     };
-    Some(Input::Mouse(Mouse {
-        kind,
-        column: x.saturating_sub(1),
-        row: y.saturating_sub(1),
-    }))
+    Some(Input::Mouse(Mouse { kind, column: x.saturating_sub(1), row: y.saturating_sub(1) }))
 }
 
 impl From<Press> for Input {
@@ -108,9 +104,7 @@ impl From<Press> for Input {
 /// Включает kitty keyboard protocol (см. `Input::KittyProtocol`).
 pub fn kitty_on() {
     let mut out = io::stdout();
-    let _ = out
-        .write_all(format!("\x1b[>{KITTY_FLAGS}u").as_bytes())
-        .and_then(|()| out.flush());
+    let _ = out.write_all(format!("\x1b[>{KITTY_FLAGS}u").as_bytes()).and_then(|()| out.flush());
 }
 
 /// Выключает его обратно.
@@ -124,10 +118,7 @@ pub fn kitty_off() {
 pub fn ru_to_en(c: char) -> char {
     const RU: &str = "йцукенгшщзхъфывапролджэячсмитьбю.ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,ё";
     const EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,./QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?`";
-    RU.chars()
-        .position(|r| r == c)
-        .and_then(|i| EN.chars().nth(i))
-        .unwrap_or(c)
+    RU.chars().position(|r| r == c).and_then(|i| EN.chars().nth(i)).unwrap_or(c)
 }
 
 /// Символ, который даёт Shift на клавише американской раскладки.
@@ -171,11 +162,7 @@ enum Parsed {
 /// Клавиша kitty `CSI … u`: `code[:shifted[:base]] ; mods[:event] ; text`.
 fn kitty_key(params: &str) -> Option<Input> {
     let mut fields = params.split(';');
-    let keys: Vec<Option<u32>> = fields
-        .next()?
-        .split(':')
-        .map(|k| k.parse().ok())
-        .collect();
+    let keys: Vec<Option<u32>> = fields.next()?.split(':').map(|k| k.parse().ok()).collect();
     let mods_field = fields.next().unwrap_or("1");
     let mut mod_parts = mods_field.split(':');
     let mods = modifiers(mod_parts.next().and_then(|m| m.parse().ok()).unwrap_or(1));
@@ -183,21 +170,12 @@ fn kitty_key(params: &str) -> Option<Input> {
     if mod_parts.next().is_some_and(|e| e == "3") {
         return None;
     }
-    let text: String = fields
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .filter_map(|c| c.parse().ok())
-        .filter_map(char::from_u32)
-        .collect();
+    let text: String =
+        fields.next().unwrap_or("").split(':').filter_map(|c| c.parse().ok()).filter_map(char::from_u32).collect();
     let code = keys.first().copied().flatten()?;
     let special = match code {
         13 | 57414 => Some(KeyCode::Enter),
-        9 => Some(if mods.contains(KeyModifiers::SHIFT) {
-            KeyCode::BackTab
-        } else {
-            KeyCode::Tab
-        }),
+        9 => Some(if mods.contains(KeyModifiers::SHIFT) { KeyCode::BackTab } else { KeyCode::Tab }),
         27 => Some(KeyCode::Esc),
         8 | 127 => Some(KeyCode::Backspace),
         57399..=57408 => char::from_digit(code - 57399, 10).map(KeyCode::Char),
@@ -206,11 +184,7 @@ fn kitty_key(params: &str) -> Option<Input> {
         _ => None,
     };
     if let Some(code) = special {
-        let mods = if code == KeyCode::BackTab {
-            mods - KeyModifiers::SHIFT
-        } else {
-            mods
-        };
+        let mods = if code == KeyCode::BackTab { mods - KeyModifiers::SHIFT } else { mods };
         return Some(key(code, mods));
     }
     let c = char::from_u32(code)?;
@@ -218,24 +192,13 @@ fn kitty_key(params: &str) -> Option<Input> {
     let base = keys.get(2).copied().flatten().and_then(char::from_u32);
     let plain = mods - KeyModifiers::SHIFT;
     // Как набрано: текст от терминала, иначе символ с Shift или без.
-    let typed_char = text
-        .chars()
-        .next()
-        .filter(|t| !t.is_control())
-        .or(shifted)
-        .unwrap_or(c);
-    let typed = KeyEvent::new(
-        KeyCode::Char(typed_char),
-        if text.is_empty() && shifted.is_none() { mods } else { plain },
-    );
+    let typed_char = text.chars().next().filter(|t| !t.is_control()).or(shifted).unwrap_or(c);
+    let typed =
+        KeyEvent::new(KeyCode::Char(typed_char), if text.is_empty() && shifted.is_none() { mods } else { plain });
     // Физическая клавиша: из базовой раскладки или сама клавиша в латинской. Некоторые терминалы
     // (Konsole) применяют Caps Lock и Shift к коду клавиши нелатинской раскладки — понижаем.
     let physical = base.unwrap_or(c).to_lowercase().next().unwrap_or(c);
-    let physical = if base.is_none() {
-        ru_to_en(physical)
-    } else {
-        physical
-    };
+    let physical = if base.is_none() { ru_to_en(physical) } else { physical };
     let hotkey = if mods.contains(KeyModifiers::SHIFT) {
         KeyEvent::new(KeyCode::Char(us_shift(physical)), plain)
     } else {
@@ -246,10 +209,7 @@ fn kitty_key(params: &str) -> Option<Input> {
 
 /// Последовательность `CSI params final`, кроме клавиш kitty.
 fn csi(params: &str, last: u8) -> Parsed {
-    let nums: Vec<u32> = params
-        .split(';')
-        .map(|p| p.split(':').next().unwrap_or("").parse().unwrap_or(1))
-        .collect();
+    let nums: Vec<u32> = params.split(';').map(|p| p.split(':').next().unwrap_or("").parse().unwrap_or(1)).collect();
     let mods = modifiers(nums.get(1).copied().unwrap_or(1));
     let code = match last {
         b'A' => KeyCode::Up,
@@ -406,10 +366,7 @@ impl Reader {
     pub fn new() -> Reader {
         let mut out = io::stdout();
         let _ = out.write_all(b"\x1b[?u").and_then(|()| out.flush());
-        Reader {
-            buf: Vec::new(),
-            paste: None,
-        }
+        Reader { buf: Vec::new(), paste: None }
     }
 
     /// Ждёт ввода до `timeout`; возвращает то, что пришло.
@@ -474,11 +431,7 @@ impl Reader {
 /// Есть ли данные в stdin в пределах `timeout`.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn wait(timeout: Duration) -> io::Result<bool> {
-    let mut fd = libc::pollfd {
-        fd: io::stdin().as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
+    let mut fd = libc::pollfd { fd: io::stdin().as_raw_fd(), events: libc::POLLIN, revents: 0 };
     // SAFETY: один корректный pollfd.
     let r = unsafe { libc::poll(&mut fd, 1, timeout.as_millis().min(i32::MAX as u128) as i32) };
     waited(r)
@@ -509,11 +462,7 @@ fn waited(r: i32) -> io::Result<bool> {
         0 => Ok(false),
         _ => {
             let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                Ok(false)
-            } else {
-                Err(e)
-            }
+            if e.kind() == io::ErrorKind::Interrupted { Ok(false) } else { Err(e) }
         }
     }
 }
@@ -563,10 +512,7 @@ mod tests {
         // Shift на неалфавитной клавише даёт американский символ: `?` (справка) в любой раскладке.
         assert_eq!(press(b"\x1b[46::47;2;44u"), (ch(','), ch('?'), NONE));
         // Ctrl+C в русской раскладке.
-        assert_eq!(
-            press(b"\x1b[1089::99;5u"),
-            (ch('с'), ch('c'), KeyModifiers::CONTROL)
-        );
+        assert_eq!(press(b"\x1b[1089::99;5u"), (ch('с'), ch('c'), KeyModifiers::CONTROL));
         assert_eq!(press(b"\x1b[32;1;32u"), (ch(' '), ch(' '), NONE));
         assert_eq!(press(b"\x1b[13;1;13u").1, KeyCode::Enter);
         assert_eq!(press(b"\x1b[27u").1, KeyCode::Esc);
@@ -586,10 +532,7 @@ mod tests {
         assert_eq!(press(b"\x1b[D").1, KeyCode::Left);
         assert_eq!(press(b"\x1bOA").1, KeyCode::Up);
         // Shift+стрелки — сдвиг задачи.
-        assert_eq!(
-            press(b"\x1b[1;2A"),
-            (KeyCode::Up, KeyCode::Up, KeyModifiers::SHIFT)
-        );
+        assert_eq!(press(b"\x1b[1;2A"), (KeyCode::Up, KeyCode::Up, KeyModifiers::SHIFT));
         assert_eq!(press(b"\x1b[3~").1, KeyCode::Delete);
         assert_eq!(press(b"\x1bOP").1, KeyCode::F(1));
         assert_eq!(press(b"\x1b[Z").1, KeyCode::BackTab);

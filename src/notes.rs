@@ -24,9 +24,7 @@ impl Entry {
 
     /// Строки продолжения без отступа.
     fn body(&self) -> impl Iterator<Item = &str> {
-        self.lines[1..]
-            .iter()
-            .map(|l| l.strip_prefix(INDENT).unwrap_or(l.trim_start()))
+        self.lines[1..].iter().map(|l| l.strip_prefix(INDENT).unwrap_or(l.trim_start()))
     }
 }
 
@@ -87,10 +85,7 @@ fn head_kind(line: &str) -> (Kind<'_>, &str) {
     if let Some(text) = line.strip_prefix("- [ ] ") {
         return (Kind::Subtask { done: false }, text);
     }
-    if let Some(text) = line
-        .strip_prefix("- [x] ")
-        .or_else(|| line.strip_prefix("- [X] "))
-    {
+    if let Some(text) = line.strip_prefix("- [x] ").or_else(|| line.strip_prefix("- [X] ")) {
         return (Kind::Subtask { done: true }, text);
     }
     if let Some(rest) = line.strip_prefix("- ")
@@ -107,13 +102,7 @@ fn head_kind(line: &str) -> (Kind<'_>, &str) {
 fn note_lines(head: String, text: &str) -> Vec<String> {
     let mut parts = text.split('\n');
     let mut lines = vec![format!("{head}{}", parts.next().unwrap_or(""))];
-    lines.extend(parts.map(|l| {
-        if l.is_empty() {
-            String::new()
-        } else {
-            format!("{INDENT}{l}")
-        }
-    }));
+    lines.extend(parts.map(|l| if l.is_empty() { String::new() } else { format!("{INDENT}{l}") }));
     lines
 }
 
@@ -130,8 +119,8 @@ impl Notes {
             } else if line.is_empty() {
                 // Пустые строки, за которыми идёт продолжение, — часть пункта (как в Markdown).
                 let next = lines[i..].iter().position(|l| !l.is_empty()).map(|n| i + n);
-                let inside = next.is_some_and(|n| lines[n].starts_with(INDENT))
-                    && entries.last().is_some_and(|e| !e.is_blank());
+                let inside =
+                    next.is_some_and(|n| lines[n].starts_with(INDENT)) && entries.last().is_some_and(|e| !e.is_blank());
                 match (inside, next) {
                     (true, Some(n)) => {
                         let last = entries.last_mut().unwrap();
@@ -153,11 +142,7 @@ impl Notes {
     }
 
     pub fn serialize(&self) -> String {
-        self.entries
-            .iter()
-            .flat_map(|e| &e.lines)
-            .map(|l| format!("{l}\n"))
-            .collect()
+        self.entries.iter().flat_map(|e| &e.lines).map(|l| format!("{l}\n")).collect()
     }
 
     /// Без единого пункта — записей нет, файл не нужен.
@@ -167,26 +152,17 @@ impl Notes {
 
     /// Номера пунктов (не пустых строк между ними) — то, что показывает окно записей.
     pub fn visible(&self) -> Vec<usize> {
-        (0..self.entries.len())
-            .filter(|&i| !self.entries[i].is_blank())
-            .collect()
+        (0..self.entries.len()).filter(|&i| !self.entries[i].is_blank()).collect()
     }
 
     pub fn item(&self, i: usize) -> Item<'_> {
         let entry = &self.entries[i];
         let (kind, head) = head_kind(entry.head());
-        Item {
-            kind,
-            head,
-            body: entry.body().collect(),
-        }
+        Item { kind, head, body: entry.body().collect() }
     }
 
     pub fn summary(&self) -> Summary {
-        let mut summary = Summary {
-            any: !self.is_empty(),
-            ..Summary::default()
-        };
+        let mut summary = Summary { any: !self.is_empty(), ..Summary::default() };
         for entry in &self.entries {
             if let (Kind::Subtask { done }, _) = head_kind(entry.head()) {
                 summary.subtasks += 1;
@@ -198,16 +174,12 @@ impl Notes {
 
     /// Заметка, текст может быть в несколько строк. Возвращает номер пункта.
     pub fn add_note(&mut self, stamp: &str, text: &str) -> usize {
-        self.entries.push(Entry {
-            lines: note_lines(format!("- {stamp} "), text),
-        });
+        self.entries.push(Entry { lines: note_lines(format!("- {stamp} "), text) });
         self.entries.len() - 1
     }
 
     pub fn add_subtask(&mut self, text: &str) {
-        self.entries.push(Entry {
-            lines: vec![format!("- [ ] {text}")],
-        });
+        self.entries.push(Entry { lines: vec![format!("- [ ] {text}")] });
     }
 
     /// Можно ли править пункт многострочно: заметки и прочий текст — да, подзадачи — нет.
@@ -222,10 +194,7 @@ impl Notes {
         if let Kind::Subtask { .. } = item.kind {
             return item.head.to_string();
         }
-        std::iter::once(item.head)
-            .chain(item.body)
-            .collect::<Vec<_>>()
-            .join("\n")
+        std::iter::once(item.head).chain(item.body).collect::<Vec<_>>().join("\n")
     }
 
     /// Новый текст пункта; отметка подзадачи и метка заметки остаются.
@@ -258,9 +227,8 @@ impl Notes {
                 continue;
             }
             let (kind, head) = head_kind(entry.head());
-            let same_subtask = self.entries.iter().position(|e| {
-                matches!(head_kind(e.head()), (Kind::Subtask { .. }, h) if h == head)
-            });
+            let same_subtask =
+                self.entries.iter().position(|e| matches!(head_kind(e.head()), (Kind::Subtask { .. }, h) if h == head));
             match (kind, same_subtask) {
                 (Kind::Subtask { done }, Some(i)) => {
                     if done && !matches!(head_kind(self.entries[i].head()).0, Kind::Subtask { done: true }) {
@@ -315,10 +283,7 @@ mod tests {
         assert_eq!(notes.item(4).kind, Kind::Text);
         assert_eq!(head_kind("- 26.1x.2026 19:40 нет").0, Kind::Text);
         assert_eq!(head_kind("- коротко").0, Kind::Text);
-        assert_eq!(
-            notes.summary(),
-            Summary { any: true, subtasks_done: 1, subtasks: 2 }
-        );
+        assert_eq!(notes.summary(), Summary { any: true, subtasks_done: 1, subtasks: 2 });
         assert_eq!(notes.serialize(), SAMPLE);
         assert_eq!(Notes::parse("\n\n").summary(), Summary::default());
         // Отступ в начале файла — не продолжение, а обычный текст.
@@ -329,10 +294,7 @@ mod tests {
     fn old_stamps_are_converted() {
         let notes = Notes::parse("- 2026-10-26 19:40 по-старому\n  дальше\n- [ ] 2026-10-26 19:40 не метка\n");
         assert_eq!(notes.item(0).kind, Kind::Note { stamp: "26.10.2026 19:40" });
-        assert_eq!(
-            notes.serialize(),
-            "- 26.10.2026 19:40 по-старому\n  дальше\n- [ ] 2026-10-26 19:40 не метка\n"
-        );
+        assert_eq!(notes.serialize(), "- 26.10.2026 19:40 по-старому\n  дальше\n- [ ] 2026-10-26 19:40 не метка\n");
     }
 
     #[test]
@@ -359,10 +321,7 @@ mod tests {
         assert_eq!(notes.editable_text(0), "купить");
         notes.set_text(0, "купить две");
         notes.set_text(1, "позвонил ещё раз");
-        assert_eq!(
-            notes.serialize(),
-            "- [x] купить две\n- 26.10.2026 19:40 позвонил ещё раз\n"
-        );
+        assert_eq!(notes.serialize(), "- [x] купить две\n- 26.10.2026 19:40 позвонил ещё раз\n");
         notes.swap(0, 1);
         notes.remove(1);
         assert_eq!(notes.serialize(), "- 26.10.2026 19:40 позвонил ещё раз\n");

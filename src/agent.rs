@@ -1,8 +1,10 @@
 //! Книжка глазами ИИ-агента: чтение и правка с учётом скрытого. Скрытые списки
-//! (`AI_HIDDEN.md`) и скрытые задачи агент не видит вовсе — ни в выдаче, ни в поиске,
-//! ни по ссылке, а писать в скрытые списки не может. Нумерация задач и пунктов записей —
+//! (пометка в `LISTS.md`) и скрытые задачи агент не видит вовсе — ни в выдаче, ни в поиске,
+//! ни по ссылке, ни через старые копии и историю, а писать в скрытые списки не может. Нумерация задач и пунктов записей —
 //! только среди видимого, чтобы по пропускам нельзя было догадаться о скрытом.
 //! Каждая правка — прочитать с диска, изменить, записать: открытая программа подхватит её сама.
+
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 
@@ -11,6 +13,12 @@ use crate::clock::{self, Date};
 use crate::lists::Lists;
 use crate::model::{Board, ListId, State, Task};
 use crate::notes::{Kind, Notes};
+
+/// Видимость для агента: реестр (скрытые списки) и id задач, скрытых целиком.
+struct Sight {
+    registry: Lists,
+    hidden_tasks: HashSet<String>,
+}
 
 pub struct Agent {
     book: Book,
@@ -74,8 +82,7 @@ pub fn parse_date(text: &str, today: Date) -> Result<Date> {
         "yesterday" | "вчера" => return Ok(today.add_days(-1)),
         _ => {}
     }
-    Date::parse_input(text, today)
-        .with_context(|| format!("not a date «{text}»: use YYYY-MM-DD, DD.MM, +N, today"))
+    Date::parse_input(text, today).with_context(|| format!("not a date «{text}»: use YYYY-MM-DD, DD.MM, +N, today"))
 }
 
 fn state_mark(state: State) -> String {
@@ -100,16 +107,36 @@ impl Agent {
         self.book.lists()
     }
 
-    fn visible(task: &Task, category: ListId, registry: &Lists) -> bool {
-        !registry.is_hidden(category) && !task.private
+    /// Что видно агенту. Задача с id видна или скрыта целиком, по её последней копии
+    /// (на самой поздней странице): переложили в скрытый список или скрыли — не видны
+    /// и старые копии `[>]` в открытых списках, и записи; открыли снова — видна.
+    fn sight(&self) -> Result<Sight> {
+        let registry = self.registry()?;
+        let mut latest: HashMap<String, bool> = HashMap::new();
+        for date in self.book.dates()? {
+            let board = self.book.load(date)?;
+            for category in board.ids() {
+                for task in board.list(category) {
+                    if let Some(id) = &task.id {
+                        latest.insert(id.clone(), registry.is_hidden(category) || task.private);
+                    }
+                }
+            }
+        }
+        let hidden_tasks = latest.into_iter().filter(|(_, hidden)| *hidden).map(|(id, _)| id).collect();
+        Ok(Sight { registry, hidden_tasks })
+    }
+
+    fn visible(task: &Task, category: ListId, sight: &Sight) -> bool {
+        !sight.registry.is_hidden(category)
+            && !task.private
+            && task.id.as_ref().is_none_or(|id| !sight.hidden_tasks.contains(id))
     }
 
     /// Видимые задачи списка: (номер среди видимых с 1, индекс в списке).
-    fn visible_indices(board: &Board, category: ListId, registry: &Lists) -> Vec<usize> {
+    fn visible_indices(board: &Board, category: ListId, sight: &Sight) -> Vec<usize> {
         let list = board.list(category);
-        (0..list.len())
-            .filter(|&i| Self::visible(&list[i], category, registry))
-            .collect()
+        (0..list.len()).filter(|&i| Self::visible(&list[i], category, sight)).collect()
     }
 
     /// Ссылка на задачу в выдаче: id, если есть, иначе `дата/список/номер`.
@@ -123,15 +150,16 @@ impl Agent {
     /// Задача по ссылке: id (берётся живая копия — не `[>]`, с самой поздней страницы) или
     /// `дата/список/номер` (номер — среди видимых, с 1). Скрытая — «не найдена».
     fn resolve(&self, reference: &str) -> Result<Found> {
-        let registry = self.registry()?;
+        let sight = self.sight()?;
+        let registry = &sight.registry;
         let reference = reference.trim();
         let parts: Vec<&str> = reference.split('/').collect();
         if let [date, list, number] = parts[..] {
             let date = Date::parse_iso(date).with_context(|| format!("bad date in task ref «{reference}»"))?;
-            let category = parse_list(list, &registry)?;
+            let category = parse_list(list, registry)?;
             let number: usize = number.parse().with_context(|| format!("bad number in task ref «{reference}»"))?;
             let board = self.book.load(date)?;
-            let visible = Self::visible_indices(&board, category, &registry);
+            let visible = Self::visible_indices(&board, category, &sight);
             let index = number
                 .checked_sub(1)
                 .and_then(|n| visible.get(n).copied())
@@ -142,9 +170,10 @@ impl Agent {
         for date in self.book.dates()?.into_iter().rev() {
             let board = self.book.load(date)?;
             for category in registry.order(board.ids()) {
-                let found = board.list(category).iter().position(|t| {
-                    t.id.as_deref() == Some(reference) && Self::visible(t, category, &registry)
-                });
+                let found = board
+                    .list(category)
+                    .iter()
+                    .position(|t| t.id.as_deref() == Some(reference) && Self::visible(t, category, &sight));
                 let Some(index) = found else { continue };
                 let live = !matches!(board.list(category)[index].state, State::Migrated(_));
                 let found = Found { date, category, index, board: board.clone() };
@@ -182,7 +211,8 @@ impl Agent {
 
     /// Страницы с видимыми делами за период: дата и сколько открыто / сделано.
     pub fn list_pages(&self, from: Option<Date>, to: Option<Date>) -> Result<String> {
-        let registry = self.registry()?;
+        let sight = self.sight()?;
+        let registry = &sight.registry;
         let mut out = String::new();
         for date in self.book.dates()? {
             if from.is_some_and(|f| date < f) || to.is_some_and(|t| date > t) {
@@ -191,7 +221,7 @@ impl Agent {
             let board = self.book.load(date)?;
             let (mut open, mut done) = (0, 0);
             for category in registry.order(board.ids()) {
-                for i in Self::visible_indices(&board, category, &registry) {
+                for i in Self::visible_indices(&board, category, &sight) {
                     match board.list(category)[i].state {
                         State::Open => open += 1,
                         State::Done => done += 1,
@@ -218,7 +248,8 @@ impl Agent {
         if from.days_until(to) > 366 {
             bail!("period is too long (max 366 days)");
         }
-        let registry = self.registry()?;
+        let sight = self.sight()?;
+        let registry = &sight.registry;
         let today = Date::today();
         let mut out = String::new();
         let mut date = from;
@@ -232,7 +263,7 @@ impl Agent {
                     continue;
                 }
                 page.push_str(&format!("### {}\n", registry.label(category)));
-                let visible = Self::visible_indices(&board, category, &registry);
+                let visible = Self::visible_indices(&board, category, &sight);
                 if visible.is_empty() {
                     page.push_str("(empty)\n");
                 }
@@ -256,7 +287,7 @@ impl Agent {
                         n + 1,
                         state_mark(task.state),
                         task.text,
-                        Self::task_ref(date, category, n + 1, task, &registry)
+                        Self::task_ref(date, category, n + 1, task, registry)
                     ));
                     if with_notes && let Some(id) = &task.id {
                         page.push_str(&indent(&self.render_notes(id)?, "   "));
@@ -311,7 +342,8 @@ impl Agent {
         let history = self.book.history(id)?;
         if history.len() > 1 {
             out.push_str("History:\n");
-            for (date, category, state) in history {
+            // Строк о скрытых списках нет: агент не знает даже их названий.
+            for (date, category, state) in history.into_iter().filter(|(_, c, _)| !registry.is_hidden(*c)) {
                 out.push_str(&format!("  {date} {} {}\n", registry.label(category), state_mark(state)));
             }
         }
@@ -331,7 +363,8 @@ impl Agent {
         if query.is_empty() {
             bail!("empty query");
         }
-        let registry = self.registry()?;
+        let sight = self.sight()?;
+        let registry = &sight.registry;
         let mut out = String::new();
         let mut seen_notes = std::collections::HashSet::new();
         for date in self.book.dates()? {
@@ -340,7 +373,7 @@ impl Agent {
             }
             let board = self.book.load(date)?;
             for category in registry.order(board.ids()) {
-                for (n, &i) in Self::visible_indices(&board, category, &registry).iter().enumerate() {
+                for (n, &i) in Self::visible_indices(&board, category, &sight).iter().enumerate() {
                     let task = &board.list(category)[i];
                     let mut hits = Vec::new();
                     // Записи одни на все копии задачи — ищем в них один раз.
@@ -361,7 +394,7 @@ impl Agent {
                             registry.label(category),
                             state_mark(task.state),
                             task.text,
-                            Self::task_ref(date, category, n + 1, task, &registry)
+                            Self::task_ref(date, category, n + 1, task, registry)
                         ));
                         for hit in hits {
                             out.push_str(&format!("    note: {hit}\n"));
@@ -387,6 +420,7 @@ impl Agent {
         }
         let mut board = self.book.load(date)?;
         let mut task = Task::new(text);
+        task.touch();
         let id = self.book.new_id();
         task.id = Some(id.clone());
         board.push(category, task);
@@ -411,6 +445,7 @@ impl Agent {
                 bail!("task text must be one non-empty line");
             }
             found.task_mut().text = text.to_string();
+            found.task_mut().touch();
         }
         if let Some(status) = status {
             if let State::Migrated(to) = found.task().state {
@@ -428,11 +463,11 @@ impl Agent {
             found.index = index;
         }
         if let Some(position) = position {
-            let registry = self.registry()?;
+            let sight = self.sight()?;
             let target = position.max(1) - 1;
             // Сдвигаем по соседям, пока не встанет на нужное место среди видимых.
             loop {
-                let visible = Self::visible_indices(&found.board, found.category, &registry);
+                let visible = Self::visible_indices(&found.board, found.category, &sight);
                 let now = visible.iter().position(|&i| i == found.index).unwrap();
                 let target = target.min(visible.len() - 1);
                 let step = if now > target {
@@ -461,15 +496,14 @@ impl Agent {
             bail!("the task is already on {to}");
         }
         let id = self.ensure_id(&mut found)?;
-        self.book
-            .postpone(&mut found.board, found.date, found.category, found.index, to)?;
+        self.book.postpone(&mut found.board, found.date, found.category, found.index, to)?;
         Ok(format!("Moved to {to} — ref: {id}\n"))
     }
 
     /// Удаление задачи; её записи, если других копий нет, уходят в `DELETED_NOTES.md`.
     pub fn delete_task(&self, reference: &str) -> Result<String> {
         let mut found = self.resolve(reference)?;
-        let task = found.board.remove(found.category, found.index).unwrap();
+        let task = found.board.delete(found.category, found.index).unwrap();
         self.book.save(found.date, &found.board)?;
         let archived = self.book.archive_notes(&task, found.date, &clock::stamp())?;
         Ok(if archived {
@@ -490,10 +524,7 @@ impl Agent {
 
     /// Номер пункта (с 1) — в индекс пункта записей.
     fn entry_index(notes: &Notes, entry: usize) -> Result<usize> {
-        entry
-            .checked_sub(1)
-            .and_then(|n| notes.visible().get(n).copied())
-            .with_context(|| format!("no entry #{entry}"))
+        entry.checked_sub(1).and_then(|n| notes.visible().get(n).copied()).with_context(|| format!("no entry #{entry}"))
     }
 
     /// Заметка (метка времени ставится сама, может быть в несколько строк) или подзадача.
@@ -545,8 +576,7 @@ impl Agent {
     pub fn delete_note(&self, reference: &str, entry: usize) -> Result<String> {
         let (found, id, mut notes) = self.notes_of(reference)?;
         let i = Self::entry_index(&notes, entry)?;
-        self.book
-            .archive_entry(&found.task().text, &id, found.date, &clock::stamp(), &notes.raw(i))?;
+        self.book.archive_entry(&found.task().text, &id, found.date, &clock::stamp(), &notes.raw(i))?;
         notes.remove(i);
         self.book.save_notes(&id, &notes)?;
         Ok(format!("Deleted entry #{entry} (saved to DELETED_NOTES.md) — ref: {id}\n"))
@@ -645,13 +675,58 @@ mod tests {
         // Удаление пункта и задачи — в архив.
         agent.delete_note(&id, 1).unwrap();
         let deleted = fs::read_to_string(agent.book().dir().join(crate::book::DELETED_NOTES)).unwrap();
-        assert!(deleted.contains(&format!("- {}", Date::today().format(c"%d.%m.%Y"))) && deleted.contains("  продолжение\n"), "{deleted}");
+        assert!(
+            deleted.contains(&format!("- {}", Date::today().format(c"%d.%m.%Y")))
+                && deleted.contains("  продолжение\n"),
+            "{deleted}"
+        );
         agent.delete_task(&format!("{}/Работа/1", d(27))).unwrap();
         // Копия-запись на 26-м ещё есть — записи живы.
         assert!(agent.get_task(&id).unwrap().contains("собрать цифры"));
         assert!(agent.add_task(d(28), ListId::HOME, "две\nстроки").is_err());
         let out = agent.add_task(d(28), ListId::HOME, "новая").unwrap();
         assert!(out.starts_with("Added to Дом on 2026-10-28 — ref: "), "{out}");
+        cleanup(agent);
+    }
+
+    #[test]
+    fn moved_into_hidden_list() {
+        // Задачу перенесли на 27-е (на 26-м осталась [>] в «Работе»), а там переложили
+        // в скрытое «Личное»: агент не видит ни старую копию, ни записи, ни название списка.
+        let agent = agent("moved");
+        let mut lists = agent.book().lists().unwrap();
+        lists.set_hidden(ListId::PERSONAL, true).unwrap();
+        agent.book().save_lists(&lists).unwrap();
+        let mut task = Task::new("секретное дело");
+        task.id = Some("abc123".into());
+        let mut old = Board::default();
+        let mut record = task.clone();
+        record.state = State::Migrated(d(27));
+        old.push(ListId::WORK, record);
+        agent.book().save(d(26), &old).unwrap();
+        let mut page = Board::default();
+        page.push(ListId::PERSONAL, task);
+        agent.book().save(d(27), &page).unwrap();
+        let mut notes = crate::notes::Notes::default();
+        notes.add_note("26.10.2026 10:00", "диагноз врача");
+        agent.book().save_notes("abc123", &notes).unwrap();
+
+        assert!(agent.get_task("abc123").is_err());
+        assert!(agent.get_task("2026-10-26/Работа/1").is_err());
+        assert_eq!(agent.search("диагноз", None, None).unwrap(), "Nothing found.\n");
+        assert_eq!(agent.search("секретное", None, None).unwrap(), "Nothing found.\n");
+        let pages = agent.get_pages(d(26), d(27), None, true).unwrap();
+        assert!(!pages.contains("секретное") && !pages.contains("диагноз") && !pages.contains("Личное"), "{pages}");
+        assert!(agent.delete_task("abc123").is_err());
+
+        // Переложили обратно в открытый список и открыли — снова видна, но без строк истории
+        // о скрытом списке.
+        let mut page = agent.book().load(d(27)).unwrap();
+        page.move_to(ListId::PERSONAL, 0, ListId::HOME);
+        agent.book().save(d(27), &page).unwrap();
+        let task = agent.get_task("abc123").unwrap();
+        assert!(task.contains("диагноз врача") && task.contains("2026-10-27 Дом"), "{task}");
+        assert!(!task.contains("Личное"), "{task}");
         cleanup(agent);
     }
 

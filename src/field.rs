@@ -66,11 +66,7 @@ impl LineInput {
     pub fn delete_word(&mut self) {
         let before = &self.text[..self.cursor];
         let trimmed = before.trim_end();
-        let start = trimmed
-            .char_indices()
-            .rev()
-            .find(|(_, c)| c.is_whitespace())
-            .map_or(0, |(i, c)| i + c.len_utf8());
+        let start = trimmed.char_indices().rev().find(|(_, c)| c.is_whitespace()).map_or(0, |(i, c)| i + c.len_utf8());
         self.text.replace_range(start..self.cursor, "");
         self.cursor = start;
     }
@@ -80,10 +76,7 @@ impl LineInput {
     }
 
     fn next_boundary(&self) -> Option<usize> {
-        self.text[self.cursor..]
-            .chars()
-            .next()
-            .map(|c| self.cursor + c.len_utf8())
+        self.text[self.cursor..].chars().next().map(|c| self.cursor + c.len_utf8())
     }
 }
 
@@ -101,11 +94,7 @@ impl TextArea {
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
         let cursor = text.len();
-        Self {
-            text,
-            cursor,
-            width: 60,
-        }
+        Self { text, cursor, width: 60 }
     }
 
     pub fn text(&self) -> &str {
@@ -230,11 +219,7 @@ impl TextArea {
         let before = &self.text[line_start..self.cursor];
         let trimmed = before.trim_end();
         let start = line_start
-            + trimmed
-                .char_indices()
-                .rev()
-                .find(|(_, c)| c.is_whitespace())
-                .map_or(0, |(i, c)| i + c.len_utf8());
+            + trimmed.char_indices().rev().find(|(_, c)| c.is_whitespace()).map_or(0, |(i, c)| i + c.len_utf8());
         self.text.replace_range(start..self.cursor, "");
         self.cursor = start;
     }

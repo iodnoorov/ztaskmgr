@@ -1,7 +1,3 @@
-use std::fs;
-use std::io::{ErrorKind, Write};
-use std::path::Path;
-
 use anyhow::{Context, Result, bail};
 
 use crate::clock::Date;
@@ -36,6 +32,17 @@ pub fn parse(text: &str, lists: &Lists) -> Result<Board> {
             continue;
         }
 
+        if let Some(graves) = line.strip_prefix(GRAVES).and_then(|l| l.strip_suffix(" -->")) {
+            for grave in graves.split_whitespace() {
+                let parsed = grave.split_once('@').and_then(|(id, t)| Some((id, t.parse::<u64>().ok()?)));
+                match parsed {
+                    Some((id, t)) if is_valid_id(id) => board.bury(id, t),
+                    _ => bail!("строка {n}: испорченное надгробие «{grave}»"),
+                }
+            }
+            continue;
+        }
+
         if let Some(title) = line.strip_prefix("## ") {
             let (category, title) = parse_heading(title, lists)
                 .with_context(|| format!("строка {n}: неизвестный список «{}»", title.trim()))?;
@@ -45,7 +52,9 @@ pub fn parse(text: &str, lists: &Lists) -> Result<Board> {
         }
 
         let Some(task) = parse_task(line) else {
-            bail!("строка {n}: ожидалась задача «- [ ] …», «- [x] …», «- [>] … → ГГГГ-ММ-ДД» или заголовок «## …»: {line}");
+            bail!(
+                "строка {n}: ожидалась задача «- [ ] …», «- [x] …», «- [>] … → ГГГГ-ММ-ДД» или заголовок «## …»: {line}"
+            );
         };
         let Some(category) = current else {
             bail!("строка {n}: задача до первого заголовка списка");
@@ -56,12 +65,19 @@ pub fn parse(text: &str, lists: &Lists) -> Result<Board> {
     Ok(board)
 }
 
-/// Служебное в конце строки задачи: `<!-- id:k3x9ab private -->` — ключ доп. записей и
-/// пометка «скрыта от ИИ», в любом наборе. Комментарий из других слов — часть текста.
+/// Строка надгробий удалённых задач в конце страницы: `<!-- deleted: abc@1730112345678 -->`.
+const GRAVES: &str = "<!-- deleted: ";
+
+/// Служебное в конце строки задачи: `<!-- id:k3x9ab t:1730112345678 private -->` — ключ
+/// доп. записей, время правки и пометка «скрыта от ИИ», в любом наборе. Незнакомые пометки
+/// `ключ:значение` (от более новой версии) сохраняются; комментарий из других слов — часть
+/// текста.
 #[derive(Default)]
 struct Meta {
     id: Option<String>,
     private: bool,
+    modified: u64,
+    extra: Vec<String>,
 }
 
 fn split_meta(line: &str) -> Option<(&str, Meta)> {
@@ -74,12 +90,20 @@ fn split_meta(line: &str) -> Option<(&str, Meta)> {
     };
     let mut meta = Meta::default();
     for word in comment.split_whitespace() {
-        match word.strip_prefix("id:") {
+        let (key, value) = word.split_once(':').unwrap_or((word, ""));
+        match (key, value) {
             // Испорченный id — ошибка, а не текст: иначе записи потеряют задачу.
-            Some(id) if !is_valid_id(id) => return None,
-            Some(id) => meta.id = Some(id.to_string()),
-            None if word == "private" => meta.private = true,
-            None => return plain,
+            ("id", id) if !is_valid_id(id) => return None,
+            ("id", id) => meta.id = Some(id.to_string()),
+            ("t", t) => match t.parse() {
+                Ok(t) => meta.modified = t,
+                Err(_) => return plain,
+            },
+            ("private", "") => meta.private = true,
+            (key, value) if !value.is_empty() && !key.is_empty() && key.bytes().all(|b| b.is_ascii_lowercase()) => {
+                meta.extra.push(word.to_string());
+            }
+            _ => return plain,
         }
     }
     Some((text, meta))
@@ -91,7 +115,7 @@ pub fn is_valid_id(id: &str) -> bool {
 }
 
 fn parse_task(line: &str) -> Option<Task> {
-    let (line, Meta { id, private }) = split_meta(line)?;
+    let (line, Meta { id, private, modified, extra }) = split_meta(line)?;
     let rest = line.strip_prefix("- [")?;
     let (mark, text) = rest.split_once("] ").or_else(|| {
         // Пустой текст: «- [ ]» без пробела в конце после trim_end.
@@ -107,12 +131,7 @@ fn parse_task(line: &str) -> Option<Task> {
         }
         _ => return None,
     };
-    Some(Task {
-        text: text.to_string(),
-        state,
-        id,
-        private,
-    })
+    Some(Task { text: text.to_string(), state, id, private, modified, extra })
 }
 
 /// Между текстом перенесённой задачи и датой, на которую её перенесли.
@@ -142,47 +161,27 @@ pub fn serialize(board: &Board, lists: &Lists) -> String {
                 out.push_str(&date.to_string());
             }
             let mut meta: Vec<String> = task.id.iter().map(|id| format!("id:{id}")).collect();
+            if task.modified > 0 {
+                meta.push(format!("t:{}", task.modified));
+            }
             if task.private {
                 meta.push("private".into());
             }
+            meta.extend(task.extra.iter().cloned());
             if !meta.is_empty() {
                 out.push_str(&format!(" <!-- {} -->", meta.join(" ")));
             }
             out.push('\n');
         }
     }
+    if !board.graves().is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let graves: Vec<String> = board.graves().iter().map(|(id, t)| format!("{id}@{t}")).collect();
+        out.push_str(&format!("{GRAVES}{} -->\n", graves.join(" ")));
+    }
     out
-}
-
-/// Загружает доску; отсутствующий файл — пустая доска.
-pub fn load(path: &Path, lists: &Lists) -> Result<Board> {
-    match fs::read_to_string(path) {
-        Ok(text) => parse(&text, lists).with_context(|| format!("разбор {}", path.display())),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(Board::default()),
-        Err(e) => Err(e).with_context(|| format!("чтение {}", path.display())),
-    }
-}
-
-pub fn save(path: &Path, board: &Board, lists: &Lists) -> Result<()> {
-    write_atomic(path, &serialize(board, lists))
-}
-
-/// Пишет через временный файл и rename, чтобы сбой посреди записи не испортил данные.
-pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        fs::create_dir_all(dir).with_context(|| format!("создание {}", dir.display()))?;
-    }
-
-    let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp = Path::new(&tmp_name);
-
-    let mut file = fs::File::create(tmp).with_context(|| format!("запись {}", tmp.display()))?;
-    file.write_all(text.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
-
-    fs::rename(tmp, path).with_context(|| format!("переименование в {}", path.display()))
 }
 
 #[cfg(test)]
@@ -196,14 +195,6 @@ mod tests {
 
     fn serialize(board: &Board) -> String {
         super::serialize(board, &Lists::default())
-    }
-
-    fn load(path: &Path) -> Result<Board> {
-        super::load(path, &Lists::default())
-    }
-
-    fn save(path: &Path, board: &Board) -> Result<()> {
-        super::save(path, board, &Lists::default())
     }
 
     const SAMPLE: &str = "\
@@ -263,6 +254,19 @@ mod tests {
     }
 
     #[test]
+    fn times_extras_and_graves() {
+        let text = "## Работа <!-- list:work -->\n- [ ] a <!-- id:aa t:1730112345678 future:yes -->\n- [ ] b <!-- t:вчера -->\n\n<!-- deleted: bb@1730000000000 cc@5 -->\n";
+        let board = parse(text).unwrap();
+        let a = &board.list(ListId::WORK)[0];
+        assert_eq!((a.modified, a.extra.as_slice()), (1730112345678, ["future:yes".to_string()].as_slice()));
+        // Не число после t: — обычный комментарий, часть текста.
+        assert_eq!(board.list(ListId::WORK)[1].text, "b <!-- t:вчера -->");
+        assert_eq!(board.buried("bb"), Some(1730000000000));
+        assert_eq!(serialize(&board), text);
+        assert!(parse("## Работа\n<!-- deleted: Bad!@1 -->\n").is_err());
+    }
+
+    #[test]
     fn lists_by_id_and_title() {
         // Пустых списков в файле нет; пустая страница — пустой текст.
         assert_eq!(serialize(&Board::default()), "");
@@ -316,19 +320,5 @@ mod tests {
         // Обычный комментарий в тексте — текст.
         let board = parse("## Работа\n- [ ] x <!-- не id -->\n").unwrap();
         assert_eq!(board.list(ListId::WORK)[0].text, "x <!-- не id -->");
-    }
-
-    #[test]
-    fn save_and_load() {
-        let dir = std::env::temp_dir().join(format!("ztaskmgr-test-{}", std::process::id()));
-        let path = dir.join("nested/tasks.md");
-        assert_eq!(load(&path).unwrap(), Board::default());
-
-        let board = parse(SAMPLE).unwrap();
-        save(&path, &board).unwrap();
-        assert_eq!(load(&path).unwrap(), board);
-        assert!(!dir.join("nested/tasks.md.tmp").exists());
-
-        fs::remove_dir_all(&dir).unwrap();
     }
 }

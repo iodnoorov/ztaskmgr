@@ -17,7 +17,8 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// Описание книжки для агента; `lists` — доступные ему списки (`list_names`).
 fn instructions(lists: &str) -> String {
-    format!("\
+    format!(
+        "\
 ztaskmgr is the user's personal notebook of tasks. Every date is a page; every page has the \
 same lists: {lists}. A list is named by its title or by the id in parentheses. The position of a task in \
 its list is its priority. Unfinished tasks move to the next day automatically; on the old page \
@@ -28,7 +29,8 @@ not move to the next day.\n\
 Tasks are referenced by `ref` from the tool output: a short id, or DATE/LIST/N for tasks that \
 have none yet. Prefer ids. Deleted notes are kept in the archive, so nothing is lost.\n\
 Some lists and tasks are hidden from you by the user's choice: do not ask about them or try to \
-guess them. The user writes in Russian: answer and write notes in the user's language.")
+guess them. The user writes in Russian: answer and write notes in the user's language."
+    )
 }
 
 fn tools(lists: &str) -> Value {
@@ -135,10 +137,7 @@ fn date_arg(args: &Value, name: &str, today: Date) -> Result<Option<Date>> {
 fn number_arg(args: &Value, name: &str) -> Result<Option<usize>> {
     match args.get(name) {
         None | Some(Value::Null) => Ok(None),
-        Some(v) => v
-            .as_u64()
-            .map(|n| Some(n as usize))
-            .with_context(|| format!("`{name}` must be a positive integer")),
+        Some(v) => v.as_u64().map(|n| Some(n as usize)).with_context(|| format!("`{name}` must be a positive integer")),
     }
 }
 
@@ -163,11 +162,9 @@ fn call(agent: &Agent, name: &str, args: &Value) -> Result<String> {
             let with_notes = args.get("with_notes").and_then(Value::as_bool).unwrap_or(false);
             agent.get_pages(from, to, lists.as_deref(), with_notes)
         }
-        "search" => agent.search(
-            required(args, "query")?,
-            date_arg(args, "from", today)?,
-            date_arg(args, "to", today)?,
-        ),
+        "search" => {
+            agent.search(required(args, "query")?, date_arg(args, "from", today)?, date_arg(args, "to", today)?)
+        }
         "get_task" => agent.get_task(required(args, "task")?),
         "add_task" => agent.add_task(
             parse_date(required(args, "date")?, today)?,
@@ -197,10 +194,9 @@ fn call(agent: &Agent, name: &str, args: &Value) -> Result<String> {
             str_arg(args, "text"),
             args.get("done").and_then(Value::as_bool),
         ),
-        "delete_note" => agent.delete_note(
-            required(args, "task")?,
-            number_arg(args, "entry")?.context("missing `entry`")?,
-        ),
+        "delete_note" => {
+            agent.delete_note(required(args, "task")?, number_arg(args, "entry")?.context("missing `entry`")?)
+        }
         other => anyhow::bail!("unknown tool «{other}»"),
     }
 }
@@ -213,10 +209,7 @@ pub fn handle(agent: &Agent, message: &Value) -> Option<Value> {
     let lists = agent.book().lists().map(|l| list_names(&l)).unwrap_or_default();
     let result = match method {
         "initialize" => {
-            let version = params
-                .get("protocolVersion")
-                .and_then(Value::as_str)
-                .unwrap_or(PROTOCOL_VERSION);
+            let version = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION);
             json!({
                 "protocolVersion": version,
                 "capabilities": {"tools": {}},
@@ -227,8 +220,6 @@ pub fn handle(agent: &Agent, message: &Value) -> Option<Value> {
         "ping" => json!({}),
         "tools/list" => json!({"tools": tools(&lists)}),
         "tools/call" => {
-            // Сначала — то, что пришло с других устройств, чтобы агент видел всё.
-            let _ = agent.book().merge_conflicts();
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             match call(agent, name, &args) {
@@ -314,10 +305,7 @@ mod tests {
         )
         .unwrap();
         let result = &reply["result"];
-        (
-            result["isError"].as_bool().unwrap(),
-            result["content"][0]["text"].as_str().unwrap().to_string(),
-        )
+        (result["isError"].as_bool().unwrap(), result["content"][0]["text"].as_str().unwrap().to_string())
     }
 
     #[test]
@@ -332,12 +320,8 @@ mod tests {
         assert_eq!(init["result"]["serverInfo"]["name"], "ztaskmgr");
         assert!(handle(&agent, &json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
         let list = handle(&agent, &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
-        let names: Vec<&str> = list["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> =
+            list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"get_pages") && names.contains(&"delete_note"), "{names:?}");
         let unknown = handle(&agent, &json!({"jsonrpc": "2.0", "id": 3, "method": "nope"})).unwrap();
         assert_eq!(unknown["error"]["code"], -32601);

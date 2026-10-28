@@ -1,40 +1,44 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::{LazyLock, Mutex};
 
-use crate::clock::Date;
+use crate::clock::{self, Date};
 
 /// Список задач — по постоянному id (`work`, `k3x9ab`). Название и место на экране хранит
-/// реестр списков (`lists.rs`): их можно менять, не переписывая страниц. Id интернируются,
-/// чтобы тип оставался `Copy` и сравнивался за число.
+/// реестр списков (`lists.rs`): их можно менять, не переписывая страниц. Внутри — ссылка
+/// на строку с `'static`: тип `Copy`, `as_str` бесплатный, сравнение — по содержимому.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ListId(u32);
+pub struct ListId(&'static str);
 
-/// Списки новой книжки; их id одинаковы на всех устройствах.
-const DEFAULT_IDS: [&str; 4] = ["work", "home", "personal", "other"];
-
-static IDS: LazyLock<Mutex<Vec<&'static str>>> = LazyLock::new(|| Mutex::new(DEFAULT_IDS.to_vec()));
+/// Id, встреченные за время работы: каждая строка хранится один раз, а не при каждом чтении
+/// страницы заново. Нужно только при создании id, а не при его использовании.
+static IDS: LazyLock<Mutex<HashSet<&'static str>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 impl ListId {
-    pub const WORK: ListId = ListId(0);
-    pub const HOME: ListId = ListId(1);
-    pub const PERSONAL: ListId = ListId(2);
-    pub const OTHER: ListId = ListId(3);
+    /// Списки новой книжки; их id одинаковы на всех устройствах.
+    pub const WORK: ListId = ListId("work");
+    pub const HOME: ListId = ListId("home");
+    pub const PERSONAL: ListId = ListId("personal");
+    pub const OTHER: ListId = ListId("other");
     pub const DEFAULTS: [ListId; 4] = [Self::WORK, Self::HOME, Self::PERSONAL, Self::OTHER];
 
     pub fn new(id: &str) -> Self {
+        if let Some(known) = Self::DEFAULTS.into_iter().find(|d| d.0 == id) {
+            return known;
+        }
         let mut ids = IDS.lock().unwrap_or_else(|e| e.into_inner());
-        let n = match ids.iter().position(|&known| known == id) {
-            Some(n) => n,
+        match ids.get(id) {
+            Some(&known) => ListId(known),
             None => {
-                ids.push(Box::leak(id.to_string().into_boxed_str()));
-                ids.len() - 1
+                let leaked: &'static str = Box::leak(id.to_string().into_boxed_str());
+                ids.insert(leaked);
+                ListId(leaked)
             }
-        };
-        ListId(n as u32)
+        }
     }
 
     pub fn as_str(self) -> &'static str {
-        IDS.lock().unwrap_or_else(|e| e.into_inner())[self.0 as usize]
+        self.0
     }
 }
 
@@ -64,16 +68,17 @@ pub struct Task {
     pub id: Option<String>,
     /// Скрыта от ИИ сама по себе (вдобавок к скрытым спискам); едет с задачей при переносе.
     pub private: bool,
+    /// Когда задачу меняли в последний раз (мс с 1970-го; 0 — неизвестно, файл старой версии).
+    /// При слиянии двух версий страницы побеждает более поздняя правка.
+    pub modified: u64,
+    /// Служебные пометки `ключ:значение`, которых эта версия не знает (от более новой):
+    /// сохраняются как есть, чтобы правка старой программой их не потеряла.
+    pub extra: Vec<String>,
 }
 
 impl Task {
     pub fn new(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            state: State::Open,
-            id: None,
-            private: false,
-        }
+        Self { text: text.into(), state: State::Open, id: None, private: false, modified: 0, extra: Vec::new() }
     }
 
     /// Копия для страницы, на которую задачу переносят: снова открыта, записи те же.
@@ -83,7 +88,14 @@ impl Task {
             state: State::Open,
             id: self.id.clone(),
             private: self.private,
+            modified: clock::now_ms(),
+            extra: self.extra.clone(),
         }
+    }
+
+    /// Отметить, что задачу только что поменяли.
+    pub fn touch(&mut self) {
+        self.modified = clock::now_ms();
     }
 
     pub fn is_open(&self) -> bool {
@@ -99,6 +111,9 @@ pub struct Board {
     /// Названия списков из заголовков файла — на случай, если списка нет в реестре
     /// (страница пришла с другого устройства раньше реестра).
     titles: Vec<(ListId, String)>,
+    /// Надгробия: id удалённых задач и когда их удалили. По ним слияние не воскрешает
+    /// удалённое, если после удаления задачу нигде не меняли.
+    deleted: Vec<(String, u64)>,
 }
 
 /// Страницы равны, если равны их списки; порядок списков и названия из файла не важны.
@@ -148,9 +163,37 @@ impl Board {
         list.len() - 1
     }
 
+    /// Убирает задачу из списка (например, чтобы переложить в другой) — без надгробия.
     pub fn remove(&mut self, category: ListId, index: usize) -> Option<Task> {
         let list = self.list_mut(category);
         (index < list.len()).then(|| list.remove(index))
+    }
+
+    /// Удаляет задачу совсем: с надгробием, чтобы при слиянии с другой версией страницы она
+    /// не вернулась.
+    pub fn delete(&mut self, category: ListId, index: usize) -> Option<Task> {
+        let task = self.remove(category, index)?;
+        if let Some(id) = &task.id {
+            self.bury(id, clock::now_ms());
+        }
+        Some(task)
+    }
+
+    /// Надгробие (позднейшее из двух, если оно уже есть).
+    pub fn bury(&mut self, id: &str, when: u64) {
+        match self.deleted.iter_mut().find(|(i, _)| i == id) {
+            Some((_, t)) => *t = (*t).max(when),
+            None => self.deleted.push((id.to_string(), when)),
+        }
+    }
+
+    /// Когда удалили задачу с этим id (если удаляли).
+    pub fn buried(&self, id: &str) -> Option<u64> {
+        self.deleted.iter().find(|(i, _)| i == id).map(|(_, t)| *t)
+    }
+
+    pub fn graves(&self) -> &[(String, u64)] {
+        &self.deleted
     }
 
     pub fn get_mut(&mut self, category: ListId, index: usize) -> Option<&mut Task> {
@@ -187,11 +230,9 @@ impl Board {
         }
         list.remove(index);
         task.state = state;
-        let at = if state == State::Open {
-            list.iter().rposition(Task::is_open).map_or(0, |i| i + 1)
-        } else {
-            list.len()
-        };
+        task.touch();
+        let at =
+            if state == State::Open { list.iter().rposition(Task::is_open).map_or(0, |i| i + 1) } else { list.len() };
         list.insert(at, task);
         Some(at)
     }
@@ -228,6 +269,7 @@ impl Board {
             for task in list.iter_mut().filter(|t| t.is_open()) {
                 moved.push((*category, task.carried()));
                 task.state = State::Migrated(to);
+                task.touch();
             }
         }
         moved
@@ -238,7 +280,8 @@ impl Board {
         if from == to {
             return None;
         }
-        let task = self.remove(from, index)?;
+        let mut task = self.remove(from, index)?;
+        task.touch();
         Some(self.push(to, task))
     }
 }
@@ -336,10 +379,10 @@ mod tests {
         board.get_mut(ListId::WORK, 2).unwrap().state = State::Cancelled;
         let to = Date::new(2026, 10, 27).unwrap();
         let moved = board.migrate_open(to);
-        assert_eq!(
-            moved,
-            [(ListId::WORK, Task::new("a")), (ListId::HOME, Task::new("c"))]
-        );
+        let brief: Vec<(ListId, &str, State)> = moved.iter().map(|(c, t)| (*c, t.text.as_str(), t.state)).collect();
+        assert_eq!(brief, [(ListId::WORK, "a", State::Open), (ListId::HOME, "c", State::Open)]);
+        // Копии и пометки «перенесена» — с временем правки, для слияния версий.
+        assert!(moved.iter().all(|(_, t)| t.modified > 0) && board.list(ListId::WORK)[0].modified > 0);
         assert_eq!(board.list(ListId::WORK)[0].state, State::Migrated(to));
         assert_eq!(board.list(ListId::WORK)[1].state, State::Done);
         assert_eq!(board.list(ListId::WORK)[2].state, State::Cancelled);

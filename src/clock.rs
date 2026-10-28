@@ -46,10 +46,8 @@ fn android_timezone() {
     else {
         return;
     };
-    let rule = ANDROID_TZDATA
-        .iter()
-        .filter_map(|path| std::fs::read(path).ok())
-        .find_map(|bundle| zone_rule(&bundle, &name));
+    let rule =
+        ANDROID_TZDATA.iter().filter_map(|path| std::fs::read(path).ok()).find_map(|bundle| zone_rule(&bundle, &name));
     if let Some(rule) = rule {
         // SAFETY: вызывается из `init`, до запуска других потоков.
         unsafe { std::env::set_var("TZ", rule) };
@@ -70,9 +68,7 @@ fn zone_rule(bundle: &[u8], name: &str) -> Option<String> {
     }
     let (index, data) = (u32_at(12)?, u32_at(16)?);
     let entry = (index..data).step_by(52).find(|&at| {
-        bundle
-            .get(at..at + 40)
-            .is_some_and(|raw| raw.split(|&b| b == 0).next() == Some(name.as_bytes()))
+        bundle.get(at..at + 40).is_some_and(|raw| raw.split(|&b| b == 0).next() == Some(name.as_bytes()))
     })?;
     let (start, length) = (u32_at(entry + 40)?, u32_at(entry + 44)?);
     let tzif = bundle.get(data + start..data + start + length)?;
@@ -86,10 +82,40 @@ fn zone_rule(bundle: &[u8], name: &str) -> Option<String> {
     (!rule.is_empty()).then(|| rule.to_string())
 }
 
+// Часы — зависимость, которую тесты подменяют: «сейчас» в потоке теста можно остановить
+// (`freeze`), и дата, метки заметок и время правки задач перестают зависеть от настоящих часов.
+#[cfg(test)]
+thread_local! {
+    static FROZEN: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Тесты: остановить часы этого потока на `ms` (мс с 1970-го; `None` — снова настоящие).
+#[cfg(test)]
+pub fn freeze(ms: Option<u64>) {
+    FROZEN.with(|f| f.set(ms));
+}
+
+/// Тесты: остановить часы на полдень (UTC) этой даты — дата одна и та же в любом поясе
+/// от −11 до +11.
+#[cfg(test)]
+pub fn freeze_on(date: Date) {
+    let days = Date::new(1970, 1, 1).unwrap().days_until(date) as u64;
+    freeze(Some(days * 86_400_000 + 12 * 3_600_000));
+}
+
+/// Миллисекунды с 1970-го — время правки задачи для слияния версий.
+pub fn now_ms() -> u64 {
+    #[cfg(test)]
+    if let Some(ms) = FROZEN.with(|f| f.get()) {
+        return ms;
+    }
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
 fn local_tm() -> Option<libc::tm> {
-    // SAFETY: `time` и `localtime_r` пишут только в переданные структуры.
+    let t = (now_ms() / 1000) as libc::time_t;
+    // SAFETY: `localtime_r` пишет только в переданную структуру.
     unsafe {
-        let t = libc::time(std::ptr::null_mut());
         let mut tm: libc::tm = std::mem::zeroed();
         (!libc::localtime_r(&t, &mut tm).is_null()).then_some(tm)
     }
@@ -107,7 +133,7 @@ pub fn stamp() -> String {
     local_tm().map_or_else(String::new, |tm| strftime(c"%d.%m.%Y %H:%M", &tm))
 }
 
-/// Часы и минуты — для шапки на узком экране.
+/// Часы и минуты — для шапки на узком экране и времени последней синхронизации.
 pub fn hm() -> String {
     local_tm().map_or_else(String::new, |tm| strftime(c"%H:%M", &tm))
 }
@@ -119,11 +145,6 @@ pub fn time() -> String {
 
 /// Текущие дата и время для шапки. Меняются раз в минуту — по смене этой строки главный цикл
 /// и перерисовывает экран.
-/// Текущее время `ЧЧ:ММ` — когда была последняя синхронизация.
-pub fn now_hm() -> String {
-    local_tm().map_or_else(String::new, |tm| strftime(c"%H:%M", &tm))
-}
-
 pub fn now() -> String {
     local_tm().map_or_else(String::new, |tm| strftime(CLOCK_FORMAT, &tm))
 }
@@ -146,19 +167,24 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 }
 
 impl Date {
+    /// Дата без проверки — для констант в тестах.
+    #[cfg(test)]
+    pub const fn from_ymd(year: i32, month: u32, day: u32) -> Date {
+        Date { year, month, day }
+    }
+
     pub fn new(year: i32, month: u32, day: u32) -> Option<Date> {
-        ((1..=12).contains(&month) && (1..=days_in_month(year, month)).contains(&day))
-            .then_some(Date { year, month, day })
+        ((1..=12).contains(&month) && (1..=days_in_month(year, month)).contains(&day)).then_some(Date {
+            year,
+            month,
+            day,
+        })
     }
 
     /// Сегодня по местному времени.
     pub fn today() -> Date {
         let tm = local_tm().expect("localtime_r");
-        Date {
-            year: tm.tm_year + 1900,
-            month: tm.tm_mon as u32 + 1,
-            day: tm.tm_mday as u32,
-        }
+        Date { year: tm.tm_year + 1900, month: tm.tm_mon as u32 + 1, day: tm.tm_mday as u32 }
     }
 
     pub fn year(self) -> i32 {
