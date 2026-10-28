@@ -70,10 +70,12 @@
 ваша и вы понимаете риск, в файле настроек можно разрешить: `webdav_insecure = on`.
 
 Сертификат сервера проверяется по встроенным в программу корневым сертификатам и по системным
-(`/etc/ssl/certs` или файл из `SSL_CERT_FILE`). Сервер с самоподписанным сертификатом подойдёт,
-если добавить его сертификат в систему: `sudo trust anchor webdav.crt` (Arch, Fedora) или
-`/usr/local/share/ca-certificates/` и `sudo update-ca-certificates` (Debian, Ubuntu). У такого
-сертификата должно быть `CA:FALSE` и адрес сервера в `subjectAltName`.
+(`/etc/ssl/certs` или файл из `SSL_CERT_FILE`). Для своего сервера заведите свой центр
+сертификации и добавьте в систему его сертификат: `sudo trust anchor ca.crt` (Arch, Fedora) или
+`/usr/local/share/ca-certificates/ca.crt` и `sudo update-ca-certificates` (Debian, Ubuntu).
+Сертификат сервера подпишите этим центром: `CA:FALSE`, адрес сервера в `subjectAltName`.
+Один самоподписанный сертификат не подойдёт: с `CA:TRUE` его не примет rustls, а с `CA:FALSE`
+система не выгрузит его в `/etc/ssl/certs`.
 
 - Программа синхронизируется при запуске, через пару секунд после правки, раз в минуту
   и при выходе; «Синхронизировать сейчас» в настройках — сразу. Сеть не мешает работе:
