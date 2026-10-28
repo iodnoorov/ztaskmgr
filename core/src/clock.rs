@@ -84,20 +84,20 @@ fn zone_rule(bundle: &[u8], name: &str) -> Option<String> {
 
 // Часы — зависимость, которую тесты подменяют: «сейчас» в потоке теста можно остановить
 // (`freeze`), и дата, метки заметок и время правки задач перестают зависеть от настоящих часов.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 thread_local! {
     static FROZEN: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Тесты: остановить часы этого потока на `ms` (мс с 1970-го; `None` — снова настоящие).
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub fn freeze(ms: Option<u64>) {
     FROZEN.with(|f| f.set(ms));
 }
 
 /// Тесты: остановить часы на полдень (UTC) этой даты — дата одна и та же в любом поясе
 /// от −11 до +11.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub fn freeze_on(date: Date) {
     let days = Date::new(1970, 1, 1).unwrap().days_until(date) as u64;
     freeze(Some(days * 86_400_000 + 12 * 3_600_000));
@@ -105,7 +105,7 @@ pub fn freeze_on(date: Date) {
 
 /// Миллисекунды с 1970-го — время правки задачи для слияния версий.
 pub fn now_ms() -> u64 {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     if let Some(ms) = FROZEN.with(|f| f.get()) {
         return ms;
     }
@@ -168,7 +168,7 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 
 impl Date {
     /// Дата без проверки — для констант в тестах.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub const fn from_ymd(year: i32, month: u32, day: u32) -> Date {
         Date { year, month, day }
     }
@@ -189,6 +189,21 @@ impl Date {
 
     pub fn year(self) -> i32 {
         self.year
+    }
+
+    /// Месяц: 1 — январь.
+    pub fn month(self) -> u32 {
+        self.month
+    }
+
+    pub fn day(self) -> u32 {
+        self.day
+    }
+
+    /// День недели: 0 — понедельник, 6 — воскресенье.
+    pub fn weekday(self) -> u32 {
+        // 1970-01-01 — четверг.
+        (self.to_days() + 3).rem_euclid(7) as u32
     }
 
     /// `2026-10-26`.
@@ -284,6 +299,15 @@ impl fmt::Display for Date {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weekday() {
+        let d = Date::new(2026, 10, 26).unwrap();
+        assert_eq!((d.weekday(), d.month(), d.day()), (0, 10, 26));
+        assert_eq!(d.add_days(6).weekday(), 6);
+        assert_eq!(Date::new(1970, 1, 1).unwrap().weekday(), 3);
+        assert_eq!(Date::new(1969, 12, 29).unwrap().weekday(), 0);
+    }
 
     fn d(y: i32, m: u32, day: u32) -> Date {
         Date::new(y, m, day).unwrap()

@@ -1,23 +1,12 @@
 mod agent;
 mod app;
-mod book;
-mod clock;
-mod config;
-mod crypt;
 mod field;
 mod input;
 mod keymap;
-mod lists;
 mod mcp;
-mod merge;
-mod model;
-mod notes;
-#[cfg(test)]
-mod proptests;
-mod storage;
-mod store;
 mod ui;
-mod webdav;
+
+use ztaskmgr_core::{book, clock, config, lists, merge, model, notes, webdav};
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
