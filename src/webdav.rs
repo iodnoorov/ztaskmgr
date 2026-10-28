@@ -12,6 +12,10 @@
 //! Сервер ответил «412: файл уже другой» — файл пропускается, в следующий раз он сольётся.
 //! Несколько процессов (программа и MCP-сервер) не синхронизируются одновременно —
 //! `.webdav-lock`.
+//!
+//! С фразой шифрования файлы на сервере зашифрованы (`crypt.rs`); всё остальное — манифест,
+//! слияние — работает с открытым текстом, как без шифрования. Незашифрованный файл на сервере
+//! (книжка до шифрования) читается как есть и сразу перезаписывается зашифрованным.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -27,6 +31,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::book::{Book, file_kind};
+use crate::crypt::{self, Cipher, KEY_FILE, Opened};
 use crate::store::write_atomic;
 
 const STATE_FILE: &str = ".webdav-state";
@@ -39,7 +44,7 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 pub const EVERY: Duration = Duration::from_secs(60);
 
 /// Настройки подключения (из `config`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
     /// Каталог книжки на сервере, например `https://cloud.example.com/remote.php/dav/files/me/ztaskmgr/`.
     pub url: String,
@@ -49,6 +54,26 @@ pub struct Settings {
     pub password_command: String,
     /// Разрешить пароль по `http://` не на этот же компьютер (`webdav_insecure = on`).
     pub insecure: bool,
+    /// Фраза шифрования книжки на сервере; пусто — не шифровать.
+    pub passphrase: String,
+    /// Команда, которая печатает фразу; если задана — главнее `passphrase`.
+    pub passphrase_command: String,
+}
+
+/// Первая строка вывода команды (`pass ztaskmgr`): пароль или фраза.
+fn run_command(command: &str, what: &str) -> Result<String> {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .with_context(|| format!("запуск «{command}»"))?;
+    if !out.status.success() {
+        bail!("команда {what} «{command}» завершилась с ошибкой");
+    }
+    let text = String::from_utf8(out.stdout).with_context(|| format!("команда {what} вывела не текст"))?;
+    Ok(text.lines().next().unwrap_or("").to_string())
 }
 
 /// Адрес на этом же компьютере: туда и по `http://` можно — по сети пароль не идёт.
@@ -64,34 +89,34 @@ fn is_loopback(url: &str) -> bool {
 }
 
 impl Settings {
-    /// Пароль из команды — один раз, до синхронизаций: команда (`pass`, `gpg`) может спросить
+    /// Пароль и фраза из команд — один раз, до синхронизаций: команда (`pass`, `gpg`) может спросить
     /// пароль у пользователя, а в фоне, поверх интерфейса, это сломало бы экран. Поэтому её
     /// запускают, когда терминал свободен (при запуске, при смене настроек), а потоку
     /// синхронизации достаются готовые настройки. Ввод команды — `/dev/null`: у MCP-сервера
     /// stdin занят протоколом, а pinentry и так работает с `/dev/tty`.
     pub fn resolve(mut self) -> Result<Self> {
-        if self.password_command.trim().is_empty() {
-            return Ok(self);
+        if !self.password_command.trim().is_empty() {
+            self.password = run_command(&self.password_command, "пароля")?;
+            self.password_command.clear();
         }
-        let out = Command::new("sh")
-            .arg("-c")
-            .arg(&self.password_command)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .output()
-            .with_context(|| format!("запуск «{}»", self.password_command))?;
-        if !out.status.success() {
-            bail!("команда пароля «{}» завершилась с ошибкой", self.password_command);
+        if !self.passphrase_command.trim().is_empty() {
+            self.passphrase = run_command(&self.passphrase_command, "фразы")?;
+            if self.passphrase.is_empty() {
+                bail!("команда фразы «{}» ничего не вывела", self.passphrase_command);
+            }
+            self.passphrase_command.clear();
         }
-        let text = String::from_utf8(out.stdout).context("команда пароля вывела не текст")?;
-        self.password = text.lines().next().unwrap_or("").to_string();
-        self.password_command.clear();
         Ok(self)
     }
 
-    /// Нужна ли команда, чтобы получить пароль (то есть свободный терминал).
+    /// Шифруется ли книжка: задана фраза или команда фразы.
+    pub fn is_encrypted(&self) -> bool {
+        !self.passphrase.is_empty() || !self.passphrase_command.trim().is_empty()
+    }
+
+    /// Нужна ли команда, чтобы получить пароль или фразу (то есть свободный терминал).
     pub fn needs_command(&self) -> bool {
-        !self.password_command.trim().is_empty()
+        !self.password_command.trim().is_empty() || !self.passphrase_command.trim().is_empty()
     }
 }
 
@@ -114,6 +139,8 @@ struct Remote {
     /// Адрес каталога, со `/` на конце.
     base: String,
     auth: Option<String>,
+    /// Ключ книжки, если она шифруется (узнаётся в начале синхронизации).
+    cipher: Option<Cipher>,
 }
 
 /// Корневые сертификаты для https: встроенные (Mozilla) и системные — так подходят и
@@ -154,7 +181,7 @@ impl Remote {
         }
         let base = if url.ends_with('/') { url.to_string() } else { format!("{url}/") };
         if settings.needs_command() {
-            bail!("пароль не получен: команда пароля не запускалась");
+            bail!("пароль или фраза не получены: команда не запускалась");
         }
         // Basic-авторизация — это пароль открытым текстом: по сети — только через https.
         if url.starts_with("http://") && !settings.user.is_empty() && !settings.insecure && !is_loopback(url) {
@@ -171,7 +198,7 @@ impl Remote {
             .tls_config(ureq::tls::TlsConfig::builder().root_certs(root_certs()).build())
             .build()
             .into();
-        Ok(Self { agent, base, auth })
+        Ok(Self { agent, base, auth, cipher: None })
     }
 
     /// Запрос к файлу или каталогу `path` (относительно `base`): код ответа, ETag и тело.
@@ -234,7 +261,7 @@ impl Remote {
         }
     }
 
-    /// Содержимое и ETag; файла нет — `None`.
+    /// Содержимое (как на сервере, зашифрованное) и ETag; файла нет — `None`.
     fn get(&self, path: &str) -> Result<Option<(Vec<u8>, Option<String>)>> {
         let (status, etag, body) = self.call("GET", path, &[], b"")?;
         match status {
@@ -244,7 +271,21 @@ impl Remote {
         }
     }
 
-    /// Запись, если на сервере всё ещё `expected` (`None` — файла там быть не должно).
+    /// Открытый текст файла с сервера и `true`, если файл там не в том виде, в каком должен быть
+    /// (не зашифрован, хотя книжка шифруется), — его надо перезаписать.
+    fn open(&self, path: &str, data: &[u8]) -> Result<(Vec<u8>, bool)> {
+        match &self.cipher {
+            Some(cipher) => Ok(match cipher.open(path, data)? {
+                Opened::Encrypted(data) => (data, false),
+                Opened::Plain(data) => (data, true),
+            }),
+            None if crypt::is_sealed(data) => bail!("зашифрован на сервере, а фразы шифрования нет"),
+            None => Ok((data.to_vec(), false)),
+        }
+    }
+
+    /// Запись открытого текста `data` (шифруется, если книжка шифруется), если на сервере всё
+    /// ещё `expected` (`None` — файла там быть не должно).
     fn put(&self, path: &str, data: &[u8], expected: Option<&str>) -> Result<Put> {
         let condition = match expected {
             Some(etag) => ("If-Match", etag),
@@ -254,9 +295,13 @@ impl Remote {
     }
 
     fn put_with(&self, path: &str, data: &[u8], condition: Option<(&str, &str)>) -> Result<Put> {
-        let mut headers = vec![("Content-Type", "text/markdown; charset=utf-8")];
+        let (body, kind) = match &self.cipher {
+            Some(cipher) => (cipher.seal(path, data)?, "application/octet-stream"),
+            None => (data.to_vec(), "text/markdown; charset=utf-8"),
+        };
+        let mut headers = vec![("Content-Type", kind)];
         headers.extend(condition);
-        let (status, etag, _) = self.call("PUT", path, &headers, data)?;
+        let (status, etag, _) = self.call("PUT", path, &headers, &body)?;
         match status {
             200..=299 => Ok(Put::Done(etag)),
             412 => Ok(Put::Changed),
@@ -284,7 +329,10 @@ impl Remote {
         let Some(known) = known else {
             return Ok(false);
         };
-        Ok(self.get(path)?.is_some_and(|(data, _)| hash(&data) == known))
+        let Some((data, _)) = self.get(path)? else {
+            return Ok(false);
+        };
+        Ok(self.open(path, &data).is_ok_and(|(data, _)| hash(&data) == known))
     }
 
     /// PUT с `If-Match`, а при 412 — проверка содержимого и запись без условия.
@@ -292,6 +340,51 @@ impl Remote {
         match self.put(path, data, expected)? {
             Put::Changed if expected.is_some() && self.unchanged_since(path, known)? => self.put_with(path, data, None),
             result => Ok(result),
+        }
+    }
+
+    /// Перезапись файла, который на сервере всё ещё `etag` с содержимым `known` (хеш),
+    /// тем же содержимым — незашифрованного зашифрованным.
+    fn replace(&self, path: &str, data: &[u8], etag: Option<&str>, known: &str) -> Result<Put> {
+        match etag {
+            Some(_) => self.put_checked(path, data, etag, Some(known)),
+            None if self.unchanged_since(path, Some(known))? => self.put_with(path, data, None),
+            None => Ok(Put::Changed),
+        }
+    }
+
+    /// Ключ книжки: с сервера, а если его там нет — новый (книжка начинает шифроваться).
+    /// Без фразы — `None`, но если книжка на сервере уже зашифрована — ошибка: иначе мы
+    /// положили бы рядом с зашифрованными файлами открытые.
+    fn book_key(&self, passphrase: &str, listed: bool, dirs: &mut (bool, bool)) -> Result<Option<Cipher>> {
+        if passphrase.is_empty() {
+            if listed {
+                bail!("книжка на сервере зашифрована — укажите фразу шифрования в настройках (S)");
+            }
+            return Ok(None);
+        }
+        if !listed {
+            ensure_dirs(self, KEY_FILE, dirs)?;
+            let (cipher, file) = Cipher::create(passphrase)?;
+            match self.put_key(&file, Some(("If-None-Match", "*")))? {
+                Put::Done(_) => return Ok(Some(cipher)),
+                // Только что создало другое устройство — берём его ключ.
+                Put::Changed => {}
+            }
+        }
+        let (file, _) = self.get(KEY_FILE)?.context("ключ книжки пропал с сервера во время синхронизации")?;
+        Cipher::unlock(passphrase, &file).map(Some)
+    }
+
+    /// Запись `KEY_FILE` — как есть, он не шифруется ключом книжки.
+    fn put_key(&self, file: &[u8], condition: Option<(&str, &str)>) -> Result<Put> {
+        let mut headers = vec![("Content-Type", "application/json")];
+        headers.extend(condition);
+        let (status, etag, _) = self.call("PUT", KEY_FILE, &headers, file)?;
+        match status {
+            200..=299 => Ok(Put::Done(etag)),
+            412 => Ok(Put::Changed),
+            _ => Self::fail("PUT", KEY_FILE, status),
         }
     }
 
@@ -428,15 +521,17 @@ struct Known {
     hash: String,
 }
 
-/// Манифест: для какого адреса и что было по каждому файлу. Другой адрес — всё сначала.
-fn load_state(dir: &Path, url: &str) -> HashMap<String, Known> {
+/// Манифест: для какого адреса и что было по каждому файлу. Другой адрес или книжка начала
+/// (перестала) шифроваться — всё сначала: так каждый файл на сервере будет прочитан и, если он
+/// не в том виде, перезаписан.
+fn load_state(dir: &Path, url: &str, encrypted: bool) -> HashMap<String, Known> {
     let Ok(text) = fs::read_to_string(dir.join(STATE_FILE)) else {
         return HashMap::new();
     };
     let Ok(value) = serde_json::from_str::<Value>(&text) else {
         return HashMap::new();
     };
-    if value["url"].as_str() != Some(url) {
+    if value["url"].as_str() != Some(url) || value["encrypted"].as_bool().unwrap_or(false) != encrypted {
         return HashMap::new();
     }
     value["files"]
@@ -454,10 +549,10 @@ fn load_state(dir: &Path, url: &str) -> HashMap<String, Known> {
         .unwrap_or_default()
 }
 
-fn save_state(dir: &Path, url: &str, state: &HashMap<String, Known>) -> Result<()> {
+fn save_state(dir: &Path, url: &str, encrypted: bool, state: &HashMap<String, Known>) -> Result<()> {
     let files: serde_json::Map<String, Value> =
         state.iter().map(|(path, k)| (path.clone(), json!({"etag": k.etag, "hash": k.hash}))).collect();
-    let text = serde_json::to_string_pretty(&json!({"url": url, "files": files}))?;
+    let text = serde_json::to_string_pretty(&json!({"url": url, "encrypted": encrypted, "files": files}))?;
     write_atomic(&dir.join(STATE_FILE), text.as_bytes())
 }
 
@@ -512,14 +607,17 @@ pub fn sync(book: &Book, settings: &Settings) -> Result<Option<Summary>> {
     let Some(_lock) = Lock::try_take(dir)? else {
         return Ok(None);
     };
-    let remote = Remote::new(settings)?;
-    let mut state = load_state(dir, &remote.base);
+    let mut remote = Remote::new(settings)?;
     let mut summary = Summary::default();
 
     // Что на сервере. Нет каталога книжки — создадим при первой записи.
     let top = remote.list("")?;
     let notes = if top.is_some() { remote.list("notes/")? } else { None };
     let mut dirs_ready = (top.is_some(), notes.is_some());
+    let has_key = top.iter().flatten().any(|(name, _)| name == KEY_FILE);
+    remote.cipher = remote.book_key(&settings.passphrase, has_key, &mut dirs_ready)?;
+    let encrypted = remote.cipher.is_some();
+    let mut state = load_state(dir, &remote.base, encrypted);
     let mut server: HashMap<String, Option<String>> = HashMap::new();
     for (prefix, files) in [("", top), ("notes/", notes)] {
         for (name, etag) in files.unwrap_or_default() {
@@ -594,16 +692,28 @@ pub fn sync(book: &Book, settings: &Settings) -> Result<Option<Summary>> {
                 (false, true, _, Some(_)) | (true, true, None, Some(_)) => match remote.get(&path)? {
                     Some((data, etag)) => {
                         let etag = etag.or_else(|| theirs.cloned().flatten());
+                        let (data, stale) = local!(path, remote.open(&path, &data));
                         let new_hash = hash(&data);
                         if my_hash.as_ref() != Some(&new_hash) {
                             if !unchanged_here() {
                                 summary.postponed += 1;
                                 continue;
                             }
-                            let text = local!(path, String::from_utf8(data).context("не текст"));
+                            let text = local!(path, std::str::from_utf8(&data).context("не текст"));
                             local!(path, book.write_file(&path, text.as_bytes()));
                             summary.downloaded += 1;
                         }
+                        let etag = if stale {
+                            match remote.replace(&path, &data, etag.as_deref(), &new_hash)? {
+                                Put::Done(etag) => etag,
+                                Put::Changed => {
+                                    summary.postponed += 1;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            etag
+                        };
                         state.insert(path, Known { etag, hash: new_hash });
                     }
                     None => summary.postponed += 1,
@@ -637,8 +747,20 @@ pub fn sync(book: &Book, settings: &Settings) -> Result<Option<Summary>> {
                         summary.postponed += 1;
                         continue;
                     };
+                    let (data, stale) = local!(path, remote.open(&path, &data));
                     let their_hash = hash(&data);
                     if my_hash.as_ref() == Some(&their_hash) {
+                        let etag = if stale {
+                            match remote.replace(&path, &data, etag.as_deref(), &their_hash)? {
+                                Put::Done(etag) => etag,
+                                Put::Changed => {
+                                    summary.postponed += 1;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            etag
+                        };
                         state.insert(path, Known { etag, hash: their_hash });
                         continue;
                     }
@@ -681,8 +803,37 @@ pub fn sync(book: &Book, settings: &Settings) -> Result<Option<Summary>> {
         Ok(())
     };
     let result = run();
-    save_state(dir, &remote.base, &state)?;
+    save_state(dir, &remote.base, encrypted, &state)?;
     result.map(|()| Some(summary))
+}
+
+/// Смена фразы шифрования: ключ книжки тот же, на сервере перешифровывается только
+/// `KEY_FILE`, файлы книжки не трогаются. Другие устройства со старой фразой синхронизироваться
+/// перестанут («неверная фраза»), пока в них не введут новую.
+pub fn change_passphrase(settings: &Settings, new: &str) -> Result<()> {
+    if settings.passphrase.is_empty() {
+        bail!("шифрование не включено: сначала задайте фразу");
+    }
+    if new.is_empty() {
+        bail!("новая фраза пустая");
+    }
+    let remote = Remote::new(settings)?;
+    let (file, etag) =
+        remote.get(KEY_FILE)?.context("книжка на сервере ещё не зашифрована — сначала синхронизируйтесь с фразой")?;
+    let cipher = Cipher::unlock(&settings.passphrase, &file).context("текущая фраза")?;
+    let wrapped = cipher.wrap(new)?;
+    let written = match etag.as_deref() {
+        Some(etag) => remote.put_key(&wrapped, Some(("If-Match", etag)))?,
+        None => Put::Changed,
+    };
+    // 412 при слабом ETag или без ETag: сверяем сам файл — он всё ещё тот, что мы прочитали.
+    if written == Put::Changed {
+        if remote.get(KEY_FILE)?.is_none_or(|(now, _)| now != file) {
+            bail!("ключ на сервере только что поменялся — попробуйте ещё раз");
+        }
+        remote.put_key(&wrapped, None)?;
+    }
+    Ok(())
 }
 
 /// Каталоги на сервере — перед первой записью в них.
@@ -705,6 +856,8 @@ enum Msg {
     Now,
     /// Новые настройки; `None` — WebDAV выключен.
     Configure(Option<Settings>),
+    /// Сменить фразу шифрования на эту.
+    Passphrase(String),
     /// Последняя синхронизация — и выход.
     Stop,
 }
@@ -712,10 +865,14 @@ enum Msg {
 /// Чем кончилась синхронизация в фоне.
 pub type Outcome = Result<Summary, String>;
 
+/// Чем кончилась смена фразы: новая фраза или ошибка.
+pub type Changed = Result<String, String>;
+
 /// Синхронизация в своём потоке: сразу, раз в минуту и по просьбе; сеть не держит экран.
 pub struct Worker {
     tx: Sender<Msg>,
     rx: Receiver<Outcome>,
+    changed: Receiver<Changed>,
     /// Поток закончил работу (после `Stop`).
     done: Receiver<()>,
     handle: JoinHandle<()>,
@@ -725,6 +882,7 @@ impl Worker {
     pub fn start(dir: &Path, settings: Option<Settings>) -> Self {
         let (tx, inbox) = mpsc::channel::<Msg>();
         let (outbox, rx) = mpsc::channel::<Outcome>();
+        let (changes, changed) = mpsc::channel::<Changed>();
         let (finished, done) = mpsc::channel::<()>();
         let dir = dir.to_path_buf();
         let handle = std::thread::spawn(move || {
@@ -748,6 +906,13 @@ impl Worker {
                         settings = new;
                         run(&settings);
                     }
+                    Ok(Msg::Passphrase(new)) => {
+                        let result = match &mut settings {
+                            Some(s) => change_passphrase(s, &new).map(|()| s.passphrase = new.clone()),
+                            None => Err(anyhow::anyhow!("WebDAV не настроен")),
+                        };
+                        let _ = changes.send(result.map(|()| new).map_err(|e| format!("{e:#}")));
+                    }
                     Ok(Msg::Stop) => {
                         run(&settings);
                         break;
@@ -757,7 +922,7 @@ impl Worker {
             }
             let _ = finished.send(());
         });
-        Self { tx, rx, done, handle }
+        Self { tx, rx, changed, done, handle }
     }
 
     pub fn now(&self) {
@@ -766,6 +931,16 @@ impl Worker {
 
     pub fn configure(&self, settings: Option<Settings>) {
         let _ = self.tx.send(Msg::Configure(settings));
+    }
+
+    /// Сменить фразу шифрования; итог — в `passphrase_changed`. Дальше поток синхронизирует
+    /// с новой фразой.
+    pub fn change_passphrase(&self, new: String) {
+        let _ = self.tx.send(Msg::Passphrase(new));
+    }
+
+    pub fn passphrase_changed(&self) -> Option<Changed> {
+        self.changed.try_recv().ok()
     }
 
     /// Результаты, накопившиеся с прошлого раза.
@@ -943,6 +1118,7 @@ mod tests {
             password: String::new(),
             password_command: "echo секрет".into(),
             insecure: false,
+            ..Settings::default()
         };
         // Без пароля из команды не синхронизируемся; команда — один раз.
         assert!(sync(&temp_book("nopass"), &settings).is_err());
@@ -1023,6 +1199,7 @@ mod tests {
             password: String::new(),
             password_command: String::new(),
             insecure: false,
+            ..Settings::default()
         };
         let book = temp_book("weak");
         let d = Date::new(2026, 10, 26).unwrap();
@@ -1037,6 +1214,12 @@ mod tests {
         assert_eq!((s.uploaded, s.postponed), (1, 0));
         let body = store.lock().unwrap().files["2026-10-26.md"].0.clone();
         assert!(String::from_utf8(body).unwrap().contains("два"));
+        // Шифрование и смена фразы — тоже, хотя If-Match не срабатывает.
+        let secret = Settings { passphrase: "фраза".into(), ..settings.clone() };
+        assert!(sync(&book, &secret).unwrap().unwrap().failed.is_empty());
+        change_passphrase(&secret, "новая").unwrap();
+        let renewed = Settings { passphrase: "новая".into(), ..settings };
+        assert!(sync(&book, &renewed).unwrap().unwrap().failed.is_empty());
         let _ = fs::remove_dir_all(book.dir());
     }
 
@@ -1057,6 +1240,7 @@ mod tests {
             password: String::new(),
             password_command: String::new(),
             insecure: false,
+            ..Settings::default()
         };
         let book = temp_book("bad");
         let s = sync(&book, &settings).unwrap().unwrap();
@@ -1080,6 +1264,7 @@ mod tests {
             password: String::new(),
             password_command: String::new(),
             insecure: false,
+            ..Settings::default()
         };
         let book = temp_book("worker");
         let mut board = Board::default();
@@ -1104,6 +1289,115 @@ mod tests {
     }
 
     #[test]
+    fn encrypted() {
+        let store = Arc::new(Mutex::new(Store::default()));
+        let url = serve(store.clone());
+        let plain = Settings { url, ..Settings::default() };
+        let d = Date::new(2026, 10, 26).unwrap();
+        let pc = temp_book("enc-pc");
+        let phone = temp_book("enc-phone");
+        let on_server = |path: &str| store.lock().unwrap().files.get(path).map(|(data, _)| data.clone());
+
+        // Книжка без шифрования уже на сервере.
+        let mut board = Board::default();
+        let mut task = Task::new("секретный отчёт");
+        task.id = Some("aa1".into());
+        board.push(ListId::WORK, task);
+        pc.save(d, &board).unwrap();
+        let mut notes = Notes::default();
+        notes.add_subtask("пин-код");
+        pc.save_notes("aa1", &notes).unwrap();
+        assert_eq!(sync(&pc, &plain).unwrap().unwrap().uploaded, 2);
+
+        // Включили шифрование: ключ на сервере, все файлы перезаписаны зашифрованными.
+        let secret = Settings { passphrase: "фраза".into(), ..plain.clone() };
+        sync(&pc, &secret).unwrap().unwrap();
+        assert!(on_server(KEY_FILE).is_some());
+        for path in ["2026-10-26.md", "notes/aa1.md"] {
+            let data = on_server(path).unwrap();
+            assert!(crypt::is_sealed(&data), "{path}");
+            assert!(
+                !String::from_utf8_lossy(&data).contains("секрет") && !String::from_utf8_lossy(&data).contains("пин")
+            );
+        }
+        // Дальше — ничего лишнего.
+        assert_eq!(sync(&pc, &secret).unwrap().unwrap(), Summary::default());
+
+        // Телефон без фразы и с неверной — ошибка, и в книжке ничего не меняется.
+        let err = sync(&phone, &plain).unwrap_err();
+        assert!(format!("{err:#}").contains("зашифрована"), "{err:#}");
+        let wrong = Settings { passphrase: "не та".into(), ..plain.clone() };
+        let err = sync(&phone, &wrong).unwrap_err();
+        assert!(format!("{err:#}").contains("неверная фраза"), "{err:#}");
+        assert!(phone.files().unwrap().is_empty());
+
+        // С верной — получает всё открытым текстом.
+        assert_eq!(sync(&phone, &secret).unwrap().unwrap().downloaded, 2);
+        assert_eq!(texts(&phone, d), ["секретный отчёт"]);
+        assert_eq!(phone.load_notes("aa1").unwrap(), notes);
+
+        // Правки с обеих сторон сливаются.
+        let mut a = pc.load(d).unwrap();
+        a.push(ListId::WORK, Task::new("с компьютера"));
+        pc.save(d, &a).unwrap();
+        let mut b = phone.load(d).unwrap();
+        b.push(ListId::WORK, Task::new("с телефона"));
+        phone.save(d, &b).unwrap();
+        assert_eq!(sync(&pc, &secret).unwrap().unwrap().uploaded, 1);
+        assert_eq!(sync(&phone, &secret).unwrap().unwrap().merged, 1);
+        assert_eq!(sync(&pc, &secret).unwrap().unwrap().downloaded, 1);
+        assert_eq!(texts(&pc, d), ["секретный отчёт", "с компьютера", "с телефона"]);
+        assert!(crypt::is_sealed(&on_server("2026-10-26.md").unwrap()));
+
+        // Открытый файл с устройства без шифрования (старой версии) принимается и шифруется.
+        {
+            let mut st = store.lock().unwrap();
+            st.version += 1;
+            let v = st.version;
+            st.files
+                .insert("2026-10-27.md".into(), ("## Work <!-- list:work -->\n- [ ] открыто\n".as_bytes().to_vec(), v));
+        }
+        assert_eq!(sync(&pc, &secret).unwrap().unwrap().downloaded, 1);
+        assert_eq!(texts(&pc, Date::new(2026, 10, 27).unwrap()), ["открыто"]);
+        assert!(crypt::is_sealed(&on_server("2026-10-27.md").unwrap()));
+
+        // Сервер подменил одну страницу другой — не расшифровывается, книжка не тронута.
+        {
+            let mut st = store.lock().unwrap();
+            let page = st.files["2026-10-26.md"].0.clone();
+            st.version += 1;
+            let v = st.version;
+            st.files.insert("2026-10-27.md".into(), (page, v));
+        }
+        let s = sync(&pc, &secret).unwrap().unwrap();
+        assert_eq!(s.failed.len(), 1);
+        assert!(s.failed[0].starts_with("2026-10-27.md: не расшифровывается"), "{:?}", s.failed);
+        assert_eq!(texts(&pc, Date::new(2026, 10, 27).unwrap()), ["открыто"]);
+
+        // Смена фразы: файлы на сервере те же, старая фраза больше не подходит.
+        let before: Vec<_> = ["2026-10-26.md", "notes/aa1.md"].map(on_server).into();
+        assert!(change_passphrase(&plain, "новая").is_err());
+        assert!(change_passphrase(&wrong, "новая").is_err());
+        change_passphrase(&secret, "новая").unwrap();
+        assert_eq!(before, ["2026-10-26.md", "notes/aa1.md"].map(on_server));
+        let err = sync(&phone, &secret).unwrap_err();
+        assert!(format!("{err:#}").contains("неверная фраза"), "{err:#}");
+        let renewed = Settings { passphrase: "новая".into(), ..plain.clone() };
+        // Не расшифровывается только подменённая выше страница.
+        let s = sync(&phone, &renewed).unwrap().unwrap();
+        assert!(s.failed.len() == 1 && s.failed[0].starts_with("2026-10-27.md"), "{:?}", s.failed);
+        assert_eq!(texts(&phone, d), ["секретный отчёт", "с компьютера", "с телефона"]);
+
+        // Фраза из команды — как пароль.
+        let command = Settings { passphrase_command: "echo фраза".into(), ..plain.clone() };
+        assert!(command.needs_command());
+        assert_eq!(command.resolve().unwrap().passphrase, "фраза");
+        assert!(Settings { passphrase_command: "true".into(), ..plain }.resolve().is_err());
+        let _ = fs::remove_dir_all(pc.dir());
+        let _ = fs::remove_dir_all(phone.dir());
+    }
+
+    #[test]
     fn errors() {
         let book = temp_book("err");
         let bad = Settings {
@@ -1112,6 +1406,7 @@ mod tests {
             password: String::new(),
             password_command: String::new(),
             insecure: false,
+            ..Settings::default()
         };
         // Пароль по http:// в сеть — нельзя, на этот же компьютер — можно.
         let open = Settings { url: "http://dav.example.com/book".into(), user: "me".into(), ..bad.clone() };

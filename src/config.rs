@@ -21,6 +21,8 @@ pub const WEBDAV_USER: &str = "webdav_user";
 pub const WEBDAV_PASSWORD: &str = "webdav_password";
 pub const WEBDAV_PASSWORD_COMMAND: &str = "webdav_password_command";
 const WEBDAV_INSECURE: &str = "webdav_insecure";
+pub const WEBDAV_PASSPHRASE: &str = "webdav_passphrase";
+pub const WEBDAV_PASSPHRASE_COMMAND: &str = "webdav_passphrase_command";
 
 #[derive(Debug, Default)]
 pub struct Config {
@@ -86,7 +88,7 @@ impl Config {
         self.save()
     }
 
-    /// Пишет через временный файл, доступный только владельцу: здесь будет и пароль.
+    /// Пишет через временный файл, доступный только владельцу: здесь будут пароль и фраза.
     fn save(&self) -> Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
@@ -133,6 +135,8 @@ impl Config {
             password: get(WEBDAV_PASSWORD),
             password_command: get(WEBDAV_PASSWORD_COMMAND),
             insecure: self.get(WEBDAV_INSECURE).and_then(parse_bool).unwrap_or(false),
+            passphrase: get(WEBDAV_PASSPHRASE),
+            passphrase_command: get(WEBDAV_PASSPHRASE_COMMAND),
         })
     }
 }

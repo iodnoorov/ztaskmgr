@@ -648,13 +648,13 @@ fn webdav_settings() {
     let mut app = test_app("webdav");
     press(&mut app, KeyCode::Char('S'));
     // «Синхронизировать сейчас» без адреса — подсказка.
-    for _ in 0..5 {
+    for _ in 0..Setting::ALL.len() {
         press(&mut app, KeyCode::Char('j'));
     }
     press(&mut app, KeyCode::Enter);
     assert!(!app.sync_requested && app.status.is_some());
     // Адрес: Enter открывает поле, Enter сохраняет.
-    for _ in 0..4 {
+    for _ in 0..Setting::ALL.len() - 2 {
         press(&mut app, KeyCode::Char('k'));
     }
     press(&mut app, KeyCode::Enter);
@@ -674,8 +674,28 @@ fn webdav_settings() {
     type_text(&mut app, "другой");
     press(&mut app, KeyCode::Esc);
     assert_eq!(app.config.webdav().unwrap().password, "секрет");
-    // Теперь «сейчас» — просьба главному циклу.
+    // Фраза шифрования — тоже точками.
     press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Enter);
+    type_text(&mut app, "фраза");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(Setting::WebdavPassphrase.value(&app.config).unwrap(), "•••••");
+    assert_eq!(app.config.webdav().unwrap().passphrase, "фраза");
+    // Смена фразы — просьба главному циклу; итог — в настройки.
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.wants_text());
+    type_text(&mut app, "новая");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.passphrase_change.take().as_deref(), Some("новая"));
+    app.on_passphrase(Err("нет сети".into()));
+    assert!(matches!(&app.status, Some(Status::Error(e)) if e.contains("не сменена")));
+    assert_eq!(app.config.webdav().unwrap().passphrase, "фраза");
+    app.on_passphrase(Ok("новая".into()));
+    assert_eq!(app.config.webdav().unwrap().passphrase, "новая");
+    // Теперь «сейчас» — просьба главному циклу.
     press(&mut app, KeyCode::Char('j'));
     press(&mut app, KeyCode::Enter);
     assert!(app.sync_requested);

@@ -889,7 +889,9 @@ fn draw_settings(frame: &mut Frame, app: &App, selected: usize, input: Option<&L
                     Span::raw(truncate_start(&value, room)).fg(SUB),
                 ])
             }
-            (Setting::SyncNow, None) => Line::from(vec![Span::raw(" ›  "), Span::raw(setting.title())]),
+            (Setting::SyncNow | Setting::ChangePassphrase, None) => {
+                Line::from(vec![Span::raw(" ›  "), Span::raw(setting.title())])
+            }
             (_, None) => {
                 let mark = if setting.is_on(&app.config) { "[x] " } else { "[ ] " };
                 Line::from(vec![Span::raw(mark), Span::raw(setting.title())])

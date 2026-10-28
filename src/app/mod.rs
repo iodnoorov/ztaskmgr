@@ -148,6 +148,8 @@ pub struct App {
     pub sync_requested: bool,
     /// Поменялись настройки WebDAV.
     pub webdav_changed: bool,
+    /// Пользователь попросил сменить фразу шифрования на эту.
+    pub passphrase_change: Option<String>,
     pub sync: SyncState,
     pub quit: bool,
 }
@@ -211,6 +213,7 @@ impl App {
             edited: false,
             sync_requested: false,
             webdav_changed: false,
+            passphrase_change: None,
             sync: SyncState::Off,
             quit: false,
         };

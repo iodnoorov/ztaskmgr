@@ -10,16 +10,22 @@ pub enum Setting {
     WebdavUser,
     WebdavPassword,
     WebdavPasswordCommand,
+    WebdavPassphrase,
+    WebdavPassphraseCommand,
+    ChangePassphrase,
     SyncNow,
 }
 
 impl Setting {
-    pub const ALL: [Setting; 6] = [
+    pub const ALL: [Setting; 9] = [
         Setting::Preview,
         Setting::WebdavUrl,
         Setting::WebdavUser,
         Setting::WebdavPassword,
         Setting::WebdavPasswordCommand,
+        Setting::WebdavPassphrase,
+        Setting::WebdavPassphraseCommand,
+        Setting::ChangePassphrase,
         Setting::SyncNow,
     ];
 
@@ -30,6 +36,9 @@ impl Setting {
             Setting::WebdavUser => "WebDAV: логин",
             Setting::WebdavPassword => "WebDAV: пароль",
             Setting::WebdavPasswordCommand => "WebDAV: команда пароля",
+            Setting::WebdavPassphrase => "Шифрование: фраза",
+            Setting::WebdavPassphraseCommand => "Шифрование: команда фразы",
+            Setting::ChangePassphrase => "Шифрование: сменить фразу",
             Setting::SyncNow => "Синхронизировать сейчас",
         }
     }
@@ -41,6 +50,9 @@ impl Setting {
             Setting::WebdavUser => "пусто — без входа",
             Setting::WebdavPassword => "лежит в файле настроек, доступном только вам",
             Setting::WebdavPasswordCommand => "например «pass ztaskmgr»; если задана — вместо пароля",
+            Setting::WebdavPassphrase => "шифрует книжку на сервере; одна на всех устройствах",
+            Setting::WebdavPassphraseCommand => "например «pass ztaskmgr-book»; если задана — вместо фразы",
+            Setting::ChangePassphrase => "на сервере; на других устройствах потом — новую фразу выше",
             Setting::SyncNow => "иначе — раз в минуту и через пару секунд после правки",
         }
     }
@@ -52,7 +64,9 @@ impl Setting {
             Setting::WebdavUser => Some(crate::config::WEBDAV_USER),
             Setting::WebdavPassword => Some(crate::config::WEBDAV_PASSWORD),
             Setting::WebdavPasswordCommand => Some(crate::config::WEBDAV_PASSWORD_COMMAND),
-            Setting::Preview | Setting::SyncNow => None,
+            Setting::WebdavPassphrase => Some(crate::config::WEBDAV_PASSPHRASE),
+            Setting::WebdavPassphraseCommand => Some(crate::config::WEBDAV_PASSPHRASE_COMMAND),
+            Setting::Preview | Setting::ChangePassphrase | Setting::SyncNow => None,
         }
     }
 
@@ -68,7 +82,7 @@ impl Setting {
         let value = config.get(self.key()?).unwrap_or("");
         Some(match self {
             _ if value.is_empty() => "—".into(),
-            Setting::WebdavPassword => "•".repeat(value.chars().count().min(12)),
+            Setting::WebdavPassword | Setting::WebdavPassphrase => "•".repeat(value.chars().count().min(12)),
             _ => value.to_string(),
         })
     }
@@ -96,7 +110,14 @@ impl App {
             };
             let value = field.text().trim().to_string();
             *input = None;
-            if let (KeyCode::Enter, Some(key)) = (code, setting.key()) {
+            if (code, setting) == (KeyCode::Enter, Setting::ChangePassphrase) {
+                if value.is_empty() {
+                    self.status = Some(Status::Error("Новая фраза пустая — не сменена".into()));
+                } else {
+                    self.passphrase_change = Some(value);
+                    self.status = Some(Status::Info("Шифрование: смена фразы…".into()));
+                }
+            } else if let (KeyCode::Enter, Some(key)) = (code, setting.key()) {
                 match self.config.set(key, &value) {
                     // Главный цикл передаст новые настройки синхронизации.
                     Ok(()) => self.webdav_changed = true,
@@ -118,6 +139,10 @@ impl App {
                     self.sync_requested = true;
                     self.status = Some(Status::Info("WebDAV: синхронизация…".into()));
                 }
+                Setting::ChangePassphrase if !self.config.webdav().is_some_and(|s| s.is_encrypted()) => {
+                    self.status = Some(Status::Info("Шифрование не включено: сначала задайте фразу".into()));
+                }
+                Setting::ChangePassphrase => *input = Some(LineInput::new(String::new())),
                 _ => {
                     let current = setting.key().and_then(|k| self.config.get(k)).unwrap_or("");
                     *input = Some(LineInput::new(current.to_string()));
@@ -182,6 +207,24 @@ impl App {
                 self.sync = SyncState::Error(e);
             }
         }
+    }
+
+    /// Чем кончилась смена фразы. Новая фраза — в настройки, если фраза хранится там; если её
+    /// печатает команда — обновить то, откуда она её берёт, может только пользователь.
+    pub fn on_passphrase(&mut self, changed: crate::webdav::Changed) {
+        self.status = Some(match changed {
+            Err(e) => Status::Error(format!("Фраза не сменена: {e}")),
+            Ok(_) if self.config.get(crate::config::WEBDAV_PASSPHRASE_COMMAND).is_some_and(|c| !c.trim().is_empty()) => {
+                Status::Info(
+                    "Фраза сменена на сервере. Обновите то, что печатает команда фразы, и введите новую фразу на других устройствах"
+                        .into(),
+                )
+            }
+            Ok(new) => match self.config.set(crate::config::WEBDAV_PASSPHRASE, &new) {
+                Ok(()) => Status::Info("Фраза сменена — введите новую фразу на других устройствах".into()),
+                Err(e) => Status::Error(format!("Фраза сменена на сервере, но не сохранена в настройках ({e:#}) — впишите её")),
+            },
+        });
     }
 
     /// `v`: превью видно только на широком экране — на узком говорим об этом.

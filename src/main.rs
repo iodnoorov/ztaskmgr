@@ -3,6 +3,7 @@ mod app;
 mod book;
 mod clock;
 mod config;
+mod crypt;
 mod field;
 mod input;
 mod keymap;
@@ -227,6 +228,13 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, kitty: &mut bool, worker: 
         }
         if std::mem::take(&mut app.sync_requested) {
             worker.now();
+        }
+        if let Some(new) = app.passphrase_change.take() {
+            worker.change_passphrase(new);
+        }
+        if let Some(changed) = worker.passphrase_changed() {
+            app.on_passphrase(changed);
+            dirty = true;
         }
         for outcome in worker.outcomes() {
             app.on_sync(outcome);
