@@ -19,6 +19,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -115,6 +116,24 @@ struct Remote {
     auth: Option<String>,
 }
 
+/// Корневые сертификаты для https: встроенные (Mozilla) и системные — так подходят и
+/// свои центры сертификации, добавленные в систему (`trust anchor`, `update-ca-certificates`).
+/// Системное хранилище читается один раз за запуск.
+fn root_certs() -> ureq::tls::RootCerts {
+    static ROOTS: OnceLock<Arc<Vec<ureq::tls::Certificate<'static>>>> = OnceLock::new();
+    let roots = ROOTS.get_or_init(|| {
+        let system = rustls_native_certs::load_native_certs().certs;
+        let bundled = webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter();
+        Arc::new(
+            bundled
+                .map(|c| ureq::tls::Certificate::from_der(c).to_owned())
+                .chain(system.iter().map(|c| ureq::tls::Certificate::from_der(c).to_owned()))
+                .collect(),
+        )
+    });
+    ureq::tls::RootCerts::Specific(roots.clone())
+}
+
 fn base64(data: &[u8]) -> String {
     const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
@@ -149,6 +168,7 @@ impl Remote {
             .http_status_as_error(false)
             .allow_non_standard_methods(true)
             .timeout_global(Some(TIMEOUT))
+            .tls_config(ureq::tls::TlsConfig::builder().root_certs(root_certs()).build())
             .build()
             .into();
         Ok(Self { agent, base, auth })
