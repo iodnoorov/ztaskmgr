@@ -5,8 +5,8 @@
 //! из будущих версий) остаётся как было.
 
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -23,6 +23,7 @@ pub const WEBDAV_PASSWORD_COMMAND: &str = "webdav_password_command";
 const WEBDAV_INSECURE: &str = "webdav_insecure";
 pub const WEBDAV_PASSPHRASE: &str = "webdav_passphrase";
 pub const WEBDAV_PASSPHRASE_COMMAND: &str = "webdav_passphrase_command";
+pub const WEBDAV_CA: &str = "webdav_ca";
 
 #[derive(Debug, Default)]
 pub struct Config {
@@ -75,17 +76,26 @@ impl Config {
 
     /// Меняет строку ключа (последнюю, она и действует) или дописывает её, и сохраняет.
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        let previous_len = self.lines.len();
         let line = format!("{key} = {value}");
-        match self.lines.iter().rposition(|l| value_of(l, key).is_some()) {
-            Some(i) => self.lines[i] = line,
+        let previous = match self.lines.iter().rposition(|l| value_of(l, key).is_some()) {
+            Some(i) => Some((i, std::mem::replace(&mut self.lines[i], line))),
             None => {
                 if self.lines.is_empty() {
                     self.lines.push(HEADER.into());
                 }
                 self.lines.push(line);
+                None
             }
+        };
+        if let Err(error) = self.save() {
+            match previous {
+                Some((i, line)) => self.lines[i] = line,
+                None => self.lines.truncate(previous_len),
+            }
+            return Err(error);
         }
-        self.save()
+        Ok(())
     }
 
     /// Пишет через временный файл, доступный только владельцу: здесь будут пароль и фраза.
@@ -93,27 +103,9 @@ impl Config {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).with_context(|| format!("создание {}", dir.display()))?;
-        }
         let mut text = self.lines.join("\n");
         text.push('\n');
-        let mut tmp_name = path.as_os_str().to_owned();
-        tmp_name.push(".tmp");
-        let tmp = Path::new(&tmp_name);
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(tmp)
-            .with_context(|| format!("запись {}", tmp.display()))?;
-        // Файл мог остаться от прошлого раза с другими правами.
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(tmp, path).with_context(|| format!("переименование в {}", path.display()))
+        crate::store::write_atomic_mode(path, text.as_bytes(), 0o600)
     }
 
     /// Панель превью задачи справа (на широком экране). По умолчанию включена.
@@ -137,6 +129,7 @@ impl Config {
             insecure: self.get(WEBDAV_INSECURE).and_then(parse_bool).unwrap_or(false),
             passphrase: get(WEBDAV_PASSPHRASE),
             passphrase_command: get(WEBDAV_PASSPHRASE_COMMAND),
+            ca: get(WEBDAV_CA),
         })
     }
 }
@@ -166,5 +159,56 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "# мой\nfuture = 1\npreview = off\n");
         assert!(!Config::load(path).unwrap().preview());
         let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn failed_set_restores_memory_and_keeps_existing_destination() {
+        let dir = std::env::temp_dir().join(format!("ztaskmgr-config-rollback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("config");
+        let mut config = Config::load(path.clone()).unwrap();
+        config.set(WEBDAV_PASSWORD, "old secret").unwrap();
+        let previous = config.lines.clone();
+        // rename файла поверх каталога обязан отказать даже при запуске от root.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("preserved"), "old destination").unwrap();
+        assert!(config.set(WEBDAV_PASSWORD, "new secret").is_err());
+        assert_eq!(config.get(WEBDAV_PASSWORD), Some("old secret"));
+        assert_eq!(config.lines, previous);
+        assert_eq!(fs::read_to_string(path.join("preserved")).unwrap(), "old destination");
+        fs::remove_dir_all(&path).unwrap();
+        config.set(WEBDAV_USER, "user").unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("old secret") && !saved.contains("new secret"));
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_config_commits_have_private_unique_temporaries() {
+        let dir = std::env::temp_dir().join(format!("ztaskmgr-config-concurrent-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("config");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|writer| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut config = Config::load(path).unwrap();
+                    barrier.wait();
+                    config.set(WEBDAV_PASSWORD, &format!("secret-{writer}")).unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let config = Config::load(path.clone()).unwrap();
+        let value = config.get(WEBDAV_PASSWORD).unwrap();
+        assert!((0..8).any(|writer| value == format!("secret-{writer}")));
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

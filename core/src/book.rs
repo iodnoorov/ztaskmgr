@@ -1,11 +1,12 @@
 //! Книжка: страницы по датам (`2026-10-26.md` — списки дел на этот день), записи задач
 //! (`notes/<id>.md`), реестр списков (`LISTS.md`), архив удалённого. Файлы — через `Store`.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use anyhow::{Context, Result, bail};
 
@@ -76,6 +77,23 @@ pub struct Book {
     /// Разобранные страницы по отпечатку файла: история, поиск и превью читают книжку
     /// целиком, а меняется в ней за раз одна-две страницы.
     pages: RefCell<HashMap<Date, (Stamp, Board)>>,
+    lock_depth: Cell<usize>,
+    lock_file: RefCell<Option<fs::File>>,
+}
+
+/// Короткая локальная транзакция. Вложенные блокировки того же `Book` безопасны.
+pub struct BookLock<'a> {
+    book: &'a Book,
+}
+
+impl Drop for BookLock<'_> {
+    fn drop(&mut self) {
+        let depth = self.book.lock_depth.get() - 1;
+        self.book.lock_depth.set(depth);
+        if depth == 0 {
+            self.book.lock_file.borrow_mut().take();
+        }
+    }
 }
 
 impl Book {
@@ -85,11 +103,28 @@ impl Book {
     }
 
     pub fn with_store(dir: PathBuf, store: Box<dyn Store>) -> Self {
-        Self { dir, store, lists: RefCell::new(None), pages: RefCell::new(HashMap::new()) }
+        Self {
+            dir,
+            store,
+            lists: RefCell::new(None),
+            pages: RefCell::new(HashMap::new()),
+            lock_depth: Cell::new(0),
+            lock_file: RefCell::new(None),
+        }
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Общая межпроцессная граница read–modify–write; не держать во время сети/ввода.
+    /// Для нескольких `Book` одного каталога брать только один guard, без вложения.
+    pub fn lock(&self) -> Result<BookLock<'_>> {
+        if self.lock_depth.get() == 0 {
+            *self.lock_file.borrow_mut() = self.store.lock()?;
+        }
+        self.lock_depth.set(self.lock_depth.get() + 1);
+        Ok(BookLock { book: self })
     }
 
     // ------------------------------------------------------------------ файлы
@@ -100,10 +135,12 @@ impl Book {
     }
 
     pub fn write_file(&self, path: &str, data: &[u8]) -> Result<()> {
+        let _guard = self.lock()?;
         self.store.write(path, data)
     }
 
     pub fn remove_file(&self, path: &str) -> Result<()> {
+        let _guard = self.lock()?;
         self.store.remove(path)
     }
 
@@ -138,28 +175,96 @@ impl Book {
     /// Страница на дату; несуществующая — пустая.
     pub fn load(&self, date: Date) -> Result<Board> {
         let path = page_path(date);
-        let Some(stamp) = self.store.stamp(&path) else {
-            return Ok(Board::default());
-        };
+        let stamp = self.store.stamp(&path);
         if let Some((cached, board)) = self.pages.borrow().get(&date)
-            && *cached == stamp
+            && Some(*cached) == stamp
         {
             return Ok(board.clone());
         }
         let text = self.read_text(&path)?.unwrap_or_default();
         let board = self.with_lists(|lists| storage::parse(&text, lists)).with_context(|| format!("разбор {path}"))?;
-        self.pages.borrow_mut().insert(date, (stamp, board.clone()));
+        board.validate_ids()?;
+        board.revision.set(Some((date, stamp)));
+        if let Some(stamp) = stamp {
+            self.pages.borrow_mut().insert(date, (stamp, board.clone()));
+        }
         Ok(board)
     }
 
-    /// Сохраняет страницу. Пустая страница — это отсутствие файла: если все задачи удалены,
-    /// файл удаляется, а пустой новый не создаётся.
+    /// Условное сохранение снимка из `load`: устаревший снимок возвращает конфликт.
+    /// Для открытого черновика со слиянием используйте `save_page`.
     pub fn save(&self, date: Date, board: &Board) -> Result<()> {
-        if board.is_empty() {
-            return self.store.remove(&page_path(date));
+        let _guard = self.lock()?;
+        board.validate_ids()?;
+        if let Some((loaded_date, stamp)) = board.revision.get()
+            && loaded_date == date
+            && self.page_stamp(date) != stamp
+        {
+            bail!("страница {date} изменилась: перечитайте её перед сохранением");
         }
-        let text = self.with_lists(|lists| Ok(storage::serialize(board, lists)))?;
-        self.store.write(&page_path(date), text.as_bytes())
+        // При ошибке metadata отсутствие файла подтверждается чтением.
+        if self.page_stamp(date).is_none() {
+            self.read_file(&page_path(date))?;
+        }
+        if board.is_empty() && board.graves().is_empty() {
+            self.store.remove(&page_path(date))?;
+        } else {
+            let text = self.with_lists(|lists| Ok(storage::serialize(board, lists)))?;
+            self.store.write(&page_path(date), text.as_bytes())?;
+        }
+        board.revision.set(Some((date, self.page_stamp(date))));
+        self.pages.borrow_mut().remove(&date);
+        Ok(())
+    }
+
+    /// Согласованный снимок страницы и её отпечатка для открытого черновика.
+    pub fn open_page(&self, date: Date) -> Result<(Board, Option<Stamp>)> {
+        let _guard = self.lock()?;
+        Ok((self.load(date)?, self.page_stamp(date)))
+    }
+
+    /// Commit открытого черновика: check, parse, merge и запись под одним guard.
+    /// При ошибке черновик и подтверждённый stamp остаются прежними.
+    pub fn save_page(&self, date: Date, board: &mut Board, stamp: &mut Option<Stamp>) -> Result<()> {
+        let _guard = self.lock()?;
+        board.validate_ids()?;
+        let current = self.page_stamp(date);
+        let mut candidate = if current != *stamp {
+            crate::merge::merge_boards(board, &self.load(date)?)
+        } else {
+            // Чтение обязательно и при stamp=None: это не доказательство отсутствия файла.
+            self.read_file(&page_path(date))?;
+            board.clone()
+        };
+        candidate.revision.set(Some((date, current)));
+        self.assign_ids(&mut candidate)?;
+        self.save(date, &candidate)?;
+        *stamp = self.page_stamp(date);
+        *board = candidate;
+        Ok(())
+    }
+
+    /// Назначение id с проверкой уже занятых идентичностей, включая несохранённую доску.
+    pub fn assign_ids(&self, board: &mut Board) -> Result<bool> {
+        let _guard = self.lock()?;
+        board.validate_ids()?;
+        self.reserve_ids(
+            board.tasks().filter_map(|task| task.id.clone()).chain(board.graves().iter().map(|(id, _)| id.clone())),
+        )?;
+        if !board.tasks().any(|task| task.id.is_none()) {
+            return Ok(false);
+        }
+        self.allocate_ids(|random, reserved| {
+            for category in board.ids() {
+                for index in 0..board.list(category).len() {
+                    let task = board.get_mut(category, index).unwrap();
+                    if task.id.is_none() {
+                        task.id = Some(fresh_id(random, reserved)?);
+                    }
+                }
+            }
+            Ok(true)
+        })
     }
 
     pub fn page_stamp(&self, date: Date) -> Option<Stamp> {
@@ -209,6 +314,7 @@ impl Book {
     }
 
     pub fn save_lists(&self, lists: &Lists) -> Result<()> {
+        let _guard = self.lock()?;
         if let Some(e) = self.lists_error() {
             bail!("{e} — исправьте файл, иначе изменение его затрёт");
         }
@@ -218,6 +324,30 @@ impl Book {
         Ok(())
     }
 
+    /// Применяет правку к актуальному реестру в общей локальной транзакции.
+    pub fn edit_lists(&self, edit: impl FnOnce(&mut Lists) -> Result<()>) -> Result<Lists> {
+        let _guard = self.lock()?;
+        let mut lists = self.lists()?;
+        edit(&mut lists)?;
+        self.save_lists(&lists)?;
+        Ok(lists)
+    }
+
+    /// Удаляет/архивирует список и переносит актуальные задачи в одной транзакции.
+    pub fn delete_list(&self, list: ListId, to: Option<ListId>, since: Date) -> Result<(Lists, usize, bool)> {
+        let _guard = self.lock()?;
+        if to.is_none() && self.tasks_since(list, since)? > 0 {
+            bail!("в списке появились задачи — выберите, куда их перенести");
+        }
+        let moved = match to {
+            Some(to) => self.move_list_tasks(list, to, since)?,
+            None => 0,
+        };
+        let used = moved > 0 || self.list_used(list)?;
+        let lists = self.edit_lists(|lists| if used { lists.archive(list) } else { lists.remove(list) })?;
+        Ok((lists, moved, used))
+    }
+
     pub fn lists_stamp(&self) -> Option<Stamp> {
         self.store.stamp(LISTS_FILE)
     }
@@ -225,6 +355,7 @@ impl Book {
     /// Переводит книжку прежних версий на нынешний формат — один раз, при запуске, а не при
     /// чтении: скрытые от ИИ списки из `AI_HIDDEN.md` — в `LISTS.md`. Возвращает, что сделано.
     pub fn migrate(&self) -> Result<Vec<String>> {
+        let _guard = self.lock()?;
         let mut done = Vec::new();
         if let Some(text) = self.read_text(AI_HIDDEN)? {
             let mut lists = self.lists()?;
@@ -260,6 +391,7 @@ impl Book {
     /// Удаление списка: все его задачи на страницах с `since` и дальше — в конец списка `to`.
     /// Прошлые страницы — история, их не трогаем. Возвращает, сколько перенесено.
     pub fn move_list_tasks(&self, from: ListId, to: ListId, since: Date) -> Result<usize> {
+        let _guard = self.lock()?;
         let mut count = 0;
         for date in self.dates()?.into_iter().filter(|&d| d >= since) {
             let mut board = self.load(date)?;
@@ -283,10 +415,32 @@ impl Book {
         Ok(self.read_text(&notes_path(id))?.map(|text| Notes::parse(&text)).unwrap_or_default())
     }
 
+    /// Согласованный снимок записей и отпечатка для клиентского черновика.
+    pub fn open_notes(&self, id: &str) -> Result<(Notes, Option<Stamp>)> {
+        let _guard = self.lock()?;
+        Ok((self.load_notes(id)?, self.notes_stamp(id)))
+    }
+
     /// Сохраняет записи; пустые — без файла, как и пустая страница.
     pub fn save_notes(&self, id: &str, notes: &Notes) -> Result<()> {
+        let _guard = self.lock()?;
         let text = if notes.is_empty() { String::new() } else { notes.serialize() };
         self.write_or_remove(&notes_path(id), &text)
+    }
+
+    /// Commit черновика записей; read error не разрешает затереть внешнюю версию.
+    pub fn save_notes_draft(&self, id: &str, notes: &mut Notes, stamp: &mut Option<Stamp>) -> Result<()> {
+        let _guard = self.lock()?;
+        let mut candidate = notes.clone();
+        if self.notes_stamp(id) != *stamp {
+            candidate.merge(&self.load_notes(id)?);
+        } else if stamp.is_none() {
+            self.read_file(&notes_path(id))?;
+        }
+        self.save_notes(id, &candidate)?;
+        *stamp = self.notes_stamp(id);
+        *notes = candidate;
+        Ok(())
     }
 
     pub fn notes_stamp(&self, id: &str) -> Option<Stamp> {
@@ -302,31 +456,45 @@ impl Book {
         Ok(path)
     }
 
-    /// Новый id (задачи, списка): 6 знаков base36 из `/dev/urandom` (36⁶ ≈ 2 млрд), которого
-    /// нет среди записей и списков.
-    pub fn new_id(&self) -> String {
-        let lists = self.lists().unwrap_or_default();
-        loop {
-            let mut bytes = [0u8; 8];
-            let random = fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).is_ok();
-            let mut n = if random {
-                u64::from_le_bytes(bytes)
-            } else {
-                // Нет /dev/urandom — время с наносекундами и адрес на стеке.
-                let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-                t.as_nanos() as u64 ^ (&bytes as *const _ as u64).rotate_left(32)
-            };
-            let id: String = (0..6)
-                .map(|_| {
-                    let c = char::from_digit((n % 36) as u32, 36).unwrap_or('0');
-                    n /= 36;
-                    c
-                })
-                .collect();
-            if self.store.stamp(&notes_path(&id)).is_none() && lists.get(ListId::new(&id)).is_none() {
-                return id;
+    fn reserve_ids(&self, ids: impl IntoIterator<Item = String>) -> Result<()> {
+        let key = self.identity_key()?;
+        reserved_ids().lock().map_err(|_| anyhow::anyhow!("реестр id недоступен"))?.entry(key).or_default().extend(ids);
+        Ok(())
+    }
+
+    fn identity_key(&self) -> Result<PathBuf> {
+        if let Ok(path) = self.dir.canonicalize() {
+            return Ok(path);
+        }
+        Ok(if self.dir.is_absolute() { self.dir.clone() } else { std::env::current_dir()?.join(&self.dir) })
+    }
+
+    /// 64 случайных бита, 16 lowercase hex; ошибка OS random не подменяется временем.
+    /// Резервируются и ещё не сохранённые id этого процесса.
+    pub fn new_id(&self) -> Result<String> {
+        self.allocate_ids(fresh_id)
+    }
+
+    fn allocate_ids<T>(&self, allocate: impl FnOnce(&mut fs::File, &mut HashSet<String>) -> Result<T>) -> Result<T> {
+        let _guard = self.lock()?;
+        let mut occupied: HashSet<String> =
+            self.lists()?.all().iter().map(|list| list.id.as_str().to_owned()).collect();
+        for date in self.dates()? {
+            let board = self.load(date)?;
+            occupied.extend(board.tasks().filter_map(|task| task.id.clone()));
+            occupied.extend(board.graves().iter().map(|(id, _)| id.clone()));
+        }
+        for path in self.files()? {
+            if let Some(FileKind::Notes(id)) = file_kind(&path) {
+                occupied.insert(id);
             }
         }
+        let key = self.identity_key()?;
+        let mut reserved = reserved_ids().lock().map_err(|_| anyhow::anyhow!("реестр id недоступен"))?;
+        let reserved = reserved.entry(key).or_default();
+        reserved.extend(occupied);
+        let mut random = fs::File::open("/dev/urandom").context("системный источник случайности")?;
+        allocate(&mut random, reserved)
     }
 
     /// Сводка записей для задач страницы — для значка `✎ 1/3`.
@@ -368,6 +536,7 @@ impl Book {
     /// Удалена задача с записями: если её копий больше нет ни на одной странице, записи
     /// дописываются в `DELETED_NOTES.md`, а их файл удаляется. Возвращает, перенесены ли.
     pub fn archive_notes(&self, task: &Task, page: Date, stamp: &str) -> Result<bool> {
+        let _guard = self.lock()?;
         let Some(id) = &task.id else {
             return Ok(false);
         };
@@ -386,6 +555,7 @@ impl Book {
     }
 
     fn append_deleted(&self, title: &str, id: &str, page: Date, body: &str) -> Result<()> {
+        let _guard = self.lock()?;
         let mut text = self.read_text(DELETED_NOTES)?.unwrap_or_default();
         text.push_str(&format!("## {title}\n<!-- id:{id}, страница {page} -->\n\n{body}\n"));
         self.store.write(DELETED_NOTES, text.as_bytes())
@@ -395,13 +565,17 @@ impl Book {
     /// `today` переезжают в конец тех же списков на `today`, а там помечаются `[>]`.
     /// Возвращает дату, с которой перенесли, и сколько задач.
     pub fn carry_over(&self, today: Date) -> Result<Option<(Date, usize)>> {
+        let _guard = self.lock()?;
         let Some(from) = self.dates()?.into_iter().rev().find(|&d| d < today) else {
             return Ok(None);
         };
         let mut source = self.load(from)?;
         // Копии на сегодня — с теми же id, что и на исходной странице: если перенос сделают
         // два устройства сразу, при слиянии это будут одни и те же задачи, а не дубли.
-        source.assign_ids(|| self.new_id());
+        if self.assign_ids(&mut source)? {
+            // Закрепляем идентичности до первой копии, не помечая источник перенесённым.
+            self.save(from, &source)?;
+        }
         let moved = source.migrate_open(today);
         if moved.is_empty() {
             return Ok(None);
@@ -412,7 +586,7 @@ impl Book {
         let lists = self.lists()?;
         for (category, task) in moved {
             let category = if lists.get(category).is_some_and(|d| d.archived) { lists.active()[0] } else { category };
-            target.push(category, task);
+            upsert_carried(self, &mut target, category, task, from)?;
         }
         // Сначала новая страница: при сбое между записями задача окажется в двух местах,
         // а не пропадёт.
@@ -424,23 +598,521 @@ impl Book {
     /// Ручной перенос: копия задачи — в конец того же списка на странице `to`, на текущей
     /// странице (`board`, ещё не сохранена) задача помечается `[>]`.
     pub fn postpone(&self, board: &mut Board, from: Date, category: ListId, index: usize, to: Date) -> Result<bool> {
-        board.assign_ids(|| self.new_id());
-        let Some(task) = board.get_mut(category, index).filter(|t| t.is_open() && from != to) else {
+        let _guard = self.lock()?;
+        if from == to || board.list(category).get(index).is_none_or(|task| !task.is_open()) {
             return Ok(false);
-        };
+        }
+        self.assign_ids(board)?;
+        // Сохраняем устойчивый id и локальные правки прежде целевой копии.
+        self.save(from, board)?;
+        let task = board.list(category)[index].clone();
         let mut target = self.load(to)?;
-        target.push(category, task.carried());
+        upsert_carried(self, &mut target, category, task.carried(), from)?;
         self.save(to, &target)?;
+        let mut source = board.clone();
+        let task = source.get_mut(category, index).unwrap();
         task.state = State::Migrated(to);
         task.touch();
-        self.save(from, board)?;
+        self.save(from, &source)?;
+        *board = source;
         Ok(true)
+    }
+}
+
+fn upsert_carried(book: &Book, target: &mut Board, category: ListId, task: Task, from: Date) -> Result<()> {
+    if task.id.as_deref().is_some_and(|id| target.buried(id).is_some()) {
+        return Ok(());
+    }
+    for existing_category in target.ids() {
+        if let Some(index) = target.list(existing_category).iter().position(|existing| existing.id == task.id) {
+            // Восстановить можно исторического предка источника, но не цель, которую
+            // уже выполнили, отменили или после частичного переноса отправили дальше.
+            if let State::Migrated(next) = target.list(existing_category)[index].state
+                && migration_reaches(book, task.id.as_deref().unwrap(), next, from)?
+            {
+                target.remove(existing_category, index);
+                target.push(category, task);
+            }
+            return Ok(());
+        }
+    }
+    target.push(category, task);
+    Ok(())
+}
+
+fn migration_reaches(book: &Book, id: &str, mut date: Date, from: Date) -> Result<bool> {
+    let mut visited = HashSet::new();
+    while visited.insert(date) {
+        if date == from {
+            return Ok(true);
+        }
+        let board = book.load(date)?;
+        match board.tasks().find(|task| task.id.as_deref() == Some(id)).map(|task| task.state) {
+            Some(State::Migrated(next)) => date = next,
+            _ => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
+fn reserved_ids() -> &'static Mutex<HashMap<PathBuf, HashSet<String>>> {
+    static IDS: LazyLock<Mutex<HashMap<PathBuf, HashSet<String>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    &IDS
+}
+
+fn fresh_id(random: &mut impl Read, reserved: &mut HashSet<String>) -> Result<String> {
+    loop {
+        let mut bytes = [0u8; 8];
+        random.read_exact(&mut bytes).context("случайный id")?;
+        let id = format!("{:016x}", u64::from_le_bytes(bytes));
+        if reserved.insert(id.clone()) {
+            return Ok(id);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
+    #[test]
+    fn historical_return_follows_multiple_dates_but_retry_does_not_undo_a_later_move() {
+        let (book, faults) = fault_book("migration-chain");
+        let mut first = Board::default();
+        first.push(ListId::WORK, Task::new("task"));
+        book.save(d(25), &first).unwrap();
+        book.postpone(&mut first, d(25), ListId::WORK, 0, d(26)).unwrap();
+        let mut second = book.load(d(26)).unwrap();
+        book.postpone(&mut second, d(26), ListId::WORK, 0, d(27)).unwrap();
+        let mut third = book.load(d(27)).unwrap();
+        book.postpone(&mut third, d(27), ListId::WORK, 0, d(25)).unwrap();
+        assert!(book.load(d(25)).unwrap().list(ListId::WORK)[0].is_open());
+
+        // Новый перенос: цель успели передвинуть дальше до повторной фиксации источника.
+        first = book.load(d(25)).unwrap();
+        faults.fail_at.set(Some(faults.writes.get() + 3));
+        assert!(book.postpone(&mut first, d(25), ListId::WORK, 0, d(28)).is_err());
+        faults.fail_at.set(None);
+        let mut target = book.load(d(28)).unwrap();
+        book.postpone(&mut target, d(28), ListId::WORK, 0, d(29)).unwrap();
+        book.postpone(&mut first, d(25), ListId::WORK, 0, d(28)).unwrap();
+        assert_eq!(book.load(d(28)).unwrap().list(ListId::WORK)[0].state, State::Migrated(d(29)));
+        assert!(book.load(d(29)).unwrap().list(ListId::WORK)[0].is_open());
+    }
+
+    #[derive(Default)]
+    struct Faults {
+        writes: Cell<usize>,
+        fail_at: Cell<Option<usize>>,
+        fail_read: Cell<bool>,
+    }
+
+    struct FaultStore {
+        inner: crate::store::MemStore,
+        faults: Rc<Faults>,
+    }
+
+    impl Store for FaultStore {
+        fn read(&self, path: &str) -> Result<Option<Vec<u8>>> {
+            if self.faults.fail_read.get() {
+                bail!("injected read failure");
+            }
+            self.inner.read(path)
+        }
+        fn write(&self, path: &str, data: &[u8]) -> Result<()> {
+            let write = self.faults.writes.get() + 1;
+            self.faults.writes.set(write);
+            if self.faults.fail_at.get() == Some(write) {
+                bail!("injected write failure");
+            }
+            self.inner.write(path, data)
+        }
+        fn remove(&self, path: &str) -> Result<()> {
+            self.inner.remove(path)
+        }
+        fn list(&self, dir: &str) -> Result<Vec<String>> {
+            self.inner.list(dir)
+        }
+        fn stamp(&self, path: &str) -> Option<Stamp> {
+            if self.faults.fail_read.get() { None } else { self.inner.stamp(path) }
+        }
+    }
+
+    fn fault_book(name: &str) -> (Book, Rc<Faults>) {
+        let faults = Rc::new(Faults::default());
+        let store = FaultStore { inner: crate::store::MemStore::default(), faults: faults.clone() };
+        (Book::with_store(PathBuf::from(format!("memory-fault-{name}")), Box::new(store)), faults)
+    }
+
+    #[test]
+    fn stale_snapshots_conflict_instead_of_losing_writes() {
+        let book = temp_book("stale");
+        let mut first = book.load(d(26)).unwrap();
+        let mut second = book.load(d(26)).unwrap();
+        first.push(ListId::WORK, Task::new("first"));
+        second.push(ListId::WORK, Task::new("second"));
+        book.save(d(26), &first).unwrap();
+        assert!(book.save(d(26), &second).is_err());
+        assert_eq!(texts(&book.load(d(26)).unwrap(), ListId::WORK), [("first".into(), State::Open)]);
+        fs::remove_dir_all(book.dir()).unwrap();
+    }
+
+    #[test]
+    fn simultaneous_draft_commits_keep_both_edits() {
+        use std::sync::{Arc, Barrier};
+        let book = temp_book("concurrent");
+        let dir = book.dir().to_owned();
+        let barrier = Arc::new(Barrier::new(2));
+        let threads: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|text| {
+                let dir = dir.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let book = Book::new(dir);
+                    let (mut board, mut stamp) = book.open_page(d(26)).unwrap();
+                    board.push(ListId::WORK, Task::new(text));
+                    barrier.wait();
+                    book.save_page(d(26), &mut board, &mut stamp).unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let board = book.load(d(26)).unwrap();
+        let mut result: Vec<_> = board.tasks().map(|task| task.text.as_str()).collect();
+        result.sort();
+        assert_eq!(result, ["first", "second"]);
+        assert!(board.tasks().all(|task| task.id.as_ref().is_some_and(|id| id.len() == 16)));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn nested_mutators_share_one_lock_and_serialized_rmw() {
+        use std::sync::{Arc, Barrier};
+        let book = temp_book("rmw");
+        let dir = book.dir().to_owned();
+        let barrier = Arc::new(Barrier::new(4));
+        let threads: Vec<_> = (0..4)
+            .map(|writer| {
+                let dir = dir.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let book = Book::new(dir);
+                    barrier.wait();
+                    for index in 0..8 {
+                        let _outer = book.lock().unwrap();
+                        let _inner = book.lock().unwrap();
+                        let mut board = book.load(d(26)).unwrap();
+                        board.push(ListId::WORK, Task::new(format!("{writer}/{index}")));
+                        book.save(d(26), &board).unwrap();
+                        book.archive_entry("task", "abc", d(26), "stamp", "entry").unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(book.load(d(26)).unwrap().tasks().count(), 32);
+        let archive = String::from_utf8(book.read_file(DELETED_NOTES).unwrap().unwrap()).unwrap();
+        assert_eq!(archive.matches("## stamp").count(), 32);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_draft_commit_keeps_memory_and_confirmed_stamp() {
+        let (book, faults) = fault_book("draft");
+        let (mut board, mut stamp) = book.open_page(d(26)).unwrap();
+        board.push(ListId::WORK, Task::new("draft"));
+        let original = board.clone();
+        faults.fail_at.set(Some(1));
+        assert!(book.save_page(d(26), &mut board, &mut stamp).is_err());
+        assert_eq!(board, original);
+        assert!(board.tasks().all(|task| task.id.is_none()));
+        assert_eq!(stamp, None);
+        faults.fail_at.set(None);
+        book.save_page(d(26), &mut board, &mut stamp).unwrap();
+        assert_eq!(book.load(d(26)).unwrap(), board);
+    }
+
+    #[test]
+    fn outside_corruption_preserves_file_draft_and_stamp() {
+        let book = temp_book("corruption");
+        let (mut board, mut stamp) = book.open_page(d(26)).unwrap();
+        board.push(ListId::WORK, Task::new("original"));
+        book.save_page(d(26), &mut board, &mut stamp).unwrap();
+        board.push(ListId::HOME, Task::new("local draft"));
+        let original = board.clone();
+        let confirmed = stamp;
+        for raw in [b"USER TEXT NOT VALID AS A PAGE".as_slice(), b"\xff\xfe".as_slice()] {
+            crate::store::write_atomic(&book.dir().join(page_path(d(26))), raw).unwrap();
+            assert!(book.save_page(d(26), &mut board, &mut stamp).is_err());
+            assert_eq!(fs::read(book.dir().join(page_path(d(26)))).unwrap(), raw);
+            assert_eq!(board, original);
+            assert_eq!(stamp, confirmed);
+        }
+        fs::remove_file(book.dir().join(page_path(d(26)))).unwrap();
+        fs::create_dir(book.dir().join(page_path(d(26)))).unwrap();
+        assert!(book.save_page(d(26), &mut board, &mut stamp).is_err());
+        assert_eq!(board, original);
+        assert_eq!(stamp, confirmed);
+        fs::remove_dir_all(book.dir()).unwrap();
+    }
+
+    #[test]
+    fn absent_stamp_does_not_hide_read_error() {
+        let (book, faults) = fault_book("read");
+        let (mut board, mut stamp) = book.open_page(d(26)).unwrap();
+        board.push(ListId::WORK, Task::new("draft"));
+        faults.fail_read.set(true);
+        assert!(book.load(d(26)).is_err());
+        assert!(book.save_page(d(26), &mut board, &mut stamp).is_err());
+        assert_eq!(stamp, None);
+        assert_eq!(faults.writes.get(), 0);
+        assert_eq!(board.tasks().next().unwrap().text, "draft");
+    }
+
+    #[test]
+    fn final_task_grave_survives_restart_and_suppresses_stale_copy() {
+        let book = temp_book("grave");
+        let mut board = Board::default();
+        let mut task = Task::new("deleted");
+        task.id = Some("abc123".into());
+        board.push(ListId::WORK, task);
+        book.save(d(26), &board).unwrap();
+        let stale = book.load(d(26)).unwrap();
+        board.delete(ListId::WORK, 0).unwrap();
+        book.save(d(26), &board).unwrap();
+        assert!(book.page_stamp(d(26)).is_some());
+        let restarted = Book::new(book.dir().to_owned());
+        let empty = restarted.load(d(26)).unwrap();
+        assert!(empty.is_empty());
+        assert!(empty.buried("abc123").is_some());
+        assert!(crate::merge::merge_boards(&empty, &stale).is_empty());
+        let mut remote = stale;
+        remote.push(ListId::HOME, Task::new("new task"));
+        let merged = crate::merge::merge_boards(&empty, &remote);
+        assert_eq!(merged.tasks().count(), 1);
+        assert_eq!(merged.tasks().next().unwrap().text, "new task");
+        fs::remove_dir_all(book.dir()).unwrap();
+    }
+
+    #[test]
+    fn carry_retry_is_idempotent_at_every_write_including_missing_source_id() {
+        for with_id in [false, true] {
+            let writes = if with_id { 2 } else { 3 };
+            for step in 1..=writes {
+                let (book, faults) = fault_book(&format!("carry-{with_id}-{step}"));
+                let mut source = Board::default();
+                let mut task = Task::new("move me");
+                if with_id {
+                    task.id = Some("manual1".into());
+                }
+                source.push(ListId::WORK, task);
+                book.save(d(25), &source).unwrap();
+                faults.fail_at.set(Some(faults.writes.get() + step));
+                assert!(book.carry_over(d(26)).is_err());
+                faults.fail_at.set(None);
+                let mut target = book.load(d(26)).unwrap();
+                if let Some(task) = target.get_mut(ListId::WORK, 0) {
+                    task.state = State::Done;
+                    book.save(d(26), &target).unwrap();
+                }
+                let completed = !target.is_empty();
+                book.carry_over(d(26)).unwrap();
+                let target = book.load(d(26)).unwrap();
+                assert_eq!(target.tasks().count(), 1, "id={with_id} step={step}");
+                assert_eq!(target.list(ListId::WORK)[0].state, if completed { State::Done } else { State::Open });
+                let source = book.load(d(25)).unwrap();
+                assert_eq!(source.list(ListId::WORK)[0].id, target.list(ListId::WORK)[0].id);
+                assert_eq!(source.list(ListId::WORK)[0].state, State::Migrated(d(26)));
+                assert_eq!(book.carry_over(d(26)).unwrap(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn postpone_retry_is_idempotent_and_keeps_notes_and_completed_target() {
+        for with_id in [false, true] {
+            for step in 1..=3 {
+                let (book, faults) = fault_book(&format!("postpone-{with_id}-{step}"));
+                let mut board = Board::default();
+                let mut task = Task::new("move me");
+                if with_id {
+                    task.id = Some("manual1".into());
+                }
+                board.push(ListId::WORK, task);
+                book.save(d(25), &board).unwrap();
+                faults.fail_at.set(Some(faults.writes.get() + step));
+                assert!(book.postpone(&mut board, d(25), ListId::WORK, 0, d(26)).is_err());
+                assert!(board.list(ListId::WORK)[0].is_open());
+                faults.fail_at.set(None);
+                // Перезапуск: повтор читает закреплённый источник, а не старый черновик.
+                let mut source = book.load(d(25)).unwrap();
+                let mut target = book.load(d(26)).unwrap();
+                let completed = !target.is_empty();
+                if let Some(task) = target.get_mut(ListId::WORK, 0) {
+                    task.state = State::Done;
+                    let id = task.id.clone().unwrap();
+                    book.save(d(26), &target).unwrap();
+                    let mut notes = Notes::default();
+                    notes.add_subtask("kept");
+                    book.save_notes(&id, &notes).unwrap();
+                }
+                book.postpone(&mut source, d(25), ListId::WORK, 0, d(26)).unwrap();
+                let target = book.load(d(26)).unwrap();
+                assert_eq!(target.tasks().count(), 1, "id={with_id} step={step}");
+                let task = &target.list(ListId::WORK)[0];
+                assert_eq!(task.state, if completed { State::Done } else { State::Open });
+                assert_eq!(source.list(ListId::WORK)[0].id, task.id);
+                if completed {
+                    assert_eq!(book.load_notes(task.id.as_deref().unwrap()).unwrap().visible().len(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn identities_reserve_tasks_lists_graves_and_unsaved_values() {
+        let (book, _) = fault_book("reserved");
+        let mut board = Board::default();
+        let mut task = Task::new("manual");
+        task.id = Some("0123456789abcdef".into());
+        board.push(ListId::WORK, task);
+        board.bury("1111111111111111", 1);
+        book.save(d(26), &board).unwrap();
+        let mut lists = book.lists().unwrap();
+        lists.add(ListId::new("2222222222222222"), "new").unwrap();
+        book.save_lists(&lists).unwrap();
+        let first = book.new_id().unwrap();
+        let second = book.new_id().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 16);
+        assert!(first.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        let key = book.identity_key().unwrap();
+        let reserved = reserved_ids().lock().unwrap();
+        let reserved = &reserved[&key];
+        for id in ["0123456789abcdef", "1111111111111111", "2222222222222222", &first, &second] {
+            assert!(reserved.contains(id), "{id}");
+        }
+        let mut random = std::io::Cursor::new([1u64.to_le_bytes(), 2u64.to_le_bytes()].concat());
+        let mut reserved = HashSet::from(["0000000000000001".to_owned()]);
+        assert_eq!(fresh_id(&mut random, &mut reserved).unwrap(), "0000000000000002");
+        assert!(fresh_id(&mut std::io::empty(), &mut reserved).is_err());
+    }
+
     use super::*;
+
+    #[test]
+    fn postponing_back_to_a_historical_date_restores_one_live_copy() {
+        let (book, _) = fault_book("return");
+        let mut source = Board::default();
+        source.push(ListId::WORK, Task::new("there and back"));
+        book.save(d(25), &source).unwrap();
+        book.postpone(&mut source, d(25), ListId::WORK, 0, d(26)).unwrap();
+        let id = source.list(ListId::WORK)[0].id.clone();
+        let mut later = book.load(d(26)).unwrap();
+        later.get_mut(ListId::WORK, 0).unwrap().text = "updated on later date".into();
+        book.postpone(&mut later, d(26), ListId::WORK, 0, d(25)).unwrap();
+        let earlier = book.load(d(25)).unwrap();
+        assert_eq!(earlier.tasks().count(), 1);
+        assert_eq!(earlier.list(ListId::WORK)[0].id, id);
+        assert_eq!(earlier.list(ListId::WORK)[0].state, State::Open);
+        assert_eq!(earlier.list(ListId::WORK)[0].text, "updated on later date");
+        assert_eq!(later.list(ListId::WORK)[0].state, State::Migrated(d(25)));
+    }
+
+    #[test]
+    fn retry_does_not_reopen_or_overwrite_an_existing_live_target() {
+        for state in [State::Open, State::Done, State::Cancelled] {
+            let (book, faults) = fault_book(&format!("target-{state:?}"));
+            let mut source = Board::default();
+            source.push(ListId::WORK, Task::new("original"));
+            book.save(d(25), &source).unwrap();
+            faults.fail_at.set(Some(faults.writes.get() + 3));
+            assert!(book.postpone(&mut source, d(25), ListId::WORK, 0, d(26)).is_err());
+            faults.fail_at.set(None);
+            let mut target = book.load(d(26)).unwrap();
+            let task = target.get_mut(ListId::WORK, 0).unwrap();
+            task.state = state;
+            task.text = "changed after the partial transfer".into();
+            task.touch();
+            book.save(d(26), &target).unwrap();
+            book.postpone(&mut source, d(25), ListId::WORK, 0, d(26)).unwrap();
+            let target = book.load(d(26)).unwrap();
+            assert_eq!(target.tasks().count(), 1);
+            assert_eq!(target.list(ListId::WORK)[0].state, state);
+            assert_eq!(target.list(ListId::WORK)[0].text, "changed after the partial transfer");
+        }
+    }
+
+    #[test]
+    fn interprocess_rmw_uses_the_same_book_lock() {
+        const CHILD: &str = "ZTASKMGR_BOOK_TEST_CHILD";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let book = Book::new(PathBuf::from(dir));
+            for index in 0..6 {
+                let _guard = book.lock().unwrap();
+                let mut board = book.load(d(26)).unwrap();
+                board.push(ListId::WORK, Task::new(format!("{}-{index}", std::process::id())));
+                book.save(d(26), &board).unwrap();
+            }
+            return;
+        }
+        let book = temp_book("process-rmw");
+        let children: Vec<_> = (0..3)
+            .map(|_| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "book::tests::interprocess_rmw_uses_the_same_book_lock"])
+                    .env(CHILD, book.dir())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        }
+        let board = book.load(d(26)).unwrap();
+        assert_eq!(board.tasks().count(), 18);
+        assert_eq!(board.tasks().map(|task| &task.text).collect::<HashSet<_>>().len(), 18);
+        fs::remove_dir_all(book.dir()).unwrap();
+    }
+
+    #[test]
+    fn duplicate_ids_do_not_get_silently_merged_and_date_copies_are_legal() {
+        let (book, _) = fault_book("duplicates");
+        let text = "## Работа\n- [ ] first <!-- id:same -->\n";
+        book.write_file("2026-10-25.md", text.as_bytes()).unwrap();
+        book.write_file("2026-10-26.md", text.as_bytes()).unwrap();
+        assert_eq!(book.history("same").unwrap().len(), 2);
+        let invalid = "## Работа\n- [ ] first <!-- id:same -->\n## Дом\n- [ ] unrelated <!-- id:same -->\n";
+        assert!(book.merge_text("2026-10-26.md", invalid).is_err());
+        assert_eq!(book.read_file("2026-10-26.md").unwrap().unwrap(), text.as_bytes());
+        book.write_file("2026-10-26.md", invalid.as_bytes()).unwrap();
+        assert!(book.load(d(26)).is_err());
+        assert!(book.new_id().is_err(), "identity allocator cannot ignore a corrupt page");
+    }
+
+    #[test]
+    fn notes_read_failure_preserves_pending_draft_and_confirmed_stamp() {
+        let (book, faults) = fault_book("notes-draft");
+        let mut notes = Notes::default();
+        notes.add_subtask("local");
+        let mut stamp = None;
+        faults.fail_read.set(true);
+        assert!(book.save_notes_draft("abc", &mut notes, &mut stamp).is_err());
+        assert_eq!(stamp, None);
+        assert_eq!(notes.visible().len(), 1);
+        assert_eq!(faults.writes.get(), 0);
+        faults.fail_read.set(false);
+        book.save_notes_draft("abc", &mut notes, &mut stamp).unwrap();
+        assert_eq!(book.load_notes("abc").unwrap(), notes);
+    }
 
     fn d(day: u32) -> Date {
         Date::new(2026, 10, day).unwrap()
@@ -515,8 +1187,8 @@ mod tests {
     #[test]
     fn notes_follow_task_and_archive() {
         let book = temp_book("notes");
-        let id = book.new_id();
-        assert_eq!(id.len(), 6);
+        let id = book.new_id().unwrap();
+        assert_eq!(id.len(), 16);
         let mut notes = Notes::default();
         notes.add_subtask("купить");
         book.save_notes(&id, &notes).unwrap();

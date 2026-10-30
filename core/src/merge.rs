@@ -182,6 +182,7 @@ impl Book {
     /// Сливает другую версию файла книжки (`text`) с нашим файлом `path` и сохраняет
     /// результат. `false` — файл не книжки, не трогаем.
     pub fn merge_text(&self, path: &str, text: &str) -> Result<bool> {
+        let _guard = self.lock()?;
         let ours = self.read_file(path)?.map(String::from_utf8).transpose().context("не текст в UTF-8")?;
         let Some(merged) = merge_text(path, ours.as_deref(), text, &self.lists()?)? else {
             return Ok(false);

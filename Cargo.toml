@@ -1,11 +1,8 @@
 [workspace]
-members = ["core", "android"]
-# Без `--workspace` (и в CI) — ядро и программа для терминала; Android-приложение собирается
-# отдельно (`android/README.md`): ему нужны SDK, NDK и библиотеки окна.
-default-members = [".", "core"]
+members = ["core"]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 repository = "https://github.com/iodnoorov/ztaskmgr"
 

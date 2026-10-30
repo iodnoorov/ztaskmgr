@@ -145,10 +145,15 @@ impl App {
             return;
         };
         let task = &self.board.list(self.active)[index];
-        let id = task.id.clone().unwrap_or_else(|| self.book.new_id());
-        let stamp = self.book.notes_stamp(&id);
-        match self.book.load_notes(&id) {
-            Ok(notes) => {
+        let id = match task.id.clone().map(Ok).unwrap_or_else(|| self.book.new_id()) {
+            Ok(id) => id,
+            Err(e) => {
+                self.status = Some(Status::Error(format!("Записи задачи: {e:#}")));
+                return;
+            }
+        };
+        match self.book.open_notes(&id) {
+            Ok((notes, stamp)) => {
                 let mut view = NotesView {
                     category: self.active,
                     index,
@@ -412,30 +417,16 @@ impl App {
     /// Сохраняет записи открытого окна. Задача без id получает его с первой записью
     /// (и страница сохраняется); пустые записи — без файла.
     pub(super) fn save_notes(&mut self) {
-        let Some(view) = &self.notes else {
+        let Some(view) = &mut self.notes else {
             return;
         };
         let (id, category, index) = (view.id.clone(), view.category, view.index);
-        // Записи поменяли снаружи, а окно этого ещё не видело — сливаем, а не затираем.
-        if self.book.notes_stamp(&id) != view.stamp
-            && let Ok(disk) = self.book.load_notes(&id)
-            && let Some(view) = &mut self.notes
-        {
-            view.notes.merge(&disk);
-        }
-        let Some(view) = &self.notes else {
-            return;
-        };
-        let summary = view.notes.summary();
         self.edited = true;
-        if let Err(e) = self.book.save_notes(&id, &view.notes) {
+        if let Err(e) = self.book.save_notes_draft(&id, &mut view.notes, &mut view.stamp) {
             self.status = Some(Status::Error(format!("Записи задачи: {e:#}")));
             return;
         }
-        let stamp = self.book.notes_stamp(&id);
-        if let Some(view) = &mut self.notes {
-            view.stamp = stamp;
-        }
+        let summary = view.notes.summary();
         if summary.any {
             self.summaries.insert(id.clone(), summary);
         } else {
@@ -474,14 +465,14 @@ impl App {
         let Some(view) = &mut self.notes else {
             return;
         };
-        let notes = match self.book.load_notes(&view.id) {
-            Ok(notes) => notes,
+        let (notes, stamp) = match self.book.open_notes(&view.id) {
+            Ok(snapshot) => snapshot,
             Err(e) => {
                 self.status = Some(Status::Error(format!("Записи задачи: {e:#}")));
                 return;
             }
         };
-        view.stamp = self.book.notes_stamp(&view.id);
+        view.stamp = stamp;
         // Пункт, который правится, — по его тексту до правки (или последнему сохранённому).
         let find = |text: &str| notes.visible().into_iter().find(|&i| notes.editable_text(i) == text);
         match &mut view.mode {

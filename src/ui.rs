@@ -876,6 +876,8 @@ fn draw_settings(frame: &mut Frame, app: &App, selected: usize, input: Option<&L
         block = block.title_bottom(Line::from(format!(" {} ", display_path(path)).fg(MUTED)).right_aligned());
     }
     let inner = block.inner(r);
+    let visible = usize::from(inner.height);
+    let offset = (selected * 2).saturating_sub(visible.saturating_sub(2));
     let mut lines = Vec::new();
     for (i, setting) in Setting::ALL.into_iter().enumerate() {
         // Переключатель — [x]; текстовый пункт — значение после названия; действие — ›.
@@ -902,13 +904,17 @@ fn draw_settings(frame: &mut Frame, app: &App, selected: usize, input: Option<&L
         }
         lines.push(line);
         lines.push(Line::from(format!("    {}", setting.help()).fg(MUTED)));
-        let y = inner.y + cells(2 * i);
-        if y < inner.bottom() {
-            hits.push((Rect::new(inner.x, y, inner.width, 2.min(inner.bottom() - y)), Hit::Setting(i)));
+        let start = 2 * i;
+        let end = start + 2;
+        let first_visible = start.max(offset);
+        let last_visible = end.min(offset + visible);
+        if first_visible < last_visible {
+            let y = inner.y + cells(first_visible - offset);
+            hits.push((Rect::new(inner.x, y, inner.width, cells(last_visible - first_visible)), Hit::Setting(i)));
         }
     }
     frame.render_widget(Clear, r);
-    frame.render_widget(Paragraph::new(lines).block(block), r);
+    frame.render_widget(Paragraph::new(lines).block(block).scroll((cells(offset), 0)), r);
     if let Some(input) = input {
         draw_field(frame, panel(Setting::ALL[selected].title()), input, hits);
     }
@@ -1330,7 +1336,7 @@ mod tests {
         let mut moved = task.clone();
         moved.state = State::Migrated(today);
         yesterday.push(ListId::WORK, moved);
-        book.save(today.add_days(-1), &yesterday).unwrap();
+        book.save(today.add_days(-1).unwrap(), &yesterday).unwrap();
         let mut page = crate::model::Board::default();
         page.push(ListId::WORK, task);
         book.save(today, &page).unwrap();
@@ -1414,7 +1420,7 @@ mod tests {
         render(&mut terminal, &mut app);
         let today = app.date;
         tap(&mut app, Hit::Key((KeyCode::Char(']'), KeyModifiers::NONE)));
-        assert_eq!(app.date, today.add_days(1));
+        assert_eq!(Some(app.date), today.add_days(1));
         // Подсказка «добавить» — как нажать `a`.
         render(&mut terminal, &mut app);
         tap(&mut app, Hit::Key((KeyCode::Char('a'), KeyModifiers::NONE)));

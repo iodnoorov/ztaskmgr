@@ -15,10 +15,11 @@
 //!
 //! С фразой шифрования файлы на сервере зашифрованы (`crypt.rs`); всё остальное — манифест,
 //! слияние — работает с открытым текстом, как без шифрования. Незашифрованный файл на сервере
-//! (книжка до шифрования) читается как есть и сразу перезаписывается зашифрованным.
+//! (книжка до шифрования) читается как есть; безопасная перезапись требует сильного ETag.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::net::IpAddr;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::Command;
@@ -58,6 +59,9 @@ pub struct Settings {
     pub passphrase: String,
     /// Команда, которая печатает фразу; если задана — главнее `passphrase`.
     pub passphrase_command: String,
+    /// PEM-файл своего центра сертификации (`webdav_ca`): ему доверяем вдобавок к встроенным
+    /// и системным, в том числе в Termux без доступа к системному хранилищу.
+    pub ca: String,
 }
 
 /// Первая строка вывода команды (`pass ztaskmgr`): пароль или фраза.
@@ -76,16 +80,32 @@ fn run_command(command: &str, what: &str) -> Result<String> {
     Ok(text.lines().next().unwrap_or("").to_string())
 }
 
-/// Адрес на этом же компьютере: туда и по `http://` можно — по сети пароль не идёт.
+/// Числовой loopback или ровно `localhost` (без поддоменов и завершающей точки).
+/// DNS-имена с похожим префиксом не получают исключение из требования HTTPS.
 fn is_loopback(url: &str) -> bool {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let host = rest.split(['/', '?']).next().unwrap_or("");
-    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
-    let host = match host.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or(""),
-        None => host.split(':').next().unwrap_or(""),
+    let Ok(uri) = url.parse::<ureq::http::Uri>() else {
+        return false;
     };
-    host == "localhost" || host == "::1" || host.starts_with("127.")
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Только сильный ETag пригоден для атомарного изменения существующего файла.
+fn strong_etag(etag: Option<&str>) -> Result<&str> {
+    let Some(etag) = etag else {
+        bail!("сервер не сообщил сильный ETag — безопасная перезапись/удаление отложены");
+    };
+    if !etag.starts_with('"')
+        || !etag.ends_with('"')
+        || etag.len() < 2
+        || etag.as_bytes()[1..etag.len() - 1].iter().any(|&b| b == b'"' || b < 0x21 || b == 0x7f)
+    {
+        bail!("сервер не сообщил сильный ETag ({etag}) — безопасная перезапись/удаление отложены");
+    }
+    Ok(etag)
 }
 
 impl Settings {
@@ -143,10 +163,10 @@ struct Remote {
     cipher: Option<Cipher>,
 }
 
-/// Корневые сертификаты для https: встроенные (Mozilla) и системные — так подходят и
-/// свои центры сертификации, добавленные в систему (`trust anchor`, `update-ca-certificates`).
-/// Системное хранилище читается один раз за запуск.
-fn root_certs() -> ureq::tls::RootCerts {
+/// Корневые сертификаты для https: встроенные (Mozilla), системные — так подходят и
+/// свои центры сертификации, добавленные в систему (`trust anchor`, `update-ca-certificates`), —
+/// и `extra` из настроек. Системное хранилище читается один раз за запуск.
+fn root_certs(extra: Vec<ureq::tls::Certificate<'static>>) -> ureq::tls::RootCerts {
     static ROOTS: OnceLock<Arc<Vec<ureq::tls::Certificate<'static>>>> = OnceLock::new();
     let roots = ROOTS.get_or_init(|| {
         let system = rustls_native_certs::load_native_certs().certs;
@@ -158,7 +178,24 @@ fn root_certs() -> ureq::tls::RootCerts {
                 .collect(),
         )
     });
-    ureq::tls::RootCerts::Specific(roots.clone())
+    if extra.is_empty() {
+        return ureq::tls::RootCerts::Specific(roots.clone());
+    }
+    ureq::tls::RootCerts::Specific(Arc::new(roots.iter().cloned().chain(extra).collect()))
+}
+
+/// Сертификаты из PEM (`-----BEGIN CERTIFICATE-----`); ни одного — ошибка.
+pub fn parse_ca(pem: &[u8]) -> Result<Vec<ureq::tls::Certificate<'static>>> {
+    let mut certs = Vec::new();
+    for item in ureq::tls::parse_pem(pem) {
+        if let ureq::tls::PemItem::Certificate(cert) = item.context("не PEM")? {
+            certs.push(cert);
+        }
+    }
+    if certs.is_empty() {
+        bail!("в нём нет сертификата (-----BEGIN CERTIFICATE-----)");
+    }
+    Ok(certs)
 }
 
 fn base64(data: &[u8]) -> String {
@@ -191,11 +228,23 @@ impl Remote {
         }
         let auth = (!settings.user.is_empty())
             .then(|| format!("Basic {}", base64(format!("{}:{}", settings.user, settings.password).as_bytes())));
+        let extra = match settings.ca.trim() {
+            "" => Vec::new(),
+            path => {
+                // Путь пишут руками — `~/` раскрываем, как это сделала бы оболочка.
+                let file = match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
+                    (Some(rest), Some(home)) => Path::new(&home).join(rest),
+                    _ => path.into(),
+                };
+                let pem = fs::read(file).with_context(|| format!("сертификат webdav_ca «{path}»"))?;
+                parse_ca(&pem).with_context(|| format!("сертификат webdav_ca «{path}»"))?
+            }
+        };
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .allow_non_standard_methods(true)
             .timeout_global(Some(TIMEOUT))
-            .tls_config(ureq::tls::TlsConfig::builder().root_certs(root_certs()).build())
+            .tls_config(ureq::tls::TlsConfig::builder().root_certs(root_certs(extra)).build())
             .build()
             .into();
         Ok(Self { agent, base, auth, cipher: None })
@@ -288,19 +337,14 @@ impl Remote {
     /// ещё `expected` (`None` — файла там быть не должно).
     fn put(&self, path: &str, data: &[u8], expected: Option<&str>) -> Result<Put> {
         let condition = match expected {
-            Some(etag) => ("If-Match", etag),
+            Some(etag) => ("If-Match", strong_etag(Some(etag))?),
             None => ("If-None-Match", "*"),
         };
-        self.put_with(path, data, Some(condition))
-    }
-
-    fn put_with(&self, path: &str, data: &[u8], condition: Option<(&str, &str)>) -> Result<Put> {
         let (body, kind) = match &self.cipher {
             Some(cipher) => (cipher.seal(path, data)?, "application/octet-stream"),
             None => (data.to_vec(), "text/markdown; charset=utf-8"),
         };
-        let mut headers = vec![("Content-Type", kind)];
-        headers.extend(condition);
+        let headers = [("Content-Type", kind), condition];
         let (status, etag, _) = self.call("PUT", path, &headers, &body)?;
         match status {
             200..=299 => Ok(Put::Done(etag)),
@@ -309,10 +353,9 @@ impl Remote {
         }
     }
 
-    /// Удаление, если на сервере всё ещё `etag` (`None` — без условия). `false` — файл там уже
-    /// другой.
-    fn delete(&self, path: &str, etag: Option<&str>) -> Result<bool> {
-        let headers: Vec<(&str, &str)> = etag.map(|e| ("If-Match", e)).into_iter().collect();
+    /// Удаление только с сильным ETag; `false` — файл на сервере уже другой.
+    fn delete(&self, path: &str, etag: &str) -> Result<bool> {
+        let headers = [("If-Match", strong_etag(Some(etag))?)];
         let (status, _, _) = self.call("DELETE", path, &headers, b"")?;
         match status {
             200..=299 | 404 => Ok(true),
@@ -321,36 +364,9 @@ impl Remote {
         }
     }
 
-    /// Сервер ответил 412, хотя файл, может быть, и не менялся: слабый ETag (`W/"…"`,
-    /// с ним `If-Match` не совпадает никогда) или ETag, закодированный иначе, чем мы его
-    /// прочитали. Тогда сверяем само содержимое: оно всё ещё то, что мы видели (`known` —
-    /// хеш), — значит, чужой правки не было.
-    fn unchanged_since(&self, path: &str, known: Option<&str>) -> Result<bool> {
-        let Some(known) = known else {
-            return Ok(false);
-        };
-        let Some((data, _)) = self.get(path)? else {
-            return Ok(false);
-        };
-        Ok(self.open(path, &data).is_ok_and(|(data, _)| hash(&data) == known))
-    }
-
-    /// PUT с `If-Match`, а при 412 — проверка содержимого и запись без условия.
-    fn put_checked(&self, path: &str, data: &[u8], expected: Option<&str>, known: Option<&str>) -> Result<Put> {
-        match self.put(path, data, expected)? {
-            Put::Changed if expected.is_some() && self.unchanged_since(path, known)? => self.put_with(path, data, None),
-            result => Ok(result),
-        }
-    }
-
-    /// Перезапись файла, который на сервере всё ещё `etag` с содержимым `known` (хеш),
-    /// тем же содержимым — незашифрованного зашифрованным.
-    fn replace(&self, path: &str, data: &[u8], etag: Option<&str>, known: &str) -> Result<Put> {
-        match etag {
-            Some(_) => self.put_checked(path, data, etag, Some(known)),
-            None if self.unchanged_since(path, Some(known))? => self.put_with(path, data, None),
-            None => Ok(Put::Changed),
-        }
+    /// Перезапись существующего файла, в том числе миграция в зашифрованный вид.
+    fn replace(&self, path: &str, data: &[u8], etag: Option<&str>) -> Result<Put> {
+        self.put(path, data, Some(strong_etag(etag)?))
     }
 
     /// Ключ книжки: с сервера, а если его там нет — новый (книжка начинает шифроваться).
@@ -366,7 +382,7 @@ impl Remote {
         if !listed {
             ensure_dirs(self, KEY_FILE, dirs)?;
             let (cipher, file) = Cipher::create(passphrase)?;
-            match self.put_key(&file, Some(("If-None-Match", "*")))? {
+            match self.put_key(&file, ("If-None-Match", "*"))? {
                 Put::Done(_) => return Ok(Some(cipher)),
                 // Только что создало другое устройство — берём его ключ.
                 Put::Changed => {}
@@ -377,23 +393,14 @@ impl Remote {
     }
 
     /// Запись `KEY_FILE` — как есть, он не шифруется ключом книжки.
-    fn put_key(&self, file: &[u8], condition: Option<(&str, &str)>) -> Result<Put> {
-        let mut headers = vec![("Content-Type", "application/json")];
-        headers.extend(condition);
+    fn put_key(&self, file: &[u8], condition: (&str, &str)) -> Result<Put> {
+        let headers = [("Content-Type", "application/json"), condition];
         let (status, etag, _) = self.call("PUT", KEY_FILE, &headers, file)?;
         match status {
             200..=299 => Ok(Put::Done(etag)),
             412 => Ok(Put::Changed),
             _ => Self::fail("PUT", KEY_FILE, status),
         }
-    }
-
-    /// DELETE с `If-Match`, а при 412 — так же, как `put_checked`.
-    fn delete_checked(&self, path: &str, etag: &str, known: Option<&str>) -> Result<bool> {
-        if self.delete(path, Some(etag))? {
-            return Ok(true);
-        }
-        Ok(self.unchanged_since(path, known)? && self.delete(path, None)?)
     }
 }
 
@@ -576,7 +583,7 @@ pub struct Summary {
     pub deleted: usize,
     /// Отложены до следующего раза: файл поменялся, пока мы его синхронизировали.
     pub postponed: usize,
-    /// Не синхронизированы из-за ошибки в самом файле: «путь: причина».
+    /// Не синхронизированы из-за локальной ошибки или отсутствия безопасного ETag: «путь: причина».
     pub failed: Vec<String>,
 }
 
@@ -627,7 +634,10 @@ pub fn sync(book: &Book, settings: &Settings) -> Result<Option<Summary>> {
             }
         }
     }
-    let local = local_files(book)?;
+    let local = {
+        let _guard = book.lock()?;
+        local_files(book)?
+    };
     let paths: BTreeSet<&String> = local.keys().chain(server.keys()).chain(state.keys()).collect();
     let paths: Vec<String> = paths.into_iter().cloned().collect();
 
@@ -659,15 +669,26 @@ pub fn sync(book: &Book, settings: &Settings) -> Result<Option<Summary>> {
             };
             // Пишем в файл, только если он всё ещё такой, каким мы его прочитали: программа
             // могла сохранить его, пока мы ходили на сервер.
-            let unchanged_here = || book.read_file(&path).ok().flatten().map(|d| hash(&d)) == my_hash;
+            let unchanged_here = || -> Result<bool> { Ok(book.read_file(&path)?.as_ref().map(|d| hash(d)) == my_hash) };
+            // Локальное удаление нельзя выдавать за выполненное без безопасного DELETE.
+            if local_changed
+                && mine.is_none()
+                && known.is_some()
+                && let Some(etag) = theirs
+            {
+                local!(path, strong_etag(etag.as_deref()));
+            }
 
             match (local_changed, remote_changed, mine, theirs) {
                 (false, false, ..) => {}
                 // Только у нас.
                 (true, false, Some(data), _) => {
                     ensure_dirs(&remote, &path, &mut dirs_ready)?;
-                    let expected = theirs.and_then(|_| known.as_ref().and_then(|k| k.etag.as_deref()));
-                    match remote.put_checked(&path, data, expected, known.as_ref().map(|k| k.hash.as_str()))? {
+                    let expected = match theirs {
+                        Some(etag) => Some(local!(path, strong_etag(etag.as_deref()))),
+                        None => None,
+                    };
+                    match remote.put(&path, data, expected)? {
                         Put::Done(etag) => {
                             state.insert(path, Known { etag, hash: my_hash.unwrap() });
                             summary.uploaded += 1;
@@ -676,8 +697,8 @@ pub fn sync(book: &Book, settings: &Settings) -> Result<Option<Summary>> {
                     }
                 }
                 (true, false, None, Some(_)) => {
-                    let etag = known.as_ref().and_then(|k| k.etag.clone()).unwrap_or_default();
-                    if remote.delete_checked(&path, &etag, known.as_ref().map(|k| k.hash.as_str()))? {
+                    let etag = local!(path, strong_etag(theirs.and_then(|e| e.as_deref())));
+                    if remote.delete(&path, etag)? {
                         state.remove(&path);
                         summary.deleted += 1;
                     } else {
@@ -694,17 +715,21 @@ pub fn sync(book: &Book, settings: &Settings) -> Result<Option<Summary>> {
                         let etag = etag.or_else(|| theirs.cloned().flatten());
                         let (data, stale) = local!(path, remote.open(&path, &data));
                         let new_hash = hash(&data);
-                        if my_hash.as_ref() != Some(&new_hash) {
-                            if !unchanged_here() {
+                        {
+                            let _guard = local!(path, book.lock());
+                            if !local!(path, unchanged_here()) {
                                 summary.postponed += 1;
                                 continue;
                             }
-                            let text = local!(path, std::str::from_utf8(&data).context("не текст"));
-                            local!(path, book.write_file(&path, text.as_bytes()));
-                            summary.downloaded += 1;
+                            if my_hash.as_ref() != Some(&new_hash) {
+                                let text = local!(path, std::str::from_utf8(&data).context("не текст"));
+                                local!(path, book.write_file(&path, text.as_bytes()));
+                                summary.downloaded += 1;
+                            }
                         }
                         let etag = if stale {
-                            match remote.replace(&path, &data, etag.as_deref(), &new_hash)? {
+                            let expected = local!(path, strong_etag(etag.as_deref()));
+                            match remote.replace(&path, &data, Some(expected))? {
                                 Put::Done(etag) => etag,
                                 Put::Changed => {
                                     summary.postponed += 1;
@@ -719,7 +744,8 @@ pub fn sync(book: &Book, settings: &Settings) -> Result<Option<Summary>> {
                     None => summary.postponed += 1,
                 },
                 (false, true, Some(_), None) => {
-                    if unchanged_here() {
+                    let _guard = local!(path, book.lock());
+                    if local!(path, unchanged_here()) {
                         local!(path, book.remove_file(&path).context("удаление"));
                         state.remove(&path);
                         summary.deleted += 1;
@@ -749,9 +775,24 @@ pub fn sync(book: &Book, settings: &Settings) -> Result<Option<Summary>> {
                     };
                     let (data, stale) = local!(path, remote.open(&path, &data));
                     let their_hash = hash(&data);
+                    let merged = {
+                        let _guard = local!(path, book.lock());
+                        if !local!(path, unchanged_here()) {
+                            summary.postponed += 1;
+                            continue;
+                        }
+                        if my_hash.as_ref() == Some(&their_hash) {
+                            None
+                        } else {
+                            let text = local!(path, std::str::from_utf8(&data).context("не текст"));
+                            local!(path, book.merge_text(&path, text).context("слияние"));
+                            Some(local!(path, book.read_file(&path).context("чтение результата слияния")))
+                        }
+                    };
                     if my_hash.as_ref() == Some(&their_hash) {
                         let etag = if stale {
-                            match remote.replace(&path, &data, etag.as_deref(), &their_hash)? {
+                            let expected = local!(path, strong_etag(etag.as_deref()));
+                            match remote.replace(&path, &data, Some(expected))? {
                                 Put::Done(etag) => etag,
                                 Put::Changed => {
                                     summary.postponed += 1;
@@ -764,24 +805,18 @@ pub fn sync(book: &Book, settings: &Settings) -> Result<Option<Summary>> {
                         state.insert(path, Known { etag, hash: their_hash });
                         continue;
                     }
-                    if !unchanged_here() {
-                        summary.postponed += 1;
-                        continue;
-                    }
-                    let text = local!(path, String::from_utf8(data).context("не текст"));
-                    local!(path, book.merge_text(&path, &text).context("слияние"));
-                    let merged = book.read_file(&path).ok().flatten();
-                    let result = match (&merged, etag.as_deref()) {
-                        (Some(merged), _) => remote.put(&path, merged, etag.as_deref())?,
+                    let merged = merged.expect("различающееся содержимое слито под локальной блокировкой");
+                    let expected = local!(path, strong_etag(etag.as_deref()));
+                    let result = match &merged {
+                        Some(merged) => remote.put(&path, merged, Some(expected))?,
                         // Слияние дало пустую страницу — файла нет и на сервере.
-                        (None, Some(etag)) => {
-                            if remote.delete(&path, Some(etag))? {
+                        None => {
+                            if remote.delete(&path, expected)? {
                                 Put::Done(None)
                             } else {
                                 Put::Changed
                             }
                         }
-                        (None, None) => Put::Changed,
                     };
                     match (result, merged) {
                         (Put::Done(etag), Some(merged)) => {
@@ -803,7 +838,10 @@ pub fn sync(book: &Book, settings: &Settings) -> Result<Option<Summary>> {
         Ok(())
     };
     let result = run();
-    save_state(dir, &remote.base, encrypted, &state)?;
+    {
+        let _guard = book.lock()?;
+        save_state(dir, &remote.base, encrypted, &state)?;
+    }
     result.map(|()| Some(summary))
 }
 
@@ -822,16 +860,9 @@ pub fn change_passphrase(settings: &Settings, new: &str) -> Result<()> {
         remote.get(KEY_FILE)?.context("книжка на сервере ещё не зашифрована — сначала синхронизируйтесь с фразой")?;
     let cipher = Cipher::unlock(&settings.passphrase, &file).context("текущая фраза")?;
     let wrapped = cipher.wrap(new)?;
-    let written = match etag.as_deref() {
-        Some(etag) => remote.put_key(&wrapped, Some(("If-Match", etag)))?,
-        None => Put::Changed,
-    };
-    // 412 при слабом ETag или без ETag: сверяем сам файл — он всё ещё тот, что мы прочитали.
-    if written == Put::Changed {
-        if remote.get(KEY_FILE)?.is_none_or(|(now, _)| now != file) {
-            bail!("ключ на сервере только что поменялся — попробуйте ещё раз");
-        }
-        remote.put_key(&wrapped, None)?;
+    let etag = strong_etag(etag.as_deref()).context("смена фразы отложена")?;
+    if remote.put_key(&wrapped, ("If-Match", etag))? == Put::Changed {
+        bail!("ключ на сервере только что поменялся — смена фразы отложена, попробуйте ещё раз");
     }
     Ok(())
 }
@@ -864,6 +895,12 @@ enum Msg {
 
 /// Чем кончилась синхронизация в фоне.
 pub type Outcome = Result<Summary, String>;
+
+/// Ошибка синхронизации для строки состояния: с «WebDAV:» впереди, но не дважды — многие
+/// ошибки сервера уже начинаются с него.
+pub fn message(error: &str) -> String {
+    if error.starts_with("WebDAV") { error.to_string() } else { format!("WebDAV: {error}") }
+}
 
 /// Чем кончилась смена фразы: новая фраза или ошибка.
 pub type Changed = Result<String, String>;
@@ -996,6 +1033,12 @@ mod tests {
         );
     }
 
+    struct Trigger {
+        method: &'static str,
+        path: String,
+        run: Box<dyn FnOnce(&mut Store) + Send>,
+    }
+
     /// Простейший WebDAV-сервер в памяти: PROPFIND, GET, PUT, DELETE, MKCOL с If-Match.
     #[derive(Default)]
     struct Store {
@@ -1004,6 +1047,11 @@ mod tests {
         version: u64,
         /// Слабые ETag (`W/"…"`): `If-Match` с ними по RFC не совпадает никогда.
         weak: bool,
+        no_etag: bool,
+        reject_match: bool,
+        trigger: Option<Trigger>,
+        requests: Vec<(String, String)>,
+        unconditional: usize,
     }
 
     fn serve(store: Arc<Mutex<Store>>) -> String {
@@ -1036,11 +1084,24 @@ mod tests {
                 reader.read_exact(&mut body).unwrap();
                 let path = path.strip_prefix("/book/").unwrap_or("").to_string();
                 let mut store = store.lock().unwrap();
+                store.requests.push((method.clone(), path.clone()));
+                if matches!(method.as_str(), "PUT" | "DELETE")
+                    && !headers.contains_key("if-match")
+                    && !headers.contains_key("if-none-match")
+                {
+                    store.unconditional += 1;
+                }
+                if store.trigger.as_ref().is_some_and(|t| t.method == method && t.path == path) {
+                    let trigger = store.trigger.take().unwrap();
+                    (trigger.run)(&mut store);
+                }
                 let weak = store.weak;
                 let etag_of = |v: u64| if weak { format!("W/\"v{v}\"") } else { format!("\"v{v}\"") };
+                let no_etag = store.no_etag;
+                let etag_header = |v| if no_etag { String::new() } else { format!("ETag: {}\r\n", etag_of(v)) };
                 let current = store.files.get(&path).map(|(_, v)| etag_of(*v));
                 let precondition = match (headers.get("if-match"), headers.get("if-none-match")) {
-                    (Some(m), _) => current.as_ref() == Some(m) && !weak,
+                    (Some(m), _) => current.as_ref() == Some(m) && !weak && !store.reject_match,
                     (_, Some(_)) => current.is_none(),
                     _ => true,
                 };
@@ -1055,7 +1116,12 @@ mod tests {
                                 if let Some(rest) = name.strip_prefix(&path)
                                     && !rest.contains('/')
                                 {
-                                    xml.push_str(&format!("<d:response><d:href>/book/{name}</d:href><d:propstat><d:prop><d:getetag>{}</d:getetag><d:resourcetype/></d:prop></d:propstat></d:response>", etag_of(*v)));
+                                    let tag = if no_etag {
+                                        String::new()
+                                    } else {
+                                        format!("<d:getetag>{}</d:getetag>", etag_of(*v))
+                                    };
+                                    xml.push_str(&format!("<d:response><d:href>/book/{name}</d:href><d:propstat><d:prop>{tag}<d:resourcetype/></d:prop></d:propstat></d:response>"));
                                 }
                             }
                             for d in &store.dirs {
@@ -1072,7 +1138,7 @@ mod tests {
                         ("201 Created", String::new(), vec![])
                     }
                     "GET" => match store.files.get(&path) {
-                        Some((data, v)) => ("200 OK", format!("ETag: {}\r\n", etag_of(*v)), data.clone()),
+                        Some((data, v)) => ("200 OK", etag_header(*v), data.clone()),
                         None => ("404 Not Found", String::new(), vec![]),
                     },
                     "PUT" if !precondition => ("412 Precondition Failed", String::new(), vec![]),
@@ -1080,7 +1146,7 @@ mod tests {
                         store.version += 1;
                         let v = store.version;
                         store.files.insert(path.clone(), (body, v));
-                        ("201 Created", format!("ETag: {}\r\n", etag_of(v)), vec![])
+                        ("201 Created", etag_header(v), vec![])
                     }
                     "DELETE" if !precondition => ("412 Precondition Failed", String::new(), vec![]),
                     "DELETE" => {
@@ -1189,38 +1255,329 @@ mod tests {
     }
 
     #[test]
-    fn weak_etags() {
+    fn weak_and_missing_etags_allow_read_and_create_but_not_destructive_changes() {
         assert_eq!(unescape("&#34;a&#x22;&amp;quot;&#zz;"), "\"a\"&quot;&#zz;");
-        let store = Arc::new(Mutex::new(Store { weak: true, ..Store::default() }));
-        let url = serve(store.clone());
-        let settings = Settings {
-            url,
-            user: String::new(),
-            password: String::new(),
-            password_command: String::new(),
-            insecure: false,
-            ..Settings::default()
-        };
-        let book = temp_book("weak");
-        let d = Date::new(2026, 10, 26).unwrap();
-        let mut board = Board::default();
-        board.push(ListId::WORK, Task::new("раз"));
-        book.save(d, &board).unwrap();
-        assert_eq!(sync(&book, &settings).unwrap().unwrap().uploaded, 1);
-        // Правка уходит, хотя If-Match со слабым ETag сервер не принимает.
-        board.push(ListId::WORK, Task::new("два"));
-        book.save(d, &board).unwrap();
-        let s = sync(&book, &settings).unwrap().unwrap();
-        assert_eq!((s.uploaded, s.postponed), (1, 0));
-        let body = store.lock().unwrap().files["2026-10-26.md"].0.clone();
-        assert!(String::from_utf8(body).unwrap().contains("два"));
-        // Шифрование и смена фразы — тоже, хотя If-Match не срабатывает.
-        let secret = Settings { passphrase: "фраза".into(), ..settings.clone() };
-        assert!(sync(&book, &secret).unwrap().unwrap().failed.is_empty());
-        change_passphrase(&secret, "новая").unwrap();
-        let renewed = Settings { passphrase: "новая".into(), ..settings };
-        assert!(sync(&book, &renewed).unwrap().unwrap().failed.is_empty());
+        for (name, weak, no_etag) in [("weak", true, false), ("missing", false, true)] {
+            let store = Arc::new(Mutex::new(Store { weak, no_etag, ..Store::default() }));
+            let settings = Settings { url: serve(store.clone()), ..Settings::default() };
+            let book = temp_book(name);
+            let reader = temp_book(&format!("{name}-reader"));
+            let path = "2026-10-26.md";
+            let original = b"## Work <!-- list:work -->\n- [ ] original\n";
+            book.write_file(path, original).unwrap();
+            assert_eq!(sync(&book, &settings).unwrap().unwrap().uploaded, 1);
+            assert_eq!(sync(&reader, &settings).unwrap().unwrap().downloaded, 1);
+            assert_eq!(reader.read_file(path).unwrap().unwrap(), original);
+
+            book.write_file(path, b"## Work <!-- list:work -->\n- [ ] local edit\n").unwrap();
+            let summary = sync(&book, &settings).unwrap().unwrap();
+            assert_eq!(summary.uploaded, 0);
+            assert_eq!(summary.failed.len(), 1);
+            assert!(summary.failed[0].contains("сильный ETag"), "{summary:?}");
+            assert_eq!(store.lock().unwrap().files[path].0, original);
+
+            book.remove_file(path).unwrap();
+            let summary = sync(&book, &settings).unwrap().unwrap();
+            assert_eq!(summary.deleted, 0);
+            assert_eq!(summary.failed.len(), 1);
+            assert!(summary.failed[0].contains("сильный ETag"), "{summary:?}");
+            assert_eq!(store.lock().unwrap().files[path].0, original);
+
+            // Миграция открытого текста также не заменяет его без сильного ETag.
+            let secret = Settings { passphrase: "old phrase".into(), ..settings };
+            let summary = sync(&reader, &secret).unwrap().unwrap();
+            assert_eq!(summary.failed.len(), 1);
+            assert_eq!(store.lock().unwrap().files[path].0, original);
+            let key = store.lock().unwrap().files[KEY_FILE].0.clone();
+            let error = change_passphrase(&secret, "new phrase").unwrap_err();
+            assert!(format!("{error:#}").contains("сильный ETag"), "{error:#}");
+            let st = store.lock().unwrap();
+            assert_eq!(st.files[KEY_FILE].0, key);
+            assert!(Cipher::unlock("old phrase", &key).is_ok());
+            assert_eq!(st.unconditional, 0);
+            drop(st);
+            let _ = fs::remove_dir_all(book.dir());
+            let _ = fs::remove_dir_all(reader.dir());
+        }
+    }
+
+    #[test]
+    fn concurrent_remote_put_and_delete_are_postponed_without_fallback() {
+        for method in ["PUT", "DELETE"] {
+            let store = Arc::new(Mutex::new(Store::default()));
+            let settings = Settings { url: serve(store.clone()), ..Settings::default() };
+            let book = temp_book(&format!("race-{method}"));
+            let path = "2026-10-26.md";
+            book.write_file(path, b"## Work <!-- list:work -->\n- [ ] original\n").unwrap();
+            sync(&book, &settings).unwrap().unwrap();
+            if method == "PUT" {
+                book.write_file(path, b"## Work <!-- list:work -->\n- [ ] local edit\n").unwrap();
+            } else {
+                book.remove_file(path).unwrap();
+            }
+            let foreign = b"## Work <!-- list:work -->\n- [ ] OTHER DEVICE TASK\n".to_vec();
+            {
+                let mut st = store.lock().unwrap();
+                st.requests.clear();
+                let foreign = foreign.clone();
+                st.trigger = Some(Trigger {
+                    method,
+                    path: path.into(),
+                    run: Box::new(move |st| {
+                        st.version += 1;
+                        st.files.insert(path.into(), (foreign, st.version));
+                    }),
+                });
+            }
+            let summary = sync(&book, &settings).unwrap().unwrap();
+            assert_eq!(summary.postponed, 1);
+            assert_eq!((summary.uploaded, summary.deleted), (0, 0));
+            let st = store.lock().unwrap();
+            assert_eq!(st.files[path].0, foreign);
+            assert_eq!(st.requests.iter().filter(|(m, _)| m == method).count(), 1);
+            assert!(!st.requests.iter().any(|(m, _)| m == "GET"), "no compare-then-write fallback");
+            assert_eq!(st.unconditional, 0);
+            drop(st);
+            let _ = fs::remove_dir_all(book.dir());
+        }
+    }
+
+    #[test]
+    fn rejected_strong_etag_is_not_retried_unconditionally() {
+        let store = Arc::new(Mutex::new(Store::default()));
+        let settings = Settings { url: serve(store.clone()), ..Settings::default() };
+        let remote = Remote::new(&settings).unwrap();
+        assert!(matches!(remote.put("2026-10-26.md", b"original", None).unwrap(), Put::Done(_)));
+        let (_, etag) = remote.get("2026-10-26.md").unwrap().unwrap();
+        {
+            let mut st = store.lock().unwrap();
+            st.reject_match = true;
+            st.requests.clear();
+        }
+        assert_eq!(remote.replace("2026-10-26.md", b"edit", etag.as_deref()).unwrap(), Put::Changed);
+        assert!(!remote.delete("2026-10-26.md", etag.as_deref().unwrap()).unwrap());
+        let st = store.lock().unwrap();
+        assert_eq!(st.files["2026-10-26.md"].0, b"original");
+        assert_eq!(st.requests.len(), 2);
+        assert_eq!(st.unconditional, 0);
+    }
+
+    #[test]
+    fn rejected_passphrase_precondition_does_not_fall_back_even_if_key_is_unchanged() {
+        let store = Arc::new(Mutex::new(Store { reject_match: true, ..Store::default() }));
+        let settings = Settings { url: serve(store.clone()), passphrase: "old phrase".into(), ..Settings::default() };
+        let (_, key) = Cipher::create(&settings.passphrase).unwrap();
+        {
+            let mut st = store.lock().unwrap();
+            st.version = 1;
+            st.files.insert(KEY_FILE.into(), (key.clone(), 1));
+        }
+        let error = change_passphrase(&settings, "new phrase").unwrap_err();
+        assert!(format!("{error:#}").contains("смена фразы отложена"), "{error:#}");
+        let st = store.lock().unwrap();
+        assert_eq!(st.files[KEY_FILE].0, key);
+        assert_eq!(st.requests, [("GET".to_string(), KEY_FILE.to_string()), ("PUT".to_string(), KEY_FILE.to_string())]);
+        assert_eq!(st.unconditional, 0);
+    }
+
+    #[test]
+    fn concurrent_passphrase_change_preserves_other_device_key() {
+        let store = Arc::new(Mutex::new(Store::default()));
+        let settings = Settings { url: serve(store.clone()), passphrase: "old phrase".into(), ..Settings::default() };
+        let (cipher, file) = Cipher::create(&settings.passphrase).unwrap();
+        let foreign = cipher.wrap("other device phrase").unwrap();
+        {
+            let mut st = store.lock().unwrap();
+            st.version = 1;
+            st.files.insert(KEY_FILE.into(), (file, 1));
+            let foreign = foreign.clone();
+            st.trigger = Some(Trigger {
+                method: "PUT",
+                path: KEY_FILE.into(),
+                run: Box::new(move |st| {
+                    st.version += 1;
+                    st.files.insert(KEY_FILE.into(), (foreign, st.version));
+                }),
+            });
+        }
+        let error = change_passphrase(&settings, "my new phrase").unwrap_err();
+        assert!(format!("{error:#}").contains("смена фразы отложена"), "{error:#}");
+        let st = store.lock().unwrap();
+        assert_eq!(st.files[KEY_FILE].0, foreign);
+        assert!(Cipher::unlock("other device phrase", &st.files[KEY_FILE].0).is_ok());
+        assert_eq!(st.requests.iter().filter(|(m, _)| m == "PUT").count(), 1);
+        assert_eq!(st.requests.iter().filter(|(m, _)| m == "GET").count(), 1);
+        assert_eq!(st.unconditional, 0);
+    }
+
+    #[test]
+    fn download_and_merge_recheck_local_commit_after_http_without_holding_book_lock() {
+        for (name, unreadable, merge) in [
+            ("download-local-race", false, false),
+            ("download-read-error", true, false),
+            ("merge-local-race", false, true),
+            ("merge-read-error", true, true),
+        ] {
+            let store = Arc::new(Mutex::new(Store::default()));
+            let settings = Settings { url: serve(store.clone()), ..Settings::default() };
+            let book = temp_book(name);
+            let path = "2026-10-26.md";
+            let original = b"## Work <!-- list:work -->\n- [ ] original\n";
+            let foreign = b"## Work <!-- list:work -->\n- [ ] local writer\n";
+            book.write_file(path, original).unwrap();
+            sync(&book, &settings).unwrap().unwrap();
+            if merge {
+                book.write_file(path, b"## Work <!-- list:work -->\n- [ ] my edit\n").unwrap();
+            }
+            let dir = book.dir().to_path_buf();
+            {
+                let mut st = store.lock().unwrap();
+                st.version += 1;
+                let version = st.version;
+                st.files.insert(path.into(), (b"## Work <!-- list:work -->\n- [ ] remote edit\n".to_vec(), version));
+                st.trigger = Some(Trigger {
+                    method: "GET",
+                    path: path.into(),
+                    run: Box::new(move |_| {
+                        // Этот писатель работает в HTTP-потоке до ответа: локальная
+                        // блокировка sync здесь не удерживается.
+                        let writer = Book::new(dir);
+                        let _guard = writer.lock().unwrap();
+                        if unreadable {
+                            fs::remove_file(writer.dir().join(path)).unwrap();
+                            fs::create_dir(writer.dir().join(path)).unwrap();
+                        } else {
+                            writer.write_file(path, foreign).unwrap();
+                        }
+                    }),
+                });
+            }
+            let summary = sync(&book, &settings).unwrap().unwrap();
+            assert_eq!(summary.downloaded, 0);
+            if unreadable {
+                assert_eq!(summary.failed.len(), 1);
+                assert!(book.dir().join(path).is_dir());
+            } else {
+                assert_eq!(summary.postponed, 1);
+                assert_eq!(book.read_file(path).unwrap().unwrap(), foreign);
+            }
+            let _ = fs::remove_dir_all(book.dir());
+        }
+    }
+
+    #[test]
+    fn unreadable_merge_result_does_not_delete_remote_or_advance_manifest() {
+        use crate::store::{FsStore, Stamp, Store as LocalStore};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct FailAfterWrite {
+            inner: FsStore,
+            armed: Rc<Cell<bool>>,
+            failed: Cell<bool>,
+        }
+
+        impl LocalStore for FailAfterWrite {
+            fn read(&self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "2026-10-26.md" && self.failed.get() {
+                    bail!("injected read failure after merge");
+                }
+                self.inner.read(path)
+            }
+
+            fn write(&self, path: &str, data: &[u8]) -> Result<()> {
+                self.inner.write(path, data)?;
+                if path == "2026-10-26.md" && self.armed.get() {
+                    self.failed.set(true);
+                }
+                Ok(())
+            }
+
+            fn remove(&self, path: &str) -> Result<()> {
+                self.inner.remove(path)
+            }
+            fn list(&self, dir: &str) -> Result<Vec<String>> {
+                self.inner.list(dir)
+            }
+            fn stamp(&self, path: &str) -> Option<Stamp> {
+                self.inner.stamp(path)
+            }
+            fn lock(&self) -> Result<Option<fs::File>> {
+                self.inner.lock()
+            }
+        }
+
+        let store = Arc::new(Mutex::new(Store::default()));
+        let settings = Settings { url: serve(store.clone()), ..Settings::default() };
+        let dir = temp_book("merge-result-error").dir().to_path_buf();
+        let armed = Rc::new(Cell::new(false));
+        let book = Book::with_store(
+            dir.clone(),
+            Box::new(FailAfterWrite { inner: FsStore::new(dir), armed: armed.clone(), failed: Cell::new(false) }),
+        );
+        let path = "2026-10-26.md";
+        book.write_file(path, b"## Work <!-- list:work -->\n- [ ] original\n").unwrap();
+        sync(&book, &settings).unwrap().unwrap();
+        let manifest = fs::read(book.dir().join(STATE_FILE)).unwrap();
+        book.write_file(path, b"## Work <!-- list:work -->\n- [ ] local edit\n").unwrap();
+        let foreign = b"## Work <!-- list:work -->\n- [ ] remote edit\n";
+        {
+            let mut st = store.lock().unwrap();
+            st.version += 1;
+            let version = st.version;
+            st.files.insert(path.into(), (foreign.to_vec(), version));
+            st.requests.clear();
+        }
+        armed.set(true);
+        let summary = sync(&book, &settings).unwrap().unwrap();
+        assert_eq!(summary.failed.len(), 1);
+        assert!(summary.failed[0].contains("injected read failure"), "{summary:?}");
+        assert_eq!((summary.uploaded, summary.merged, summary.deleted), (0, 0, 0));
+        assert_eq!(fs::read(book.dir().join(STATE_FILE)).unwrap(), manifest);
+        let merged = fs::read_to_string(book.dir().join(path)).unwrap();
+        assert!(merged.contains("local edit") && merged.contains("remote edit"));
+        let st = store.lock().unwrap();
+        assert_eq!(st.files[path].0, foreign);
+        assert!(!st.requests.iter().any(|(m, _)| matches!(m.as_str(), "PUT" | "DELETE")));
+        drop(st);
         let _ = fs::remove_dir_all(book.dir());
+    }
+
+    #[test]
+    fn http_password_exception_requires_numeric_loopback_or_exact_localhost() {
+        for host in ["127.0.0.1:8080", "127.99.10.1", "[::1]:8080", "[0:0:0:0:0:0:0:1]", "localhost", "LOCALHOST"] {
+            let settings = Settings {
+                url: format!("http://{host}/book"),
+                user: "me".into(),
+                ca: "/nonexistent/ca.pem".into(),
+                ..Settings::default()
+            };
+            assert!(is_loopback(&settings.url), "{host}");
+            let error = Remote::new(&settings).err().expect("missing CA file");
+            assert!(format!("{error:#}").contains("webdav_ca"), "{host}: {error:#}");
+        }
+        for host in [
+            "127.evil",
+            "127.outside.example.invalid",
+            "127.0.0.1.evil",
+            "127.999.1.1",
+            "127.1",
+            "localhost.evil",
+            "localhost.",
+            "192.168.1.5",
+            "[::2]",
+        ] {
+            let settings = Settings {
+                url: format!("http://{host}/book"),
+                user: "me".into(),
+                ca: "/nonexistent/ca.pem".into(),
+                ..Settings::default()
+            };
+            assert!(!is_loopback(&settings.url), "{host}");
+            let error = Remote::new(&settings).err().expect("external HTTP password rejected");
+            let error = format!("{error:#}");
+            assert!(error.contains("https://") && !error.contains("webdav_ca"), "{host}: {error}");
+        }
     }
 
     #[test]
@@ -1395,6 +1752,70 @@ mod tests {
         assert!(Settings { passphrase_command: "true".into(), ..plain }.resolve().is_err());
         let _ = fs::remove_dir_all(pc.dir());
         let _ = fs::remove_dir_all(phone.dir());
+    }
+
+    /// HTTPS-сервер с сертификатом, подписанным своим (тестовым) центром; на всё отвечает 404 —
+    /// книжки на сервере ещё нет.
+    fn serve_tls() -> String {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let certs = CertificateDer::pem_slice_iter(include_bytes!("../testdata/test-server.crt"))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(include_bytes!("../testdata/test-server.key")).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        let config = Arc::new(config);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let mut tls = rustls::StreamOwned::new(rustls::ServerConnection::new(config.clone()).unwrap(), stream);
+                // Заголовки — до пустой строки; короткое тело PROPFIND приходит с ними.
+                let (mut buf, mut got) = ([0u8; 4096], Vec::new());
+                while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tls.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = tls.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+            }
+        });
+        format!("https://{addr}/book/")
+    }
+
+    #[test]
+    fn own_ca() {
+        let ca = include_bytes!("../testdata/test-ca.crt");
+        assert_eq!(parse_ca(ca).unwrap().len(), 1);
+        assert!(parse_ca(b"garbage").is_err());
+        assert!(parse_ca(include_bytes!("../testdata/test-server.key")).is_err());
+
+        let book = temp_book("ca");
+        let plain = Settings { url: serve_tls(), ..Settings::default() };
+        // Свой центр неизвестен — соединение не проходит проверку.
+        let err = format!("{:#}", sync(&book, &plain).unwrap_err());
+        assert!(err.contains("UnknownIssuer"), "{err}");
+        // С ним — проходит.
+        let path = book.dir().with_extension("ca.pem");
+        fs::write(&path, ca).unwrap();
+        let trusted = Settings { ca: path.to_string_lossy().into(), ..plain.clone() };
+        assert_eq!(sync(&book, &trusted).unwrap().unwrap(), Summary::default());
+        // Нет файла — понятная ошибка, а не «не тот издатель».
+        let missing = Settings { ca: "/nonexistent/ca.pem".into(), ..plain };
+        let err = format!("{:#}", sync(&book, &missing).unwrap_err());
+        assert!(err.contains("webdav_ca"), "{err}");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(book.dir());
     }
 
     #[test]

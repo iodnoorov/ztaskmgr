@@ -247,8 +247,12 @@ pub fn serve(agent: &Agent, webdav: Option<webdav::Settings>) -> Result<()> {
     let mut last_sync: Option<Instant> = None;
     let sync = |last: &mut Option<Instant>| {
         if let Some(settings) = &webdav {
-            if let Err(e) = webdav::sync(agent.book(), settings) {
-                eprintln!("ztaskmgr: WebDAV: {e:#}");
+            match webdav::sync(agent.book(), settings) {
+                Err(e) => eprintln!("ztaskmgr: WebDAV: {e:#}"),
+                Ok(Some(summary)) if !summary.failed.is_empty() => {
+                    eprintln!("ztaskmgr: WebDAV: не синхронизированы:\n  {}", summary.failed.join("\n  "));
+                }
+                _ => {}
             }
             *last = Some(Instant::now());
         }

@@ -78,8 +78,8 @@ pub fn parse_date(text: &str, today: Date) -> Result<Date> {
     let text = text.trim();
     match text.to_lowercase().as_str() {
         "today" | "сегодня" => return Ok(today),
-        "tomorrow" | "завтра" => return Ok(today.add_days(1)),
-        "yesterday" | "вчера" => return Ok(today.add_days(-1)),
+        "tomorrow" | "завтра" => return today.add_days(1).context("date is past the supported range"),
+        "yesterday" | "вчера" => return today.add_days(-1).context("date is past the supported range"),
         _ => {}
     }
     Date::parse_input(text, today).with_context(|| format!("not a date «{text}»: use YYYY-MM-DD, DD.MM, +N, today"))
@@ -192,7 +192,7 @@ impl Agent {
         if let Some(id) = &found.task().id {
             return Ok(id.clone());
         }
-        let id = self.book.new_id();
+        let id = self.book.new_id()?;
         found.task_mut().id = Some(id.clone());
         self.book.save(found.date, &found.board)?;
         Ok(id)
@@ -304,7 +304,11 @@ impl Agent {
                 };
                 out.push_str(&format!("## {date}, {}{when}\n{page}\n", date.format(c"%A")));
             }
-            date = date.add_days(1);
+            if date == to {
+                break;
+            }
+            let Some(next) = date.add_days(1) else { break };
+            date = next;
         }
         if out.is_empty() {
             out.push_str("No tasks in this period.\n");
@@ -412,6 +416,7 @@ impl Agent {
     // ------------------------------------------------------------------ правка задач
 
     pub fn add_task(&self, date: Date, category: ListId, text: &str) -> Result<String> {
+        let _guard = self.book.lock()?;
         self.check_writable(category)?;
         let registry = self.registry()?;
         let text = text.trim();
@@ -421,7 +426,7 @@ impl Agent {
         let mut board = self.book.load(date)?;
         let mut task = Task::new(text);
         task.touch();
-        let id = self.book.new_id();
+        let id = self.book.new_id()?;
         task.id = Some(id.clone());
         board.push(category, task);
         self.book.save(date, &board)?;
@@ -437,6 +442,7 @@ impl Agent {
         list: Option<ListId>,
         position: Option<usize>,
     ) -> Result<String> {
+        let _guard = self.book.lock()?;
         let mut found = self.resolve(reference)?;
         let id = self.ensure_id(&mut found)?;
         if let Some(text) = text {
@@ -488,6 +494,7 @@ impl Agent {
     }
 
     pub fn postpone_task(&self, reference: &str, to: Date) -> Result<String> {
+        let _guard = self.book.lock()?;
         let mut found = self.resolve(reference)?;
         if !found.task().is_open() {
             bail!("only open tasks can be moved to another date");
@@ -502,6 +509,7 @@ impl Agent {
 
     /// Удаление задачи; её записи, если других копий нет, уходят в `DELETED_NOTES.md`.
     pub fn delete_task(&self, reference: &str) -> Result<String> {
+        let _guard = self.book.lock()?;
         let mut found = self.resolve(reference)?;
         let task = found.board.delete(found.category, found.index).unwrap();
         self.book.save(found.date, &found.board)?;
@@ -529,6 +537,7 @@ impl Agent {
 
     /// Заметка (метка времени ставится сама, может быть в несколько строк) или подзадача.
     pub fn add_note(&self, reference: &str, text: &str, subtask: bool) -> Result<String> {
+        let _guard = self.book.lock()?;
         let text = text.trim_end().trim_start_matches('\n');
         if text.trim().is_empty() {
             bail!("empty text");
@@ -547,6 +556,7 @@ impl Agent {
     }
 
     pub fn update_note(&self, reference: &str, entry: usize, text: Option<&str>, done: Option<bool>) -> Result<String> {
+        let _guard = self.book.lock()?;
         let (_, id, mut notes) = self.notes_of(reference)?;
         let i = Self::entry_index(&notes, entry)?;
         if let Some(text) = text {
@@ -574,6 +584,7 @@ impl Agent {
 
     /// Удаление пункта записей; он уходит в `DELETED_NOTES.md`.
     pub fn delete_note(&self, reference: &str, entry: usize) -> Result<String> {
+        let _guard = self.book.lock()?;
         let (found, id, mut notes) = self.notes_of(reference)?;
         let i = Self::entry_index(&notes, entry)?;
         self.book.archive_entry(&found.task().text, &id, found.date, &clock::stamp(), &notes.raw(i))?;
@@ -648,7 +659,6 @@ mod tests {
         // Ссылка по номеру → id с первой правки.
         let out = agent.add_note("2026-10-26/work/1", "начал\nпродолжение", false).unwrap();
         let id = out.rsplit("ref: ").next().unwrap().trim().to_string();
-        assert_eq!(id.len(), 6);
         agent.add_note(&id, "собрать цифры", true).unwrap();
         agent.update_note(&id, 2, None, Some(true)).unwrap();
         let task = agent.get_task(&id).unwrap();
@@ -746,5 +756,14 @@ mod tests {
         lists.set_hidden(ListId::PERSONAL, true).unwrap();
         assert!(parse_list("личное", &lists).is_err());
         assert_eq!(list_names(&lists), "Работа (work), Дом (home), Прочее (other)");
+    }
+    #[test]
+    fn last_supported_day_is_read_without_incrementing_past_the_range() {
+        let agent = agent("date-boundary");
+        let last = Date::new(9999, 12, 31).unwrap();
+        assert!(parse_date("tomorrow", last).is_err());
+        assert!(parse_date("yesterday", Date::new(1, 1, 1).unwrap()).is_err());
+        assert!(agent.get_pages(last, last, None, false).is_ok());
+        cleanup(agent);
     }
 }

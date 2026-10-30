@@ -18,6 +18,7 @@ webpki-root-certs = "1.0.11"
 
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 
 [features]
 # Подмена часов для тестов программ поверх ядра (`clock::freeze`).

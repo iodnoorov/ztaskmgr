@@ -114,6 +114,8 @@ pub struct Board {
     /// Надгробия: id удалённых задач и когда их удалили. По ним слияние не воскрешает
     /// удалённое, если после удаления задачу нигде не меняли.
     deleted: Vec<(String, u64)>,
+    /// Версия снимка для условного сохранения; не часть формата или равенства досок.
+    pub(crate) revision: std::cell::Cell<Option<(crate::clock::Date, Option<crate::store::Stamp>)>>,
 }
 
 /// Страницы равны, если равны их списки; порядок списков и названия из файла не важны.
@@ -243,18 +245,16 @@ impl Board {
         list.insert(index.min(list.len()), task);
     }
 
-    /// Даёт id задачам, у которых его нет. Возвращает, были ли такие.
-    pub fn assign_ids(&mut self, mut new_id: impl FnMut() -> String) -> bool {
-        let mut any = false;
-        for task in self.lists.iter_mut().flat_map(|(_, l)| l).filter(|t| t.id.is_none()) {
-            task.id = Some(new_id());
-            any = true;
-        }
-        any
-    }
-
     pub fn tasks(&self) -> impl Iterator<Item = &Task> {
         self.lists.iter().flat_map(|(_, l)| l)
+    }
+    /// Один id обозначает одну задачу на странице; исторические копии на других датах допустимы.
+    pub fn validate_ids(&self) -> anyhow::Result<()> {
+        let mut ids = std::collections::HashSet::new();
+        for id in self.tasks().filter_map(|task| task.id.as_deref()) {
+            anyhow::ensure!(ids.insert(id), "повторяющийся id задачи «{id}» на одной странице");
+        }
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {

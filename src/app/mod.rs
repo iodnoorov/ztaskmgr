@@ -137,6 +137,8 @@ pub struct App {
     /// Время изменения файлов страницы и скрытых списков, когда мы их читали или писали.
     page_stamp: Option<Stamp>,
     lists_stamp: Option<Stamp>,
+    /// Не подтверждённый commit: перечитывание не должно уничтожить локальный черновик.
+    page_dirty: bool,
     /// Карта попаданий последнего кадра; позже нарисованное — выше.
     pub hits: Vec<(Rect, Hit)>,
     /// Ширина экрана в последнем кадре.
@@ -208,6 +210,7 @@ impl App {
             preview_target: None,
             page_stamp: None,
             lists_stamp: None,
+            page_dirty: false,
             hits: Vec::new(),
             width: 0,
             edited: false,
@@ -271,12 +274,20 @@ impl App {
 
     /// Открывает страницу на дату; активный список остаётся тем же.
     pub fn open_page(&mut self, date: Date) {
+        if self.page_dirty {
+            self.save();
+            if self.page_dirty {
+                return;
+            }
+        }
         // Окно записей закроется — начатую заметку сохраняем, пока страница прежняя.
         self.save_draft(false);
         self.date = date;
-        match self.book.load(date) {
-            Ok(board) => {
+        match self.book.open_page(date) {
+            Ok((board, stamp)) => {
+                self.page_stamp = stamp;
                 self.board = board;
+                self.page_dirty = false;
                 self.page_error = None;
                 if matches!(self.status, Some(Status::Error(_))) {
                     self.status = None;
@@ -291,7 +302,6 @@ impl App {
         }
         self.lists.clear();
         self.refresh_shown();
-        self.page_stamp = self.book.page_stamp(date);
         // Окно записей привязано к задаче прежней страницы.
         self.notes = None;
         self.summaries = self.book.summaries(&self.board);
@@ -318,26 +328,18 @@ impl App {
     }
 
     fn save(&mut self) {
-        // Файл поменяли снаружи с тех пор, как мы его читали (синхронизация в фоне, агент),
-        // и мы этого ещё не видели — не затираем, а сливаем с ним.
-        if self.book.page_stamp(self.date) != self.page_stamp
-            && let Ok(disk) = self.book.load(self.date)
-        {
-            self.board = crate::merge::merge_boards(&self.board, &disk);
-            self.refresh_shown();
-        }
-        let book = &self.book;
-        self.board.assign_ids(|| book.new_id());
+        self.page_dirty = true;
         self.edited = true;
-        match self.book.save(self.date, &self.board) {
+        match self.book.save_page(self.date, &mut self.board, &mut self.page_stamp) {
             Ok(()) => {
+                self.page_dirty = false;
+                self.refresh_shown();
                 if matches!(self.status, Some(Status::Error(_))) {
                     self.status = None;
                 }
             }
             Err(e) => self.status = Some(Status::Error(format!("Ошибка сохранения: {e:#}"))),
         }
-        self.page_stamp = self.book.page_stamp(self.date);
     }
 
     fn load_registry(&mut self) {
@@ -356,15 +358,9 @@ impl App {
 
     /// Меняет реестр списков и сохраняет его; ошибка — в строку состояния.
     fn edit_registry(&mut self, edit: impl FnOnce(&mut Lists) -> anyhow::Result<()>) -> bool {
-        // Реестр поменяли снаружи — правка ложится на свежую версию, а не затирает её.
-        if self.book.lists_stamp() != self.lists_stamp {
-            self.load_registry();
-        }
-        let mut lists = self.registry.clone();
-        let result = edit(&mut lists).and_then(|()| self.book.save_lists(&lists));
-        self.lists_stamp = self.book.lists_stamp();
-        match result {
-            Ok(()) => {
+        match self.book.edit_lists(edit) {
+            Ok(lists) => {
+                self.lists_stamp = self.book.lists_stamp();
                 self.registry = lists;
                 self.refresh_shown();
                 self.edited = true;
@@ -463,19 +459,24 @@ impl App {
         };
         let notes_task = self.notes_task().cloned();
 
-        match self.book.load(self.date) {
-            Ok(board) => {
-                self.board = board;
+        match self.book.open_page(self.date) {
+            Ok((board, stamp)) => {
+                if self.page_dirty {
+                    self.board = crate::merge::merge_boards(&self.board, &board);
+                } else {
+                    self.board = board;
+                    self.page_stamp = stamp;
+                }
                 self.page_error = None;
             }
             Err(e) => {
                 let e = format!("{e:#}");
-                self.board = Board::default();
+                // Уже открытый черновик и режим ввода остаются доступны после ошибки.
                 self.status = Some(Status::Error(format!("Страница не прочитана: {e}")));
                 self.page_error = Some(e);
+                return;
             }
         }
-        self.page_stamp = self.book.page_stamp(self.date);
 
         for (&category, task) in &selected {
             let index = self.find_task(category, task);
@@ -763,8 +764,13 @@ impl App {
             }
             Action::Top => self.select(self.active, Some(0)),
             Action::Bottom => self.select(self.active, Some(usize::MAX)),
-            Action::PrevDay => self.open_page(self.date.add_days(-1)),
-            Action::NextDay => self.open_page(self.date.add_days(1)),
+            Action::PrevDay | Action::NextDay => {
+                let offset = if action == Action::PrevDay { -1 } else { 1 };
+                match self.date.add_days(offset) {
+                    Some(date) => self.open_page(date),
+                    None => self.status = Some(Status::Error("Достигнута граница поддерживаемых дат".into())),
+                }
+            }
             Action::Today => self.open_page(self.today),
             Action::GoToDate => self.mode = Mode::Date { input: LineInput::default(), purpose: DatePurpose::Go },
             Action::Add => self.mode = Mode::Edit { input: LineInput::default(), index: None },
@@ -948,7 +954,10 @@ impl App {
             self.status = Some(Status::Info("Переносятся только невыполненные задачи".into()));
             return;
         }
-        let default = self.date.max(self.today).add_days(1);
+        let Some(default) = self.date.max(self.today).add_days(1) else {
+            self.status = Some(Status::Error("Нельзя перенести за пределы 9999 года".into()));
+            return;
+        };
         self.mode = Mode::Date { input: LineInput::new(default.to_string()), purpose: DatePurpose::Postpone(index) };
     }
 

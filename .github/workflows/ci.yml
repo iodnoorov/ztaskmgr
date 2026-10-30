@@ -14,8 +14,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Форматирование
-        run: cargo fmt --check
+        run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Тесты
-        run: cargo test
+        run: cargo test --locked --workspace

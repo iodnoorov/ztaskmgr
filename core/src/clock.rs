@@ -113,7 +113,7 @@ pub fn now_ms() -> u64 {
 }
 
 fn local_tm() -> Option<libc::tm> {
-    let t = (now_ms() / 1000) as libc::time_t;
+    let t = (now_ms() / 1000).try_into().ok()?;
     // SAFETY: `localtime_r` пишет только в переданную структуру.
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
@@ -149,7 +149,7 @@ pub fn now() -> String {
     local_tm().map_or_else(String::new, |tm| strftime(CLOCK_FORMAT, &tm))
 }
 
-/// Календарная дата — страница книжки. Пишется и читается как `2026-10-26`.
+/// Календарная дата — страница книжки: годы 1–9999, запись `2026-10-26`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Date {
     year: i32,
@@ -174,11 +174,8 @@ impl Date {
     }
 
     pub fn new(year: i32, month: u32, day: u32) -> Option<Date> {
-        ((1..=12).contains(&month) && (1..=days_in_month(year, month)).contains(&day)).then_some(Date {
-            year,
-            month,
-            day,
-        })
+        ((1..=9999).contains(&year) && (1..=12).contains(&month) && (1..=days_in_month(year, month)).contains(&day))
+            .then_some(Date { year, month, day })
     }
 
     /// Сегодня по местному времени.
@@ -210,7 +207,11 @@ impl Date {
     pub fn parse_iso(text: &str) -> Option<Date> {
         let mut parts = text.splitn(3, '-');
         let (y, m, d) = (parts.next()?, parts.next()?, parts.next()?);
-        if y.len() != 4 || m.len() != 2 || d.len() != 2 {
+        if y.len() != 4
+            || m.len() != 2
+            || d.len() != 2
+            || !y.bytes().chain(m.bytes()).chain(d.bytes()).all(|b| b.is_ascii_digit())
+        {
             return None;
         }
         Date::new(y.parse().ok()?, m.parse().ok()?, d.parse().ok()?)
@@ -221,10 +222,10 @@ impl Date {
     pub fn parse_input(text: &str, base: Date) -> Option<Date> {
         let text = text.trim();
         if let Some(n) = text.strip_prefix('+') {
-            return Some(base.add_days(n.parse().ok()?));
+            return base.add_days(n.parse().ok()?);
         }
-        if let Some(n) = text.strip_prefix('-').filter(|n| n.chars().all(|c| c.is_ascii_digit())) {
-            return Some(base.add_days(-n.parse::<i64>().ok()?));
+        if text.starts_with('-') {
+            return base.add_days(text.parse().ok()?);
         }
         if let Some(date) = Date::parse_iso(text) {
             return Some(date);
@@ -253,7 +254,12 @@ impl Date {
         era * 146_097 + doe - 719_468
     }
 
-    fn from_days(days: i64) -> Date {
+    fn from_days(days: i64) -> Option<Date> {
+        let min = Date { year: 1, month: 1, day: 1 }.to_days();
+        let max = Date { year: 9999, month: 12, day: 31 }.to_days();
+        if !(min..=max).contains(&days) {
+            return None;
+        }
         let z = days + 719_468;
         let era = z.div_euclid(146_097);
         let doe = z - era * 146_097;
@@ -263,11 +269,12 @@ impl Date {
         let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
         let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
         let year = (yoe + era * 400 + i64::from(month <= 2)) as i32;
-        Date { year, month, day }
+        Date::new(year, month, day)
     }
 
-    pub fn add_days(self, n: i64) -> Date {
-        Date::from_days(self.to_days() + n)
+    /// Сдвиг в пределах поддерживаемых дат; слишком большое смещение — `None`.
+    pub fn add_days(self, n: i64) -> Option<Date> {
+        Date::from_days(self.to_days().checked_add(n)?)
     }
 
     /// Сколько дней от `self` до `other` (отрицательное — `other` раньше).
@@ -304,7 +311,7 @@ mod tests {
     fn weekday() {
         let d = Date::new(2026, 10, 26).unwrap();
         assert_eq!((d.weekday(), d.month(), d.day()), (0, 10, 26));
-        assert_eq!(d.add_days(6).weekday(), 6);
+        assert_eq!(d.add_days(6).unwrap().weekday(), 6);
         assert_eq!(Date::new(1970, 1, 1).unwrap().weekday(), 3);
         assert_eq!(Date::new(1969, 12, 29).unwrap().weekday(), 0);
     }
@@ -383,15 +390,15 @@ mod tests {
     #[test]
     fn day_arithmetic() {
         assert_eq!(d(1970, 1, 1).to_days(), 0);
-        assert_eq!(d(2026, 10, 26).add_days(6), d(2026, 11, 1));
-        assert_eq!(d(2024, 2, 28).add_days(1), d(2024, 2, 29));
-        assert_eq!(d(2026, 3, 1).add_days(-1), d(2026, 2, 28));
-        assert_eq!(d(2026, 12, 31).add_days(1), d(2027, 1, 1));
+        assert_eq!(d(2026, 10, 26).add_days(6), Some(d(2026, 11, 1)));
+        assert_eq!(d(2024, 2, 28).add_days(1), Some(d(2024, 2, 29)));
+        assert_eq!(d(2026, 3, 1).add_days(-1), Some(d(2026, 2, 28)));
+        assert_eq!(d(2026, 12, 31).add_days(1), Some(d(2027, 1, 1)));
         assert_eq!(d(1969, 12, 31).to_days(), -1);
         assert_eq!(d(2026, 10, 26).days_until(d(2026, 10, 24)), -2);
-        for days in -800_000..800_000 {
+        for days in d(1, 1, 1).to_days()..=d(9999, 12, 31).to_days() {
             if days % 997 == 0 {
-                assert_eq!(Date::from_days(days).to_days(), days);
+                assert_eq!(Date::from_days(days).unwrap().to_days(), days);
             }
         }
         assert_eq!(Date::new(2026, 2, 29), None);
@@ -399,10 +406,31 @@ mod tests {
     }
 
     #[test]
+    fn date_boundaries() {
+        let first = d(1, 1, 1);
+        let last = d(9999, 12, 31);
+        assert_eq!(first.add_days(-1), None);
+        assert_eq!(last.add_days(1), None);
+        assert_eq!(first.add_days(i64::MIN), None);
+        assert_eq!(last.add_days(i64::MAX), None);
+        for date in [first, last] {
+            assert_eq!(date.add_days(0), Some(date));
+            assert_eq!(Date::parse_iso(&date.to_string()), Some(date));
+        }
+        for text in ["+9223372036854775807", "-9223372036854775808", "1.1.10000", "1.1.0"] {
+            assert_eq!(Date::parse_input(text, d(2026, 10, 30)), None, "{text}");
+        }
+        assert_eq!(Date::new(0, 1, 1), None);
+        assert_eq!(Date::new(10000, 1, 1), None);
+    }
+
+    #[test]
     fn parse() {
         let base = d(2026, 10, 26);
         assert_eq!(Date::parse_iso("2026-10-27"), Some(d(2026, 10, 27)));
         assert_eq!(Date::parse_iso("2026-1-27"), None);
+        assert_eq!(Date::parse_iso("+001-01-01"), None);
+        assert_eq!(Date::parse_iso("2026-+1-01"), None);
         assert_eq!(Date::parse_input("2026-10-27", base), Some(d(2026, 10, 27)));
         assert_eq!(Date::parse_input("27.10.2027", base), Some(d(2027, 10, 27)));
         assert_eq!(Date::parse_input(" 1.11 ", base), Some(d(2026, 11, 1)));

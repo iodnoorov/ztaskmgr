@@ -214,12 +214,15 @@ fn pages_and_postpone() {
     assert_eq!(app.date, d(30));
     assert!(app.board.is_empty());
 
-    // Все задачи удалены — файла страницы нет.
+    // Последняя задача удалена, но её надгробие подавляет старую копию страницы.
     press(&mut app, KeyCode::Char('t'));
     assert_eq!(app.date, d(26));
+    let before_delete = app.board.clone();
     press(&mut app, KeyCode::Char('d'));
     press(&mut app, KeyCode::Char('y'));
-    assert_eq!(app.book.dates().unwrap(), [d(27)]);
+    let deleted = app.book.load(d(26)).unwrap();
+    assert!(deleted.is_empty());
+    assert!(crate::merge::merge_boards(&deleted, &before_delete).is_empty());
     cleanup(app);
 }
 
@@ -644,6 +647,55 @@ fn save_does_not_overwrite_unseen_changes() {
 }
 
 #[test]
+fn corrupt_external_page_does_not_destroy_pending_local_draft() {
+    let mut app = test_app("corrupt-draft");
+    app.board.push(ListId::WORK, Task::new("saved"));
+    app.save();
+    let stamp = app.page_stamp;
+    app.board.push(ListId::HOME, Task::new("local draft"));
+    let draft = app.board.clone();
+    let path = app.book.dir().join("2026-10-26.md");
+    std::fs::write(&path, b"USER TEXT NOT VALID AS A PAGE").unwrap();
+    app.save();
+    assert!(matches!(app.status, Some(Status::Error(_))));
+    assert_eq!(app.page_stamp, stamp);
+    assert_eq!(app.board, draft);
+    assert!(app.page_dirty);
+    assert!(app.check_external());
+    assert_eq!(app.board, draft);
+    assert_eq!(app.page_stamp, stamp);
+    app.open_page(d(27));
+    assert_eq!(app.date, d(26), "failed draft must not disappear on navigation");
+    assert_eq!(std::fs::read(&path).unwrap(), b"USER TEXT NOT VALID AS A PAGE");
+    std::fs::remove_file(&path).unwrap();
+    app.save();
+    assert!(!app.page_dirty);
+    assert_eq!(app.book.load(d(26)).unwrap(), app.board);
+    assert_eq!(texts(&app, ListId::HOME), ["local draft"]);
+    cleanup(app);
+}
+
+#[test]
+fn date_navigation_and_postpone_stop_at_supported_boundaries() {
+    let mut app = test_app("date-boundaries");
+    let first = Date::new(1, 1, 1).unwrap();
+    app.open_page(first);
+    app.act(Action::PrevDay);
+    assert_eq!(app.date, first);
+    assert!(matches!(app.status, Some(Status::Error(_))));
+    let last = Date::new(9999, 12, 31).unwrap();
+    app.open_page(last);
+    app.act(Action::NextDay);
+    assert_eq!(app.date, last);
+    app.board.push(ListId::WORK, Task::new("cannot postpone"));
+    app.select(ListId::WORK, Some(0));
+    app.start_postpone();
+    assert!(matches!(app.mode, Mode::Normal));
+    assert!(matches!(app.status, Some(Status::Error(_))));
+    cleanup(app);
+}
+
+#[test]
 fn webdav_settings() {
     let mut app = test_app("webdav");
     press(&mut app, KeyCode::Char('S'));
@@ -695,6 +747,12 @@ fn webdav_settings() {
     assert_eq!(app.config.webdav().unwrap().passphrase, "фраза");
     app.on_passphrase(Ok("новая".into()));
     assert_eq!(app.config.webdav().unwrap().passphrase, "новая");
+    // Свой сертификат — путь к файлу.
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Enter);
+    type_text(&mut app, "/etc/webdav-ca.crt");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.config.webdav().unwrap().ca, "/etc/webdav-ca.crt");
     // Теперь «сейчас» — просьба главному циклу.
     press(&mut app, KeyCode::Char('j'));
     press(&mut app, KeyCode::Enter);

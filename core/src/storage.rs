@@ -62,6 +62,7 @@ pub fn parse(text: &str, lists: &Lists) -> Result<Board> {
         board.push(category, task);
     }
 
+    board.validate_ids()?;
     Ok(board)
 }
 
@@ -195,6 +196,18 @@ mod tests {
 
     fn serialize(board: &Board) -> String {
         super::serialize(board, &Lists::default())
+    }
+
+    #[test]
+    fn duplicate_task_ids_are_explicit_errors_even_across_lists() {
+        for text in [
+            "## Работа\n- [ ] first <!-- id:same -->\n- [ ] second <!-- id:same -->\n",
+            "## Работа\n- [ ] same text <!-- id:same -->\n## Дом\n- [x] same text <!-- id:same -->\n",
+        ] {
+            let error = parse(text).unwrap_err().to_string();
+            assert!(error.contains("повторяющийся id") && error.contains("same"), "{error}");
+        }
+        assert!(parse("## Работа\n- [ ] first <!-- id:0123456789abcdef -->\n").is_ok());
     }
 
     const SAMPLE: &str = "\

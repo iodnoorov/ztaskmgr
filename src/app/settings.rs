@@ -13,11 +13,12 @@ pub enum Setting {
     WebdavPassphrase,
     WebdavPassphraseCommand,
     ChangePassphrase,
+    WebdavCa,
     SyncNow,
 }
 
 impl Setting {
-    pub const ALL: [Setting; 9] = [
+    pub const ALL: [Setting; 10] = [
         Setting::Preview,
         Setting::WebdavUrl,
         Setting::WebdavUser,
@@ -26,6 +27,7 @@ impl Setting {
         Setting::WebdavPassphrase,
         Setting::WebdavPassphraseCommand,
         Setting::ChangePassphrase,
+        Setting::WebdavCa,
         Setting::SyncNow,
     ];
 
@@ -39,6 +41,7 @@ impl Setting {
             Setting::WebdavPassphrase => "Шифрование: фраза",
             Setting::WebdavPassphraseCommand => "Шифрование: команда фразы",
             Setting::ChangePassphrase => "Шифрование: сменить фразу",
+            Setting::WebdavCa => "WebDAV: свой сертификат",
             Setting::SyncNow => "Синхронизировать сейчас",
         }
     }
@@ -53,6 +56,7 @@ impl Setting {
             Setting::WebdavPassphrase => "шифрует книжку на сервере; одна на всех устройствах",
             Setting::WebdavPassphraseCommand => "например «pass ztaskmgr-book»; если задана — вместо фразы",
             Setting::ChangePassphrase => "на сервере; на других устройствах потом — новую фразу выше",
+            Setting::WebdavCa => "PEM-файл своего центра сертификации, если он не в системе",
             Setting::SyncNow => "иначе — раз в минуту и через пару секунд после правки",
         }
     }
@@ -66,6 +70,7 @@ impl Setting {
             Setting::WebdavPasswordCommand => Some(crate::config::WEBDAV_PASSWORD_COMMAND),
             Setting::WebdavPassphrase => Some(crate::config::WEBDAV_PASSPHRASE),
             Setting::WebdavPassphraseCommand => Some(crate::config::WEBDAV_PASSPHRASE_COMMAND),
+            Setting::WebdavCa => Some(crate::config::WEBDAV_CA),
             Setting::Preview | Setting::ChangePassphrase | Setting::SyncNow => None,
         }
     }
@@ -202,7 +207,7 @@ impl App {
             }
             Err(e) => {
                 if self.sync != SyncState::Error(e.clone()) {
-                    self.status = Some(Status::Error(format!("WebDAV: {e}")));
+                    self.status = Some(Status::Error(crate::webdav::message(&e)));
                 }
                 self.sync = SyncState::Error(e);
             }

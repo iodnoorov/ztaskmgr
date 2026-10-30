@@ -84,7 +84,14 @@ impl App {
             },
             ListsMode::Add(mut input) => match edit_line(&mut input, &press) {
                 Some(KeyCode::Enter) => {
-                    let id = ListId::new(&self.book.new_id());
+                    let id = match self.book.new_id() {
+                        Ok(id) => ListId::new(&id),
+                        Err(e) => {
+                            self.status = Some(Status::Error(format!("Новый список: {e:#}")));
+                            self.mode = Mode::Lists { row, sub: ListsMode::Add(input) };
+                            return;
+                        }
+                    };
                     let title = input.text().to_string();
                     if self.edit_registry(|lists| lists.add(id, &title)) {
                         row = self.registry.active().len() - 1;
@@ -168,18 +175,16 @@ impl App {
     /// иначе удаляется совсем.
     pub(super) fn finish_delete(&mut self, list: ListId, to: Option<ListId>) {
         let title = self.list_title(list).to_string();
-        let moved = match to.map(|to| self.book.move_list_tasks(list, to, self.today)) {
-            Some(Err(e)) => {
+        let (registry, moved, used) = match self.book.delete_list(list, to, self.today) {
+            Ok(result) => result,
+            Err(e) => {
                 self.status = Some(Status::Error(format!("Удаление списка: {e:#}")));
                 return;
             }
-            Some(Ok(n)) => n,
-            None => 0,
         };
-        let used = moved > 0 || self.book.list_used(list).unwrap_or(true);
-        if !self.edit_registry(|lists| if used { lists.archive(list) } else { lists.remove(list) }) {
-            return;
-        }
+        self.registry = registry;
+        self.lists_stamp = self.book.lists_stamp();
+        self.edited = true;
         self.reload_page();
         self.status = Some(Status::Info(match to {
             Some(to) if moved > 0 => format!("Список «{title}» удалён, задачи ({moved}) — в «{}»", self.list_title(to)),
