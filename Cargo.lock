@@ -2287,7 +2287,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "ztaskmgr"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "directories",
@@ -2300,7 +2300,7 @@ dependencies = [
 
 [[package]]
 name = "ztaskmgr-core"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "argon2",
