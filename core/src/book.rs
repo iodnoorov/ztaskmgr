@@ -566,10 +566,17 @@ impl Book {
     /// Возвращает дату, с которой перенесли, и сколько задач.
     pub fn carry_over(&self, today: Date) -> Result<Option<(Date, usize)>> {
         let _guard = self.lock()?;
-        let Some(from) = self.dates()?.into_iter().rev().find(|&d| d < today) else {
+        let mut last_filled = None;
+        for date in self.dates()?.into_iter().rev().filter(|&d| d < today) {
+            let board = self.load(date)?;
+            if !board.is_empty() {
+                last_filled = Some((date, board));
+                break;
+            }
+        }
+        let Some((from, mut source)) = last_filled else {
             return Ok(None);
         };
-        let mut source = self.load(from)?;
         // Копии на сегодня — с теми же id, что и на исходной странице: если перенос сделают
         // два устройства сразу, при слиянии это будут одни и те же задачи, а не дубли.
         if self.assign_ids(&mut source)? {
@@ -1181,6 +1188,30 @@ mod tests {
         // Только с последней страницы; повторный запуск ничего не делает.
         assert_eq!(book.load(d(20)).unwrap(), older);
         assert_eq!(book.carry_over(d(26)).unwrap(), None);
+        fs::remove_dir_all(book.dir()).unwrap();
+    }
+
+    #[test]
+    fn carry_over_skips_empty_days_and_future_pages() {
+        let book = temp_book("carry-empty-days");
+        let mut source = Board::default();
+        source.push(ListId::WORK, Task::new("после перерыва"));
+        source.push(ListId::WORK, Task::new("отменено"));
+        source.get_mut(ListId::WORK, 1).unwrap().state = State::Cancelled;
+        book.save(d(20), &source).unwrap();
+        // Пустые файлы могут остаться после внешнего редактирования или синхронизации.
+        fs::write(book.dir().join(page_path(d(24))), "").unwrap();
+        fs::write(book.dir().join(page_path(d(25))), "\n\n").unwrap();
+        let mut future = Board::default();
+        future.push(ListId::HOME, Task::new("на будущее"));
+        book.save(d(29), &future).unwrap();
+
+        assert_eq!(book.carry_over(d(26)).unwrap(), Some((d(20), 1)));
+        assert_eq!(texts(&book.load(d(26)).unwrap(), ListId::WORK), [("после перерыва".into(), State::Open)]);
+        assert_eq!(book.load(d(20)).unwrap().list(ListId::WORK)[1].state, State::Cancelled);
+        assert_eq!(book.load(d(29)).unwrap(), future);
+        assert_eq!(book.carry_over(d(26)).unwrap(), None);
+        assert_eq!(book.load(d(26)).unwrap().tasks().count(), 1);
         fs::remove_dir_all(book.dir()).unwrap();
     }
 
