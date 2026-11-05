@@ -8,6 +8,7 @@ pub mod crypt;
 pub mod lists;
 pub mod merge;
 pub mod model;
+pub mod notebook;
 pub mod notes;
 #[cfg(test)]
 mod proptests;

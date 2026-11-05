@@ -28,7 +28,8 @@ subtasks do not complete it. A cancelled task [-] is one the user decided not to
 not move to the next day.\n\
 Tasks are referenced by `ref` from the tool output: a short id, or DATE/LIST/N for tasks that \
 have none yet. Prefer ids. Deleted notes are kept in the archive, so nothing is lost.\n\
-Some lists and tasks are hidden from you by the user's choice: do not ask about them or try to \
+Standalone Markdown notes are independent of tasks and organized in nested groups. Use list_notebook, get_notebook_page and link_notebook_page to work with them. Hidden groups hide all descendants.\n\
+Some lists, tasks, groups and standalone notes are hidden from you by the user's choice: do not ask about them or try to \
 guess them. The user writes in Russian: answer and write notes in the user's language."
     )
 }
@@ -38,6 +39,12 @@ fn tools(lists: &str) -> Value {
     let task = json!({"type": "string", "description": "Task ref from tool output: an id like k3x9ab, or DATE/LIST/N"});
     let list = json!({"type": "string", "description": format!("List title or id: {lists}")});
     json!([
+        {"name":"list_notebook", "description":"List visible standalone notes and groups; optional full-text query.", "inputSchema":{"type":"object","properties":{"query":{"type":"string"}}}, "annotations":{"readOnlyHint":true}},
+        {"name":"get_notebook_page", "description":"Read a standalone Markdown note by id.", "inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}, "annotations":{"readOnlyHint":true}},
+        {"name":"create_notebook_page", "description":"Create a standalone note, optionally in a group.", "inputSchema":{"type":"object","properties":{"title":{"type":"string"},"group":{"type":"string"}},"required":["title"]}},
+        {"name":"create_notebook_group", "description":"Create a group of standalone notes, optionally under a parent group.", "inputSchema":{"type":"object","properties":{"title":{"type":"string"},"parent":{"type":"string"}},"required":["title"]}},
+        {"name":"update_notebook_page", "description":"Replace the complete Markdown body of a standalone note. Include its # Title heading.", "inputSchema":{"type":"object","properties":{"id":{"type":"string"},"body":{"type":"string"}},"required":["id","body"]}},
+        {"name":"link_notebook_page", "description":"Attach or detach a standalone note to a task.", "inputSchema":{"type":"object","properties":{"task":{"type":"string"},"id":{"type":"string"},"attach":{"type":"boolean"}},"required":["task","id","attach"]}},
         {
             "name": "list_pages",
             "description": "Dates that have tasks, with counts of open and done tasks. Use to see what periods have entries.",
@@ -146,6 +153,16 @@ fn call(agent: &Agent, name: &str, args: &Value) -> Result<String> {
     let today = Date::today();
     let registry = agent.book().lists()?;
     match name {
+        "list_notebook" => agent.list_notebook(str_arg(args, "query")),
+        "get_notebook_page" => agent.get_notebook_page(required(args, "id")?),
+        "create_notebook_page" => agent.create_notebook_page(required(args, "title")?, str_arg(args, "group")),
+        "create_notebook_group" => agent.create_notebook_group(required(args, "title")?, str_arg(args, "parent")),
+        "update_notebook_page" => agent.update_notebook_page(required(args, "id")?, required(args, "body")?),
+        "link_notebook_page" => agent.link_notebook_page(
+            required(args, "task")?,
+            required(args, "id")?,
+            args.get("attach").and_then(Value::as_bool).context("missing boolean attach")?,
+        ),
         "list_pages" => agent.list_pages(date_arg(args, "from", today)?, date_arg(args, "to", today)?),
         "get_pages" => {
             let from = parse_date(required(args, "from")?, today)?;
@@ -344,5 +361,45 @@ mod tests {
         let (error, _) = call_tool(&agent, "add_note", json!({"task": id, "text": "x", "kind": "idea"}));
         assert!(error);
         let _ = std::fs::remove_dir_all(agent.book().dir());
+    }
+}
+
+#[cfg(test)]
+mod notebook_tests {
+    use super::*;
+    #[test]
+    fn hidden_descendants_and_links_never_leak_through_mcp() {
+        let dir = std::env::temp_dir().join(format!("ztaskmgr-mcp-notebook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let agent = Agent::new(crate::book::Book::new(dir.clone()));
+        let root = agent.create_notebook_group("Программирование", None).unwrap();
+        let child = agent.create_notebook_group("Языки", Some(&root)).unwrap();
+        let note = agent.create_notebook_page("Rust", Some(&child)).unwrap();
+        let task = agent.add_task(Date::today(), ListId::WORK, "Апробация").unwrap();
+        let _ = task;
+        let reference = format!("{}/work/1", Date::today());
+        agent.link_notebook_page(&reference, &note, true).unwrap();
+        assert!(agent.get_task(&reference).unwrap().contains("Linked note: Rust"));
+        agent.book().set_group_hidden(&root, true).unwrap();
+        assert_eq!(agent.list_notebook(None).unwrap(), "");
+        assert!(agent.get_notebook_page(&note).is_err());
+        assert!(!agent.get_task(&reference).unwrap().contains(&note));
+        assert!(agent.create_notebook_page("Попытка", Some(&child)).is_err());
+        assert!(agent.update_notebook_page(&note, "# Подмена").is_err());
+        agent.book().set_group_hidden(&root, false).unwrap();
+        assert!(agent.get_notebook_page(&note).is_err());
+        agent.book().set_group_hidden(&child, false).unwrap();
+        assert!(agent.get_notebook_page(&note).is_err());
+        agent
+            .book()
+            .update_notebook_page(&note, |p| {
+                p.hidden = false;
+                Ok(())
+            })
+            .unwrap();
+        let reply = handle(&agent, &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_notebook_page","arguments":{"id":note}}})).unwrap();
+        assert_eq!(reply["result"]["isError"], false);
+        assert_eq!(reply["result"]["content"][0]["text"], "# Rust");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

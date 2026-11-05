@@ -153,6 +153,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Vec<Link> {
     if app.notes.is_some() {
         draw_notes(frame, app, board_area, &mut hits);
     }
+    if app.notebook.is_some() {
+        draw_notebook(frame, app, &mut hits);
+    }
     if app.show_help {
         draw_help(frame, app.notes.is_some());
     }
@@ -1222,6 +1225,97 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// Окно ввода по центру экрана, не шире `max_width` и с отступом от краёв.
 fn popup_area(area: Rect, max_width: u16, height: u16) -> Rect {
     centered(area, max_width.min(area.width.saturating_sub(4)).max(10), height)
+}
+
+fn draw_notebook(frame: &mut Frame, app: &mut App, hits: &mut Hits) {
+    hits.clear();
+    let Some(view) = &app.notebook else {
+        return;
+    };
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+    let [head, content, footer, status] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(1),
+        Constraint::Length(if area.width < 100 { 6 } else { 4 }),
+        Constraint::Length(3),
+    ])
+    .areas(area);
+    let location = match app.selected_task() {
+        Some(task) => format!("{} · задача: {}", app.notebook_location(view), task.text),
+        None => app.notebook_location(view),
+    };
+    frame.render_widget(Paragraph::new(location).wrap(Wrap { trim: false }).block(Block::bordered()), head);
+    if let Some(page) = &view.reading {
+        frame.render_widget(
+            Paragraph::new(page.body.as_str())
+                .wrap(Wrap { trim: false })
+                .scroll((view.scroll, 0))
+                .block(Block::bordered().title(page.title())),
+            content,
+        );
+    } else {
+        match app.notebook_rows(view) {
+            Ok(rows) => {
+                let items: Vec<ListItem> = rows
+                    .iter()
+                    .map(|r| {
+                        ListItem::new(format!(
+                            "{} {}{}{}",
+                            if r.group { "[+]" } else { "   " },
+                            r.title,
+                            if r.hidden { " [скрыто]" } else { "" },
+                            if r.linked { " [связано]" } else { "" }
+                        ))
+                    })
+                    .collect();
+                let mut state = ratatui::widgets::ListState::default();
+                state.select(Some(view.row.min(items.len().saturating_sub(1))));
+                frame.render_stateful_widget(
+                    List::new(items)
+                        .block(Block::bordered().title(format!("Поиск: {}", view.query)))
+                        .highlight_style(Style::default().bg(Color::DarkGray))
+                        .highlight_symbol("› "),
+                    content,
+                    &mut state,
+                );
+                for (line, i) in
+                    (state.offset()..rows.len()).take(usize::from(content.height.saturating_sub(2))).enumerate()
+                {
+                    hits.push((
+                        Rect::new(content.x + 1, content.y + 1 + cells(line), content.width.saturating_sub(2), 1),
+                        Hit::NotebookRow(i),
+                    ));
+                }
+            }
+            Err(e) => {
+                frame.render_widget(Paragraph::new(format!("Ошибка чтения: {e:#}")).block(Block::bordered()), content)
+            }
+        }
+    }
+    if let Some((kind, input)) = &view.input {
+        let title = match kind {
+            'n' => "Название заметки",
+            'g' => "Название группы",
+            'r' => "Новое название группы",
+            _ => "Поиск по всем заметкам",
+        };
+        frame.render_widget(Paragraph::new(input.text()).block(Block::bordered().title(title)), footer);
+    } else {
+        let hints = if view.reading.is_some() {
+            "e — редактор · ↑↓ PgUp/PgDn — прокрутка · Esc — назад"
+        } else if view.confirm {
+            "y — удалить · любая другая клавиша — отмена"
+        } else {
+            "Enter — открыть · n — заметка · g — группа · e — редактор · r — имя группы · m — перенос · p — скрыть · a — связь с задачей · Tab — связи · / — поиск · Backspace — вверх · Esc — закрыть"
+        };
+        frame.render_widget(Paragraph::new(hints).wrap(Wrap { trim: false }).block(Block::bordered()), footer);
+    }
+    let message = match &app.status {
+        Some(Status::Error(s) | Status::Info(s)) => s.as_str(),
+        _ => "",
+    };
+    frame.render_widget(Paragraph::new(message).wrap(Wrap { trim: false }).block(Block::bordered()), status);
 }
 
 #[cfg(test)]

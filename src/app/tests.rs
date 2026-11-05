@@ -990,3 +990,74 @@ fn navigation_stays_in_bounds() {
     press(&mut app, KeyCode::Up);
     assert_eq!(app.selected(), None);
 }
+
+#[test]
+fn notebook_editor_links_search_and_invalid_draft_recovery() {
+    let mut app = test_app("notebook-editor");
+    press(&mut app, KeyCode::Char('a'));
+    type_text(&mut app, "Апробация");
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('N'));
+    press(&mut app, KeyCode::Char('g'));
+    app.on_paste("Программирование");
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('n'));
+    app.on_paste("Rust");
+    press(&mut app, KeyCode::Enter);
+    let path = app.editor_request.take().unwrap();
+    std::fs::write(&path, "# Rust\n\nРабота с ошибками").unwrap();
+    app.after_editor(None);
+    assert!(!path.exists());
+    let pages = app.book.notebook_pages().unwrap();
+    let id = pages[0].id.clone();
+    press(&mut app, KeyCode::Char('a'));
+    assert_eq!(app.selected_task().unwrap().references(), [id.as_str()]);
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Enter);
+    assert!(app.notebook.as_ref().unwrap().reading.is_some());
+    press(&mut app, KeyCode::Char('e'));
+    let path = app.editor_request.take().unwrap();
+    std::fs::write(&path, "случайно удалил заголовок").unwrap();
+    app.after_editor(None);
+    assert!(path.exists());
+    assert!(matches!(&app.status, Some(Status::Error(s)) if s.contains("Черновик")));
+    assert!(app.book.notebook_page(&id).unwrap().body.contains("Работа с ошибками"));
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Char('/'));
+    app.on_paste("ошибками");
+    press(&mut app, KeyCode::Enter);
+    let view = app.notebook.as_ref().unwrap();
+    assert_eq!(app.notebook_rows(view).unwrap().len(), 1);
+    let backend = ratatui::backend::TestBackend::new(60, 20);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            crate::ui::draw(frame, &mut app);
+        })
+        .unwrap();
+    cleanup(app);
+}
+
+#[test]
+fn notebook_editor_merges_simultaneous_edit_and_keeps_remote_metadata() {
+    let mut app = test_app("notebook-concurrent");
+    let id = app.book.create_notebook_page("Rust", None).unwrap();
+    press(&mut app, KeyCode::Char('N'));
+    press(&mut app, KeyCode::Char('e'));
+    let path = app.editor_request.take().unwrap();
+    std::fs::write(&path, "# Rust\n\nЛокальный текст").unwrap();
+    app.book
+        .update_notebook_page(&id, |p| {
+            p.body = "# Rust\n\nУдалённый текст".into();
+            p.hidden = true;
+            Ok(())
+        })
+        .unwrap();
+    app.after_editor(None);
+    let page = app.book.notebook_page(&id).unwrap();
+    assert!(page.hidden && page.conflicted());
+    assert!(page.body.contains("Локальный текст") && page.body.contains("Удалённый текст"));
+    cleanup(app);
+}

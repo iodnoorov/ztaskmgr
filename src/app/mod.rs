@@ -3,6 +3,7 @@
 //! списков. Окна — в своих модулях.
 
 mod lists_window;
+mod notebook;
 mod notes;
 mod preview;
 mod settings;
@@ -10,6 +11,7 @@ mod settings;
 mod tests;
 
 pub use lists_window::ListsMode;
+pub use notebook::{NotebookEditor, NotebookView};
 pub use notes::{AUTOSAVE, Draft, NoteTarget, NotesMode, NotesView};
 pub use preview::Preview;
 pub use settings::{Setting, SyncState};
@@ -84,6 +86,7 @@ pub enum Hit {
     Setting(usize),
     /// Вариант в окне выбора (перенос в список, строка окна списков).
     Pick(usize),
+    NotebookRow(usize),
     /// Пункт записей (номер среди видимых) и `[ ]` у подзадачи.
     Entry(usize),
     EntryCheck(usize),
@@ -125,6 +128,8 @@ pub struct App {
     /// Файл, который надо открыть во внешнем редакторе: это делает главный цикл,
     /// ему принадлежит терминал. Потом — `after_editor`.
     pub editor_request: Option<PathBuf>,
+    pub notebook: Option<NotebookView>,
+    pub notebook_editor: Option<NotebookEditor>,
     /// Реестр списков книжки (`LISTS.md`): названия, порядок, скрытые от ИИ.
     pub registry: Lists,
     /// Настройки этого устройства.
@@ -203,6 +208,8 @@ impl App {
             notes: None,
             summaries: HashMap::new(),
             editor_request: None,
+            notebook: None,
+            notebook_editor: None,
             registry: Lists::default(),
             config,
             preview: None,
@@ -555,6 +562,10 @@ impl App {
             self.show_about = false;
             return;
         }
+        if self.notebook.is_some() {
+            self.on_key_notebook(press);
+            return;
+        }
         if self.notes.is_some() {
             self.on_key_notes(press);
             return;
@@ -585,12 +596,36 @@ impl App {
             self.mode,
             Mode::Lists { sub: ListsMode::Add(_) | ListsMode::Rename(_), .. } | Mode::Settings { input: Some(_), .. }
         );
-        notes_field
+        self.notebook.as_ref().is_some_and(|v| v.input.is_some())
+            || notes_field
             || (self.notes.is_none() && (lists_field || matches!(self.mode, Mode::Edit { .. } | Mode::Date { .. })))
     }
 
     /// Тап (щелчок) и свайп (прокрутка): что под пальцем — по карте попаданий кадра.
     pub fn on_mouse(&mut self, mouse: Mouse) {
+        if self.notebook.is_some() {
+            match mouse.kind {
+                MouseKind::ScrollUp => self.on_key(KeyCode::Up),
+                MouseKind::ScrollDown => self.on_key(KeyCode::Down),
+                MouseKind::Click => {
+                    if let Some((_, hit)) =
+                        self.hits.iter().rev().find(|(rect, _)| rect.contains(Position::new(mouse.column, mouse.row)))
+                    {
+                        match *hit {
+                            Hit::NotebookRow(i) => {
+                                if let Some(v) = &mut self.notebook {
+                                    v.row = i;
+                                }
+                                self.on_key(KeyCode::Enter);
+                            }
+                            Hit::Key((code, modifiers)) => self.on_key(KeyEvent::new(code, modifiers)),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let point = Position::new(mouse.column, mouse.row);
         let hit = self.hits.iter().rev().find(|(rect, _)| rect.contains(point)).map(|&(_, hit)| hit);
         if self.show_help || self.show_about {
@@ -700,6 +735,14 @@ impl App {
     /// Вставленный текст идёт в открытое поле ввода как есть, иначе игнорируется:
     /// на главном экране он сработал бы как горячие клавиши.
     pub fn on_paste(&mut self, text: &str) {
+        if let Some(view) = &mut self.notebook {
+            if let Some((_, input)) = &mut view.input {
+                for c in text.chars().filter(|c| !c.is_control()) {
+                    input.insert(c);
+                }
+            }
+            return;
+        }
         let input = match (&mut self.notes, &mut self.mode) {
             (Some(view), _) => match &mut view.mode {
                 NotesMode::Edit { input, .. } => Some(input),
@@ -749,6 +792,7 @@ impl App {
             Action::NextList => self.cycle_list(true),
             Action::PrevList => self.cycle_list(false),
             Action::ListLeft | Action::ListRight | Action::ListUp | Action::ListDown => self.grid_move(action),
+            Action::Notebook => self.notebook = Some(NotebookView::default()),
             Action::Lists => {
                 let row = self.list_rows().iter().position(|&c| c == self.active).unwrap_or(0);
                 self.mode = Mode::Lists { row, sub: ListsMode::Browse };

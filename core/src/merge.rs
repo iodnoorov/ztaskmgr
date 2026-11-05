@@ -164,6 +164,12 @@ pub fn merge_text(path: &str, ours: Option<&str>, theirs: &str, lists: &Lists) -
             mine.merge(&Lists::parse(theirs)?);
             mine.serialize()
         }
+        Some(FileKind::Groups) => crate::notebook::merge_groups(ours, theirs)?,
+        Some(FileKind::NotebookPage(id)) => {
+            let merged = crate::notebook::merge_pages(ours, theirs)?;
+            anyhow::ensure!(crate::notebook::Page::parse(&merged)?.id == id, "ID заметки не совпадает с путём");
+            merged
+        }
         Some(FileKind::Deleted) => {
             let mut text = ours.to_string();
             let have = sections(ours);

@@ -81,6 +81,24 @@ impl Task {
         Self { text: text.into(), state: State::Open, id: None, private: false, modified: 0, extra: Vec::new() }
     }
 
+    /// Ссылки на самостоятельные заметки сохраняются в совместимом поле метаданных.
+    pub fn references(&self) -> Vec<&str> {
+        self.extra
+            .iter()
+            .filter_map(|s| s.strip_prefix("refs:"))
+            .flat_map(|s| s.split(','))
+            .filter(|id| crate::storage::is_valid_id(id))
+            .collect()
+    }
+
+    pub fn set_references(&mut self, ids: &[String]) {
+        self.extra.retain(|s| !s.starts_with("refs:"));
+        if !ids.is_empty() {
+            self.extra.push(format!("refs:{}", ids.join(",")));
+        }
+        self.touch();
+    }
+
     /// Копия для страницы, на которую задачу переносят: снова открыта, записи те же.
     pub fn carried(&self) -> Self {
         Self {

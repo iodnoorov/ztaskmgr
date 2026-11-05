@@ -38,10 +38,19 @@ pub enum FileKind {
     Page(Date),
     Notes(String),
     Lists,
+    Groups,
+    NotebookPage(String),
     Deleted,
 }
 
 pub fn file_kind(path: &str) -> Option<FileKind> {
+    if path == crate::notebook::GROUPS_FILE {
+        return Some(FileKind::Groups);
+    }
+    if let Some(name) = path.strip_prefix("pages/") {
+        let id = name.strip_suffix(".md").filter(|id| storage::is_valid_id(id))?;
+        return Some(FileKind::NotebookPage(id.into()));
+    }
     match path.strip_prefix("notes/") {
         Some(name) => {
             let id = name.strip_suffix(".md").filter(|id| storage::is_valid_id(id))?;
@@ -147,7 +156,7 @@ impl Book {
     /// Все файлы книжки (страницы, записи, реестр, архив) — пути относительно каталога.
     pub fn files(&self) -> Result<Vec<String>> {
         let mut files = Vec::new();
-        for (dir, prefix) in [("", ""), ("notes", "notes/")] {
+        for (dir, prefix) in [("", ""), ("notes", "notes/"), ("pages", "pages/")] {
             for name in self.store.list(dir)? {
                 let path = format!("{prefix}{name}");
                 if file_kind(&path).is_some() {

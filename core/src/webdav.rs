@@ -372,7 +372,7 @@ impl Remote {
     /// Ключ книжки: с сервера, а если его там нет — новый (книжка начинает шифроваться).
     /// Без фразы — `None`, но если книжка на сервере уже зашифрована — ошибка: иначе мы
     /// положили бы рядом с зашифрованными файлами открытые.
-    fn book_key(&self, passphrase: &str, listed: bool, dirs: &mut (bool, bool)) -> Result<Option<Cipher>> {
+    fn book_key(&self, passphrase: &str, listed: bool, dirs: &mut (bool, bool, bool)) -> Result<Option<Cipher>> {
         if passphrase.is_empty() {
             if listed {
                 bail!("книжка на сервере зашифрована — укажите фразу шифрования в настройках (S)");
@@ -620,13 +620,14 @@ pub fn sync(book: &Book, settings: &Settings) -> Result<Option<Summary>> {
     // Что на сервере. Нет каталога книжки — создадим при первой записи.
     let top = remote.list("")?;
     let notes = if top.is_some() { remote.list("notes/")? } else { None };
-    let mut dirs_ready = (top.is_some(), notes.is_some());
+    let pages = if top.is_some() { remote.list("pages/")? } else { None };
+    let mut dirs_ready = (top.is_some(), notes.is_some(), pages.is_some());
     let has_key = top.iter().flatten().any(|(name, _)| name == KEY_FILE);
     remote.cipher = remote.book_key(&settings.passphrase, has_key, &mut dirs_ready)?;
     let encrypted = remote.cipher.is_some();
     let mut state = load_state(dir, &remote.base, encrypted);
     let mut server: HashMap<String, Option<String>> = HashMap::new();
-    for (prefix, files) in [("", top), ("notes/", notes)] {
+    for (prefix, files) in [("", top), ("notes/", notes), ("pages/", pages)] {
         for (name, etag) in files.unwrap_or_default() {
             let path = format!("{prefix}{name}");
             if is_book_file(&path) {
@@ -868,10 +869,14 @@ pub fn change_passphrase(settings: &Settings, new: &str) -> Result<()> {
 }
 
 /// Каталоги на сервере — перед первой записью в них.
-fn ensure_dirs(remote: &Remote, path: &str, ready: &mut (bool, bool)) -> Result<()> {
+fn ensure_dirs(remote: &Remote, path: &str, ready: &mut (bool, bool, bool)) -> Result<()> {
     if !ready.0 {
         remote.mkcol("")?;
         ready.0 = true;
+    }
+    if path.starts_with("pages/") && !ready.2 {
+        remote.mkcol("pages/")?;
+        ready.2 = true;
     }
     if path.starts_with("notes/") && !ready.1 {
         remote.mkcol("notes/")?;
@@ -1172,6 +1177,76 @@ mod tests {
 
     fn texts(book: &Book, date: Date) -> Vec<String> {
         book.load(date).unwrap().list(ListId::WORK).iter().map(|t| t.text.clone()).collect()
+    }
+
+    #[test]
+    fn notebook_sync_preserves_conflicts_tombstones_and_sticky_privacy() {
+        let store = Arc::new(Mutex::new(Store::default()));
+        let settings = Settings {
+            url: serve(store.clone()),
+            user: "me".into(),
+            password: "secret".into(),
+            passphrase: "notebook-test".into(),
+            ..Settings::default()
+        };
+        let pc = temp_book("notebook-pc");
+        let phone = temp_book("notebook-phone");
+        let group = pc.create_group("Программирование", None).unwrap();
+        let child = pc.create_group("Языки", Some(&group)).unwrap();
+        let note = pc.create_notebook_page("Rust", Some(&child)).unwrap();
+        let path = format!("pages/{note}.md");
+        let result = sync(&pc, &settings).unwrap().unwrap();
+        assert!(result.failed.is_empty());
+        assert!(store.lock().unwrap().files.contains_key(&path));
+        let raw = store.lock().unwrap().files[&path].0.clone();
+        assert!(!String::from_utf8_lossy(&raw).contains("Rust"));
+        sync(&phone, &settings).unwrap();
+        assert_eq!(phone.notebook_page(&note).unwrap().title(), "Rust");
+        pc.update_notebook_page(&note, |p| {
+            p.body.push_str("\n\nКомпьютер");
+            Ok(())
+        })
+        .unwrap();
+        phone
+            .update_notebook_page(&note, |p| {
+                p.body.push_str("\n\nТелефон");
+                Ok(())
+            })
+            .unwrap();
+        sync(&pc, &settings).unwrap();
+        let result = sync(&phone, &settings).unwrap().unwrap();
+        assert!(result.failed.is_empty());
+        assert_eq!(result.merged, 1);
+        sync(&pc, &settings).unwrap();
+        assert_eq!(pc.notebook_page(&note).unwrap().body, phone.notebook_page(&note).unwrap().body);
+        assert!(pc.notebook_page(&note).unwrap().conflicted());
+        pc.set_group_hidden(&group, true).unwrap();
+        sync(&pc, &settings).unwrap();
+        sync(&phone, &settings).unwrap();
+        phone.set_group_hidden(&group, false).unwrap();
+        assert!(phone.notebook_page(&note).unwrap().hidden);
+        assert!(phone.groups().unwrap().iter().find(|g| g.id == child).unwrap().hidden);
+        sync(&phone, &settings).unwrap();
+        sync(&pc, &settings).unwrap();
+        assert!(!pc.groups().unwrap().iter().find(|g| g.id == group).unwrap().hidden);
+        pc.update_notebook_page(&note, |p| {
+            p.deleted = true;
+            Ok(())
+        })
+        .unwrap();
+        phone
+            .update_notebook_page(&note, |p| {
+                p.body.push_str("\n\nПравка после удаления");
+                Ok(())
+            })
+            .unwrap();
+        sync(&pc, &settings).unwrap();
+        sync(&phone, &settings).unwrap();
+        assert!(phone.notebook_page(&note).unwrap().deleted);
+        assert!(phone.notebook_page(&note).unwrap().body.contains("Правка после удаления"));
+        assert_eq!(sync(&phone, &settings).unwrap().unwrap(), Summary::default());
+        let _ = fs::remove_dir_all(pc.dir());
+        let _ = fs::remove_dir_all(phone.dir());
     }
 
     #[test]

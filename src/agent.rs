@@ -338,6 +338,7 @@ impl Agent {
             found.date,
             state_mark(task.state)
         ));
+        out.push_str(&self.notebook_references(task)?);
         let Some(id) = &task.id else {
             out.push_str("Ref: (no id yet — it gets one with the first note or change)\nNo notes.\n");
             return Ok(out);
@@ -596,6 +597,110 @@ impl Agent {
 
 fn indent(text: &str, prefix: &str) -> String {
     text.lines().map(|l| format!("{prefix}{l}\n")).collect()
+}
+
+impl Agent {
+    fn visible_notebook_page(&self, id: &str) -> Result<ztaskmgr_core::notebook::Page> {
+        let page = self.book.notebook_page(id).map_err(|_| anyhow::anyhow!("unknown note"))?;
+        ensure_notebook_visible(&self.book, &page)?;
+        Ok(page)
+    }
+    pub fn list_notebook(&self, query: Option<&str>) -> Result<String> {
+        let _guard = self.book.lock()?;
+        let groups = self.book.groups()?;
+        let query = query.unwrap_or("").to_lowercase();
+        let mut out = String::new();
+        for g in groups.iter().filter(|g| !ztaskmgr_core::notebook::group_hidden(&groups, Some(&g.id))) {
+            out.push_str(&format!(
+                "Group: {} — id: {} parent: {}\n",
+                g.title,
+                g.id,
+                g.parent.as_deref().unwrap_or("root")
+            ));
+        }
+        for page in self.book.notebook_pages()? {
+            if !page.hidden
+                && !page.deleted
+                && !ztaskmgr_core::notebook::group_hidden(&groups, page.group.as_deref())
+                && page.body.to_lowercase().contains(&query)
+            {
+                out.push_str(&format!(
+                    "Note: {} — id: {} group: {}\n",
+                    page.title(),
+                    page.id,
+                    page.group.as_deref().unwrap_or("root")
+                ));
+            }
+        }
+        Ok(out)
+    }
+    pub fn get_notebook_page(&self, id: &str) -> Result<String> {
+        let _guard = self.book.lock()?;
+        Ok(self.visible_notebook_page(id)?.body)
+    }
+    fn visible_notebook_group(&self, group: Option<&str>) -> Result<()> {
+        if ztaskmgr_core::notebook::group_hidden(&self.book.groups()?, group) {
+            bail!("unknown group");
+        }
+        Ok(())
+    }
+    pub fn create_notebook_page(&self, title: &str, group: Option<&str>) -> Result<String> {
+        let _guard = self.book.lock()?;
+        self.visible_notebook_group(group)?;
+        self.book.create_notebook_page(title, group)
+    }
+    pub fn create_notebook_group(&self, title: &str, parent: Option<&str>) -> Result<String> {
+        let _guard = self.book.lock()?;
+        self.visible_notebook_group(parent)?;
+        self.book.create_group(title, parent)
+    }
+    pub fn update_notebook_page(&self, id: &str, body: &str) -> Result<String> {
+        let _guard = self.book.lock()?;
+        self.visible_notebook_page(id)?;
+        self.book.update_notebook_page(id, |p| {
+            p.body = body.into();
+            Ok(())
+        })?;
+        Ok("Saved".into())
+    }
+    pub fn link_notebook_page(&self, reference: &str, id: &str, attach: bool) -> Result<String> {
+        let _guard = self.book.lock()?;
+        self.visible_notebook_page(id)?;
+        let mut found = self.resolve(reference)?;
+        let task = found.task_mut();
+        let mut ids: Vec<String> = task.references().into_iter().map(str::to_string).collect();
+        if attach {
+            if !ids.iter().any(|i| i == id) {
+                ids.push(id.into());
+            }
+        } else {
+            ids.retain(|i| i != id);
+        }
+        task.set_references(&ids);
+        self.book.save(found.date, &found.board)?;
+        Ok("Saved".into())
+    }
+    fn notebook_references(&self, task: &Task) -> Result<String> {
+        let _guard = self.book.lock()?;
+        let groups = self.book.groups()?;
+        let mut out = String::new();
+        for id in task.references() {
+            if let Ok(p) = self.book.notebook_page(id)
+                && !p.hidden
+                && !p.deleted
+                && !ztaskmgr_core::notebook::group_hidden(&groups, p.group.as_deref())
+            {
+                out.push_str(&format!("Linked note: {} — id: {}\n", p.title(), p.id));
+            }
+        }
+        Ok(out)
+    }
+}
+fn ensure_notebook_visible(book: &Book, page: &ztaskmgr_core::notebook::Page) -> Result<()> {
+    if page.hidden || page.deleted || ztaskmgr_core::notebook::group_hidden(&book.groups()?, page.group.as_deref()) {
+        bail!("unknown note");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

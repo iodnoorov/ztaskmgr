@@ -443,6 +443,10 @@ impl App {
 
     /// Редактор закрылся (`error` — если не запустился): перечитать записи.
     pub fn after_editor(&mut self, error: Option<String>) {
+        if self.notebook_editor.is_some() {
+            self.finish_notebook_editor(error);
+            return;
+        }
         self.edited = true;
         if let Some(e) = error {
             self.status = Some(Status::Error(e));

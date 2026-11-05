@@ -20,6 +20,7 @@ pub enum Action {
     ListDown,
     /// Окно списков: добавить, переименовать, удалить, порядок.
     Lists,
+    Notebook,
     Down,
     Up,
     Top,
@@ -181,6 +182,7 @@ pub const ROWS: &[Row] = &[
             ((KeyCode::Down, CTRL), A::ListDown),
         ],
     ),
+    row(Section::Navigation, "самостоятельные заметки", &[(c('N'), A::Notebook)]),
     row(Section::Navigation, "окно списков", &[(c('L'), A::Lists)]),
     labeled(
         Section::Navigation,
